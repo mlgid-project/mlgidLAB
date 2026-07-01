@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import math
+import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -13,11 +15,14 @@ from PySide6.QtCore import (
     QEvent,
     QEventLoop,
     QMetaObject,
+    QObject,
+    QProcess,
     QSettings,
     QSignalBlocker,
     Qt,
     QThread,
     QTimer,
+    QUrl,
     Signal,
     Slot,
 )
@@ -26,6 +31,7 @@ from PySide6.QtGui import (
     QActionGroup,
     QCloseEvent,
     QColor,
+    QDesktopServices,
     QDragEnterEvent,
     QDropEvent,
     QFont,
@@ -62,6 +68,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QStyle,
     QTabWidget,
+    QTextBrowser,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -73,6 +80,7 @@ from silx.gui.hdf5.NexusSortFilterProxyModel import NexusSortFilterProxyModel
 from mlgidlab import file_model
 from mlgidlab import frame_range
 from mlgidlab import peak_clipboard
+from mlgidlab import update_check
 from mlgidlab.image_viewer import (
     GIWAXSImageViewer,
     MATCHED_STYLE,
@@ -568,6 +576,113 @@ class _SettingsDialog(QDialog):
         settings.setValue(
             MainWindow._PLAYBACK_TOTAL_S_KEY, float(self._spin_total_s.value())
         )
+
+
+class _UpdateCheckWorker(QObject):
+    """Runs the blocking GitHub release fetch off the GUI thread.
+
+    Emits ``finished(result)`` where result is ``(tag, url)`` or ``None``
+    (offline / no newer release). Lives on a ``QThread``; the host connects
+    ``finished`` with a queued connection to marshal back to the GUI thread.
+    """
+
+    finished = Signal(object)
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = update_check.latest_release()
+        except Exception:  # pragma: no cover - defensive; latest_release is safe
+            logger.debug("update check worker failed", exc_info=True)
+            result = None
+        self.finished.emit(result)
+
+
+class _UpdateInstallWorker(QObject):
+    """Runs the blocking ``pip install --upgrade`` off the GUI thread.
+
+    Emits ``finished(returncode, output)`` where ``output`` is the combined
+    stdout+stderr of pip (for the success/failure dialog). Lives on a
+    ``QThread`` like ``_UpdateCheckWorker``; the host marshals ``finished``
+    back to the GUI thread with a queued connection.
+    """
+
+    finished = Signal(int, str)
+
+    def __init__(self, command: list[str]) -> None:
+        super().__init__()
+        self._command = command
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            proc = subprocess.run(
+                self._command,
+                capture_output=True,
+                text=True,
+            )
+            output = (proc.stdout or "") + (proc.stderr or "")
+            self.finished.emit(proc.returncode, output)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("update install worker failed", exc_info=True)
+            self.finished.emit(1, f"Failed to launch pip: {exc}")
+
+
+class _UpdateBanner(QFrame):
+    """Dismissible 'a newer version is available' strip above the tabs.
+
+    Carries an "Update now" button that self-installs the release (emitted
+    as ``installRequested``); the host shows it only when the install is a
+    normal pip-managed one (see ``update_check.self_update_supported``).
+    """
+
+    installRequested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("UpdateBanner")
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setStyleSheet(
+            "#UpdateBanner { background: #2d5a88; }"
+            "#UpdateBanner QLabel { color: #f5f7fa; }"
+        )
+        self._url = update_check.RELEASES_PAGE
+        row = QHBoxLayout(self)
+        row.setContentsMargins(12, 6, 8, 6)
+        row.setSpacing(10)
+        self._label = QLabel(self)
+        self._label.setWordWrap(True)
+        row.addWidget(self._label, 1)
+        self._update_btn = QToolButton(self)
+        self._update_btn.setText("Update now")
+        self._update_btn.setToolTip(
+            "Download and install this release into the current environment."
+        )
+        self._update_btn.clicked.connect(self.installRequested)
+        self._update_btn.hide()
+        row.addWidget(self._update_btn)
+        view_btn = QToolButton(self)
+        view_btn.setText("View release")
+        view_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(self._url))
+        )
+        row.addWidget(view_btn)
+        close_btn = QToolButton(self)
+        close_btn.setText("✕")
+        close_btn.setToolTip("Dismiss")
+        close_btn.clicked.connect(self.hide)
+        row.addWidget(close_btn)
+
+    def show_update(
+        self, current: str, latest: str, url: str, *, can_install: bool = False
+    ) -> None:
+        self._url = url or update_check.RELEASES_PAGE
+        self._label.setText(
+            f"A newer version of mlgidLAB is available: "
+            f"<b>{latest}</b> (you have {current})."
+        )
+        self._update_btn.setVisible(can_install)
+        self.show()
 
 
 class MainWindow(QMainWindow):
@@ -1621,6 +1736,55 @@ class MainWindow(QMainWindow):
         )
         self.action_copy_diagnostics.triggered.connect(self._copy_diagnostics)
         help_menu.addAction(self.action_copy_diagnostics)
+        help_menu.addSeparator()
+        self.action_check_updates = QAction("Check for &updates…", self)
+        self.action_check_updates.setToolTip(
+            "Check GitHub for a newer mlgidLAB release."
+        )
+        self.action_check_updates.triggered.connect(
+            lambda: self._start_update_check(notify_uptodate=True)
+        )
+        help_menu.addAction(self.action_check_updates)
+        supported, reason = update_check.self_update_supported()
+        self.action_update_now = QAction("Update &now…", self)
+        self.action_update_now.setEnabled(supported)
+        self.action_update_now.setToolTip(
+            "Check GitHub and, if a newer release exists, install it into "
+            "the current environment."
+            if supported
+            else reason
+        )
+        # Re-check + install-if-newer in one step (no need to wait for the
+        # startup banner). Same off-thread check as "Check for updates…",
+        # but on finding a newer release it goes straight to the confirm +
+        # install flow instead of showing the banner.
+        self.action_update_now.triggered.connect(
+            lambda: self._start_update_check(
+                notify_uptodate=True, install_when_found=True
+            )
+        )
+        help_menu.addAction(self.action_update_now)
+        self.action_auto_update = QAction(
+            "Automatically install updates", self
+        )
+        self.action_auto_update.setCheckable(True)
+        self.action_auto_update.setEnabled(supported)
+        self.action_auto_update.setChecked(
+            supported
+            and str(QSettings().value(self._AUTO_UPDATE_KEY, "false")).lower()
+            == "true"
+        )
+        self.action_auto_update.setToolTip(
+            "When a newer release is found on launch, install it into the "
+            "current environment (after a confirmation)."
+            if supported
+            else reason
+        )
+        self.action_auto_update.toggled.connect(self._set_auto_update)
+        help_menu.addAction(self.action_auto_update)
+
+    def _set_auto_update(self, enabled: bool) -> None:
+        QSettings().setValue(self._AUTO_UPDATE_KEY, bool(enabled))
 
     def _show_controls(self) -> None:
         """Modal reference for keyboard shortcuts + mouse + workflow.
@@ -1844,6 +2008,236 @@ class MainWindow(QMainWindow):
             f"Copied {len(diagnostics)} chars of diagnostics to clipboard",
             5000,
         )
+
+    # -- Update check + post-update changelog --
+
+    def _run_startup_update_checks(self) -> None:
+        """Post-update changelog + async online update check.
+
+        Called once from ``main()`` after the window is shown — NOT from
+        ``__init__``, so the test fixture (which builds the window directly)
+        never triggers a network call or a changelog dialog. Both parts are
+        best-effort and silent on failure.
+        """
+        self._maybe_show_changelog()
+        self._start_update_check(notify_uptodate=False)
+
+    def _start_update_check(
+        self,
+        *,
+        notify_uptodate: bool = False,
+        install_when_found: bool = False,
+    ) -> None:
+        """Fetch the latest GitHub release off-thread; show the banner if a
+        newer version exists. ``notify_uptodate`` posts a status-bar
+        confirmation when nothing newer is found (Help -> Check for updates).
+        ``install_when_found`` skips the banner and goes straight to the
+        confirm + install flow when a newer release exists and self-update is
+        supported (Help -> Update now…).
+        """
+        if getattr(self, "_update_thread", None) is not None:
+            return  # a check is already in flight
+        self._update_notify_uptodate = notify_uptodate
+        self._update_install_when_found = install_when_found
+        self._update_thread = QThread(self)
+        self._update_worker = _UpdateCheckWorker()
+        self._update_worker.moveToThread(self._update_thread)
+        self._update_thread.started.connect(self._update_worker.run)
+        self._update_worker.finished.connect(self._on_update_check_finished)
+        self._update_worker.finished.connect(self._update_thread.quit)
+        self._update_thread.finished.connect(self._update_worker.deleteLater)
+        self._update_thread.finished.connect(self._clear_update_thread)
+        self._update_thread.start()
+
+    def _clear_update_thread(self) -> None:
+        thread = getattr(self, "_update_thread", None)
+        if thread is not None:
+            thread.deleteLater()
+        self._update_thread = None
+        self._update_worker = None
+
+    @Slot(object)
+    def _on_update_check_finished(self, result) -> None:
+        from mlgidlab import __version__ as current
+
+        if result is not None:
+            tag, url = result
+            if update_check.is_outdated(current, tag):
+                self._latest_tag = tag
+                self._latest_url = url
+                supported, _ = update_check.self_update_supported()
+                # Help -> Update now…: user explicitly asked to install, so
+                # go straight to the confirm dialog (never silently).
+                if getattr(self, "_update_install_when_found", False) and supported:
+                    self._on_install_update_requested()
+                    return
+                # Opt-in "install automatically on launch": skip the banner and
+                # go straight to the (still confirmed) install. Only ever when
+                # the install is a normal pip-managed one.
+                auto = (
+                    supported
+                    and str(
+                        QSettings().value(self._AUTO_UPDATE_KEY, "false")
+                    ).lower()
+                    == "true"
+                )
+                if auto:
+                    self._start_update_install(tag)
+                else:
+                    self._update_banner.show_update(
+                        current, tag, url, can_install=supported
+                    )
+                return
+        if getattr(self, "_update_notify_uptodate", False):
+            self.statusBar().showMessage(
+                f"mlgidLAB is up to date (v{current}).", 5000
+            )
+
+    # -- In-app self-update (pip install --upgrade) --
+
+    def _on_install_update_requested(self) -> None:
+        """Confirm, then upgrade to the last-found release in place.
+
+        Wired to the banner's "Update now" button. The confirmation names the
+        target version and warns that a restart is needed (the running
+        process keeps the old code until relaunched).
+        """
+        tag = getattr(self, "_latest_tag", None)
+        if not tag:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Update mlgidLAB",
+            f"Install {tag} into the current environment?\n\n"
+            "mlgidLAB will download and pip-install the new version, then "
+            "offer to restart.",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Ok,
+        )
+        if reply == QMessageBox.StandardButton.Ok:
+            self._start_update_install(tag)
+
+    def _start_update_install(self, tag: str) -> None:
+        """Run ``pip install --upgrade`` for ``tag`` off the GUI thread.
+
+        Shows a busy progress dialog while pip runs; ``_on_update_install_
+        finished`` closes it and reports success (restart prompt) or failure.
+        """
+        if getattr(self, "_install_thread", None) is not None:
+            return  # an install is already in flight
+        command = update_check.build_upgrade_command(tag)
+        self._install_progress = QProgressDialog(
+            f"Updating mlgidLAB to {tag}…", "", 0, 0, self
+        )
+        self._install_progress.setWindowTitle("Updating mlgidLAB")
+        self._install_progress.setWindowModality(
+            Qt.WindowModality.WindowModal
+        )
+        # No cancel: interrupting pip mid-write can leave a half-installed
+        # package. Hide the button rather than leave a no-op "Cancel".
+        self._install_progress.setCancelButton(None)
+        self._install_progress.setMinimumDuration(0)
+        self._install_progress.show()
+
+        self._install_thread = QThread(self)
+        self._install_worker = _UpdateInstallWorker(command)
+        self._install_worker.moveToThread(self._install_thread)
+        self._install_thread.started.connect(self._install_worker.run)
+        self._install_worker.finished.connect(self._on_update_install_finished)
+        self._install_worker.finished.connect(self._install_thread.quit)
+        self._install_thread.finished.connect(self._install_worker.deleteLater)
+        self._install_thread.finished.connect(self._clear_install_thread)
+        self._install_thread.start()
+
+    def _clear_install_thread(self) -> None:
+        thread = getattr(self, "_install_thread", None)
+        if thread is not None:
+            thread.deleteLater()
+        self._install_thread = None
+        self._install_worker = None
+
+    @Slot(int, str)
+    def _on_update_install_finished(self, returncode: int, output: str) -> None:
+        progress = getattr(self, "_install_progress", None)
+        if progress is not None:
+            progress.close()
+            self._install_progress = None
+        if returncode == 0:
+            self._update_banner.hide()
+            self._prompt_restart()
+            return
+        # Failure: surface the tail of pip's output plus the manual fallback.
+        tail = "\n".join(output.strip().splitlines()[-15:]) or "(no output)"
+        tag = getattr(self, "_latest_tag", "") or ""
+        command = " ".join(update_check.build_upgrade_command(tag))
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Update failed")
+        box.setText(
+            "The update could not be installed. You can try again, or "
+            "update manually from a terminal:"
+        )
+        box.setInformativeText(command)
+        box.setDetailedText(tail)
+        box.exec()
+
+    def _prompt_restart(self) -> None:
+        """Offer to relaunch so the freshly installed version loads.
+
+        The upgrade landed on disk but the running interpreter still holds the
+        old modules; only a restart picks up the new code.
+        """
+        reply = QMessageBox.question(
+            self,
+            "Update installed",
+            "mlgidLAB was updated. Restart now to use the new version?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        # Relaunch the module entry point with the same interpreter, then quit
+        # this instance. startDetached returns before we exit so the new
+        # process survives our shutdown.
+        QProcess.startDetached(sys.executable, ["-m", "mlgidlab"])
+        QApplication.quit()
+
+    def _maybe_show_changelog(self) -> None:
+        """First launch after an update: show what changed since the last
+        version this profile ran (bundled CHANGELOG). Records the current
+        version so the popup only appears once per update.
+        """
+        from mlgidlab import __version__ as current
+
+        settings = QSettings()
+        raw = settings.value(self._LAST_SEEN_VERSION_KEY, None)
+        last_seen = str(raw) if raw else None
+        try:
+            sections = update_check.whats_new(current, last_seen)
+            if sections:
+                self._show_changelog_dialog(current, sections)
+        finally:
+            settings.setValue(self._LAST_SEEN_VERSION_KEY, current)
+
+    def _show_changelog_dialog(
+        self, current: str, sections: list[tuple[str, str]]
+    ) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"What's new in mlgidLAB {current}")
+        dlg.resize(560, 480)
+        layout = QVBoxLayout(dlg)
+        intro = QLabel("mlgidLAB was updated. Here's what changed:", dlg)
+        layout.addWidget(intro)
+        browser = QTextBrowser(dlg)
+        browser.setOpenExternalLinks(True)
+        browser.setMarkdown(
+            "\n\n".join(f"## {head}\n\n{body}" for head, body in sections)
+        )
+        layout.addWidget(browser)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok, dlg)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+        dlg.exec()
 
     def _action_undo(self) -> None:
         # Covers manual add/remove, manual geom edits, and detected/fitted
@@ -2079,6 +2473,10 @@ class MainWindow(QMainWindow):
     _PLAYBACK_MODE_KEY = "playbackMode"
     _PLAYBACK_FRAME_MS_KEY = "playbackFrameIntervalMs"
     _PLAYBACK_TOTAL_S_KEY = "playbackTotalTimeS"
+    # Last mlgidLAB version this profile ran, for the post-update changelog.
+    _LAST_SEEN_VERSION_KEY = "lastSeenVersion"
+    # Opt-in: install a newer release automatically on launch (Help menu).
+    _AUTO_UPDATE_KEY = "autoUpdate"
 
     def _load_recent_files(self) -> list[dict]:
         """Return the persisted recent-files list as a list of dicts.
@@ -2226,7 +2624,21 @@ class MainWindow(QMainWindow):
         # Render a deferred (clicked-while-hidden) tree node when the user
         # switches to the Data tab — see ``_set_or_defer_data_node``.
         self.tabs.currentChanged.connect(self._on_main_tab_changed)
-        self.setCentralWidget(self.tabs)
+
+        # Central column: a hidden "update available" banner above the tabs
+        # (shown by the startup update check — see _on_update_check_finished).
+        central = QWidget(self)
+        col = QVBoxLayout(central)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+        self._update_banner = _UpdateBanner(central)
+        self._update_banner.hide()
+        self._update_banner.installRequested.connect(
+            self._on_install_update_requested
+        )
+        col.addWidget(self._update_banner)
+        col.addWidget(self.tabs)
+        self.setCentralWidget(central)
 
     def _build_docks(self) -> None:
         # Make the side docks own the bottom corners so the bottom Profile
@@ -2634,6 +3046,9 @@ class MainWindow(QMainWindow):
         self.conversion_panel.set_active_raw_frame_resolver(
             self._active_raw_frame_for_calibration
         )
+        # Flip the live raw preview when the panel's fliplr/flipud checkboxes
+        # toggle, so the user sees the orientation the conversion will produce.
+        self.conversion_panel.rawFlipsChanged.connect(self._on_raw_flips_changed)
         self._conversion_dock = QDockWidget("Conversion", self)
         self._conversion_dock.setWidget(self.conversion_panel)
         self._conversion_dock.setObjectName("ConversionDock")
@@ -3799,6 +4214,10 @@ class MainWindow(QMainWindow):
                 "dataset (shape (N, H, W) with H, W ≥ 32). Check the "
                 "files in the tree on the left to see their structure.",
             )
+
+    def _on_raw_flips_changed(self, flip_lr: bool, flip_ud: bool) -> None:
+        """Apply the conversion panel's fliplr/flipud to the raw preview."""
+        self.viewer.set_raw_flips(flip_lr, flip_ud)
 
     def _load_raw_entry_into_viewer(self, label: str) -> None:
         """Load the picked raw entry into the viewer in pixel coords.

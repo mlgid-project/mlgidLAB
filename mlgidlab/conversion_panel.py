@@ -300,6 +300,9 @@ class ConversionPanel(QWidget):
     # preserved so existing call sites keep working.
     logMessage = Signal(str)
     logCleared = Signal()
+    # Emitted (fliplr, flipud) when the orientation flip checkboxes toggle, so
+    # the host can flip the live raw preview to match the conversion output.
+    rawFlipsChanged = Signal(bool, bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -585,6 +588,9 @@ class ConversionPanel(QWidget):
         # checked.
         self.flip_lr = QCheckBox("Flip horizontally (fliplr)")
         self.flip_ud = QCheckBox("Flip vertically (flipud)")
+        # Re-emit the combined flip state so the host can flip the raw preview.
+        self.flip_lr.toggled.connect(self._emit_raw_flips)
+        self.flip_ud.toggled.connect(self._emit_raw_flips)
         flips = QHBoxLayout()
         flips.setContentsMargins(0, 0, 0, 0)
         flips.addWidget(self.flip_lr)
@@ -620,6 +626,12 @@ class ConversionPanel(QWidget):
         section.body_layout.addWidget(override_section)
 
         return section
+
+    def _emit_raw_flips(self, _checked: bool = False) -> None:
+        """Broadcast the current (fliplr, flipud) checkbox state."""
+        self.rawFlipsChanged.emit(
+            self.flip_lr.isChecked(), self.flip_ud.isChecked()
+        )
 
     def _browse_poni(self) -> None:
         path, _ = QFileDialog.getOpenFileName(

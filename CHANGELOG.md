@@ -4,6 +4,33 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## 0.1.0a10 — tenth alpha (2026-07-01)
+
+Feature alpha on `0.1.0a9`. No on-disk schema or backend changes; the
+`[pipeline]` pins are unchanged. Adds in-app update notifications and
+self-update, plus a live raw-preview flip.
+
+### Added
+
+- **In-app update notifications.** On launch mlgidLAB checks GitHub for a
+  newer release and, if one exists, shows a dismissible banner above the
+  tabs (`Help → Check for updates…` runs the same check on demand). A first
+  launch after updating also shows an offline "what's new" dialog built from
+  the bundled changelog. Everything is best-effort and silent when offline.
+- **One-click self-update.** For a normal pip install the banner offers an
+  **Update now** button that pip-installs the new release into the current
+  environment (`pip install --upgrade "mlgidlab[pipeline]? @ git+…@<tag>"`,
+  run off the GUI thread), then offers to restart. `Help → Update now…` runs
+  the same check + install on demand, and `Help → Automatically install
+  updates` (off by default) does it on launch after one confirmation.
+  Self-update is disabled for editable / development installs (the banner
+  keeps only "View release"); the `[pipeline]` extra is preserved when it is
+  installed.
+- **Live raw-preview flip.** Ticking the Conversion panel's Flip L-R /
+  Flip U-D checkboxes now flips the raw preview to match the orientation the
+  conversion will write (mirrors pygid's flipud-then-fliplr on the file-order
+  frame); the converted display is unchanged.
+
 ## 0.1.0a9 — ninth alpha (2026-06-30)
 
 Feature + bugfix alpha on `0.1.0a8`. No on-disk schema or backend

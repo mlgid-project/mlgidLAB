@@ -15,7 +15,7 @@ os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 from PySide6.QtWidgets import QApplication
 
-__version__ = "0.1.0a9"
+__version__ = "0.1.0a10"
 
 
 def main() -> int:
@@ -62,6 +62,11 @@ def main() -> int:
     else:
         window.action_theme_dark.setChecked(True)
     window.show()
+    # Post-update changelog (offline) + async "newer release available"
+    # check. Deferred into the event loop so it runs after the window is up
+    # and never blocks show(). Not started from MainWindow.__init__ so the
+    # headless test fixture never performs a network call.
+    QTimer.singleShot(0, window._run_startup_update_checks)
     # argv[0] is the program; treat any extra args as files to open.
     paths = [Path(a) for a in sys.argv[1:] if Path(a).exists()]
     if paths:

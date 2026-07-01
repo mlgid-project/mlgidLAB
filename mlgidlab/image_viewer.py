@@ -217,6 +217,20 @@ def _robust_levels(frame: np.ndarray) -> tuple[float, float]:
     return lo, hi
 
 
+def _apply_raw_flips(frame: np.ndarray, flip_lr: bool, flip_ud: bool) -> np.ndarray:
+    """Orient a file-order (H, W) raw detector frame for preview.
+
+    Mirrors pygid's ``process_image`` (flipud then fliplr) so the preview
+    matches the orientation the conversion will produce. Returns the frame
+    unchanged when neither flip is set.
+    """
+    if flip_ud:
+        frame = np.flipud(frame)
+    if flip_lr:
+        frame = np.fliplr(frame)
+    return frame
+
+
 @dataclass
 class _DisplayParams:
     """Per-mode display state. ``image_pg`` is the *single 2D frame*
@@ -1062,6 +1076,14 @@ class GIWAXSImageViewer(QWidget):
 
         self._mode = MODE_POLAR
         self._log_scale: bool = False
+        # Raw-preview orientation flips, driven by the Conversion panel's
+        # fliplr/flipud checkboxes. Default False (show the frame exactly as
+        # stored); when set, the preview is flipped to match what pygid's
+        # conversion will produce. Only the raw branch of _render_frame reads
+        # these; the converted display is unaffected (its flips are already
+        # baked in by pygid). See set_raw_flips and _apply_raw_flips.
+        self._raw_flip_lr: bool = False
+        self._raw_flip_ud: bool = False
         # The contrast (histogram) levels the user has dialed in with the
         # slider, or None to auto-contrast from the data. When set, it is
         # reused across operation re-renders (add-peak, pipeline reattach,
@@ -1302,6 +1324,22 @@ class GIWAXSImageViewer(QWidget):
             arr_3d = np.ascontiguousarray(arr_3d)
         self._raw_image_stack = arr_3d
         self._render_active_mode()
+
+    def set_raw_flips(self, flip_lr: bool, flip_ud: bool) -> None:
+        """Set the raw-preview orientation flips and re-render.
+
+        Driven by the Conversion panel's fliplr/flipud checkboxes so the
+        preview shows the raw image in the orientation the conversion will
+        produce (see ``_apply_raw_flips``). The flags persist, so a raw
+        stack loaded later is rendered with the same flips. Re-renders with
+        ``auto_range=False`` so the user's zoom/pan survives the toggle.
+        """
+        flip_lr, flip_ud = bool(flip_lr), bool(flip_ud)
+        if (flip_lr, flip_ud) == (self._raw_flip_lr, self._raw_flip_ud):
+            return
+        self._raw_flip_lr, self._raw_flip_ud = flip_lr, flip_ud
+        if self._mode == MODE_RAW and self._raw_image_stack is not None:
+            self._render_active_mode(auto_range=False)
 
     def _drop_raw_stack(self) -> None:
         """Forget the raw stack, closing a lazy stack's h5py handle.
@@ -2606,7 +2644,10 @@ class GIWAXSImageViewer(QWidget):
             if self._mode == MODE_RAW:
                 if self._raw_image_stack is None:
                     return
-                frame = np.asarray(self._raw_image_stack[idx]).T
+                frame = _apply_raw_flips(
+                    np.asarray(self._raw_image_stack[idx]),
+                    self._raw_flip_lr, self._raw_flip_ud,
+                ).T
             elif self._mode == MODE_POLAR:
                 if self._frame_source is None or not self._frame_source.is_open:
                     return

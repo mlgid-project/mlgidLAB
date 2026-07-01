@@ -31,10 +31,10 @@ conda create -n mlgidlab python=3.12 -y
 conda activate mlgidlab
 
 # GUI only
-pip install "git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a9"
+pip install "git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a10"
 
 # or, full pipeline (detection / fitting / matching + raw conversion)
-pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a9"
+pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a10"
 ```
 
 ### From a local clone (for development)
@@ -68,6 +68,22 @@ mlgidlab                 # console entry point
 mlgidlab path/to/file.h5 # open a file on startup
 python -m mlgidlab       # equivalent module form
 ```
+
+## Updating
+
+On launch mlgidLAB checks GitHub for a newer release. If one exists a
+banner appears with an **Update now** button that installs the new version
+into the current environment (equivalent to the `pip install --upgrade
+"…@<tag>"` command above, run in the background) and then offers to
+restart. `Help → Update now…` runs the same check-and-install on demand
+(no need to wait for the banner), and `Help → Automatically install
+updates` (off by default) does it automatically on launch, after a single
+confirmation.
+
+Self-update is only offered for normal pip installs. For a **development /
+editable** checkout (`pip install -e`) the button is hidden — update it with
+`git pull` (or re-run the `pip install -e` command). The `[pipeline]` extra
+is kept across an update when it is installed.
 
 ## First-file walkthrough
 

@@ -8,7 +8,7 @@ window: convert raw detector images to NeXus, then **detect / fit /
 match**, **review and edit** peaks, and **export** — same algorithms,
 visual control.
 
-> **Alpha (`v0.1.0a9`).** Pre-release for evaluation in the research
+> **Alpha (`v0.1.0a10`).** Pre-release for evaluation in the research
 > group. The detect → fit → match → edit loop works end-to-end; expect
 > rough edges and report issues. See [`CHANGELOG.md`](CHANGELOG.md) for
 > highlights.
@@ -28,7 +28,7 @@ conda create -n mlgidlab python=3.12 -y
 conda activate mlgidlab
 
 # full pipeline (detection / fitting / matching + raw conversion)
-pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a9"
+pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a10"
 mlgidlab
 ```
 
@@ -67,8 +67,9 @@ install, a first-file walkthrough, and shortcuts are in
   version policy + how to verify a backend bump.
 - **[Manual test plan](docs/manual_test_plan.html)** — click-through
   checklist for alpha testers. Download it and open in a browser; grab
-  the matching `example.zip` dataset from the
-  [latest release's assets](https://github.com/mlgid-project/mlgidLAB/releases/latest).
+  the `example.zip` dataset — hosted once on the
+  [v0.1.0a9 release](https://github.com/mlgid-project/mlgidLAB/releases/download/v0.1.0a9/example.zip)
+  and reused for every version, so later releases carry no attachments.
 - **[Changelog](CHANGELOG.md)** — release highlights.
 
 (For Contributor-facing architecture / module reference docs please contact me.)
