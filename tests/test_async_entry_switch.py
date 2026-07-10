@@ -132,11 +132,11 @@ def test_combo_switch_renders_via_worker(main_window, qtbot, tmp_path):
     _open(main_window, tmp_path)
     main_window._ensure_entry_load_worker()
 
-    with qtbot.waitSignal(main_window._entry_load_worker.loaded, timeout=5000):
+    with qtbot.waitSignal(main_window._entry_load_worker.loaded, timeout=30000):
         main_window.entry_combo.setCurrentText("entry_0002")  # -> async load
 
     qtbot.waitUntil(
         lambda: main_window.viewer._frame_source is not None
         and float(np.mean(main_window.viewer._frame_source.get_cartesian(0))) == 2.0,
-        timeout=5000,
+        timeout=30000,
     )

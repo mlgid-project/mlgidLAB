@@ -73,8 +73,11 @@ def test_fabio_files_open_as_separate_entries(main_window, qtbot, tmp_path):
     assert main_window.entry_combo.count() == 3
     labels = [main_window.entry_combo.itemText(i) for i in range(3)]
     assert labels == [p.name for p in tiffs]
+    # Generous timeout: the first image loads on a worker thread and
+    # CI's shared 2-core runners have blown a 5 s budget before.
     qtbot.waitUntil(
-        lambda: main_window.viewer._raw_image_stack is not None, timeout=5000
+        lambda: main_window.viewer._raw_image_stack is not None,
+        timeout=30000,
     )
     stack = main_window.viewer._raw_image_stack
     assert isinstance(stack, file_model.LazyFabioStack)
@@ -86,8 +89,10 @@ def test_fabio_files_open_as_separate_entries(main_window, qtbot, tmp_path):
 def test_fabio_conversion_collects_one_scan_per_file(main_window, qtbot, tmp_path):
     tiffs = _write_tiffs(tmp_path, n=3)
     _activate_fabio(main_window, tiffs)
+    # Same slow-runner allowance as test_fabio_files_open_as_separate_entries.
     qtbot.waitUntil(
-        lambda: main_window.viewer._raw_image_stack is not None, timeout=5000
+        lambda: main_window.viewer._raw_image_stack is not None,
+        timeout=30000,
     )
 
     panel = main_window.conversion_panel

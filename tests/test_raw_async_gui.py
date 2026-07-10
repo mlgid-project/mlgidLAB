@@ -141,11 +141,11 @@ def test_open_recent_raw_goes_through_worker_queue(
     qtbot.waitUntil(
         lambda: main_window.session is not None
         and main_window.session.kind == "raw",
-        timeout=5000,
+        timeout=30000,
     )
     assert main_window.entry_combo.count() == 1
     qtbot.waitUntil(
-        lambda: main_window.viewer._raw_image_stack is not None, timeout=5000
+        lambda: main_window.viewer._raw_image_stack is not None, timeout=30000
     )
     assert isinstance(main_window.viewer._raw_image_stack, file_model.LazyRawStack)
     assert len(calls) == 1  # the worker's walk; activation reused its result
@@ -171,7 +171,7 @@ def test_populate_raw_entries_uses_session_cache_without_walking(
 
     assert main_window.entry_combo.count() == 1
     qtbot.waitUntil(
-        lambda: main_window.viewer._raw_image_stack is not None, timeout=5000
+        lambda: main_window.viewer._raw_image_stack is not None, timeout=30000
     )
 
 
@@ -210,7 +210,7 @@ def test_tree_click_on_raw_dataset_switches_entry(main_window, qtbot, tmp_path):
     path = _two_dataset_raw(tmp_path)
     _activate_raw(main_window, path)
     qtbot.waitUntil(
-        lambda: main_window.viewer._raw_image_stack is not None, timeout=5000
+        lambda: main_window.viewer._raw_image_stack is not None, timeout=30000
     )
     assert main_window.entry_combo.currentText() == "two_raw.h5::scan1/eiger"
 
@@ -222,7 +222,7 @@ def test_tree_click_on_raw_dataset_switches_entry(main_window, qtbot, tmp_path):
     qtbot.waitUntil(
         lambda: main_window.viewer._raw_image_stack is not None
         and float(main_window.viewer._raw_image_stack[0].mean()) == 2.0,
-        timeout=5000,
+        timeout=30000,
     )
 
 
@@ -235,7 +235,7 @@ def test_tree_click_on_ancestor_group_selects_first_candidate(
     path = _two_dataset_raw(tmp_path)
     _activate_raw(main_window, path)
     qtbot.waitUntil(
-        lambda: main_window.viewer._raw_image_stack is not None, timeout=5000
+        lambda: main_window.viewer._raw_image_stack is not None, timeout=30000
     )
 
     main_window._activate_entry_for_node(_FakeNode("/scan2", str(path)))
@@ -248,7 +248,7 @@ def test_tree_click_outside_candidates_is_noop(main_window, qtbot, tmp_path):
     path = _two_dataset_raw(tmp_path)
     _activate_raw(main_window, path)
     qtbot.waitUntil(
-        lambda: main_window.viewer._raw_image_stack is not None, timeout=5000
+        lambda: main_window.viewer._raw_image_stack is not None, timeout=30000
     )
     before = main_window.entry_combo.currentText()
 

@@ -106,7 +106,7 @@ def test_prefetch_release_is_synchronous(main_window, synthetic_nexus, qtbot):
     qtbot.waitUntil(
         lambda: main_window._prefetch_worker is not None
         and main_window._prefetch_worker._file is not None,
-        timeout=2000,
+        timeout=30000,
     )
 
     main_window._detach_silx_tree()

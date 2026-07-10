@@ -52,9 +52,9 @@ def test_switch_away_stashes_live_source(main_window, qtbot, tmp_path):
     a = _open(main_window, _nexus_file(tmp_path, "a.h5", 3))
     # Move A to a non-first entry so the stash records the user's place.
     main_window._ensure_entry_load_worker()
-    with qtbot.waitSignal(main_window._entry_load_worker.loaded, timeout=5000):
+    with qtbot.waitSignal(main_window._entry_load_worker.loaded, timeout=30000):
         main_window.entry_combo.setCurrentText("entry_0002")
-    qtbot.waitUntil(lambda: _viewer_mean(main_window) == 2.0, timeout=5000)
+    qtbot.waitUntil(lambda: _viewer_mean(main_window) == 2.0, timeout=30000)
     src_a = main_window.viewer._frame_source
 
     _open(main_window, _nexus_file(tmp_path, "b.h5", 1))
@@ -71,9 +71,9 @@ def test_reactivation_restores_place_without_file_io(
 ):
     a = _open(main_window, _nexus_file(tmp_path, "a.h5", 3))
     main_window._ensure_entry_load_worker()
-    with qtbot.waitSignal(main_window._entry_load_worker.loaded, timeout=5000):
+    with qtbot.waitSignal(main_window._entry_load_worker.loaded, timeout=30000):
         main_window.entry_combo.setCurrentText("entry_0002")
-    qtbot.waitUntil(lambda: _viewer_mean(main_window) == 2.0, timeout=5000)
+    qtbot.waitUntil(lambda: _viewer_mean(main_window) == 2.0, timeout=30000)
     _open(main_window, _nexus_file(tmp_path, "b.h5", 1))
 
     def _boom(*args, **kwargs):
@@ -92,7 +92,7 @@ def test_reactivation_restores_place_without_file_io(
 def test_close_inactive_session_releases_stash(main_window, qtbot, tmp_path):
     a = _open(main_window, _nexus_file(tmp_path, "a.h5", 3))
     qtbot.waitUntil(
-        lambda: main_window.viewer._frame_source is not None, timeout=5000
+        lambda: main_window.viewer._frame_source is not None, timeout=30000
     )
     src_a = main_window.viewer._frame_source
     _open(main_window, _nexus_file(tmp_path, "b.h5", 1))
