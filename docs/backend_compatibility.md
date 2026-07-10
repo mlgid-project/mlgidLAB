@@ -162,3 +162,51 @@ the baseline table) and, if a version moved, bump the `[pipeline]` pins
 in `pyproject.toml`. If it fails, file the failing call + the version
 that introduced the break as a known issue and keep the last-good
 pin in place.
+
+## Recorded bumps
+
+### 2026-07-05 — mlgidbase main @ `561edfa` (unreleased, self-labelled 0.1.3)
+
+Installed for the phase-tracking feature (`track_peaks`, "First
+implementation of the peak tracking function"):
+
+```bash
+# reference clone fast-forwarded to origin/main first
+pip install --force-reinstall --no-deps project_repos/mlgidBASE
+```
+
+- **Full suite green** against it (352 passed locally, backends
+  installed) — the standard Step-2 verification.
+- The `[pipeline]` pin in `pyproject.toml` is **unchanged** (still
+  `mlgidbase` 0.1.3): the commit is unreleased and still calls itself
+  0.1.3, so there is nothing meaningful to pin. Re-pin when upstream
+  tags the release containing `561edfa`.
+- **Caveats the GUI codes around** (checked at this sha; see
+  `mlgidlab/phase_tracking.py`):
+  - `track_peaks` exists only past the 0.1.3 release — the GUI
+    feature-gates on availability and raises a named RuntimeError
+    ("needs mlgidbase newer than 0.1.3") for older installs.
+  - `networkx` is imported by `mlgidbase.peak_operations` but **not
+    declared** in mlgidbase's dependencies (upstream packaging gap).
+    It is present in the GUI_project env; a fresh env needs
+    `pip install networkx` until upstream declares it.
+  - Upstream `_track_peaks` **returns None** (docstring claims
+    otherwise); the GUI recovers the data via a capture hook on
+    `mlgidbase.peak_operations._plot_tracked_peaks` (positional
+    8-arg contract, validated at call time —
+    `phase_tracking.UpstreamContractError` fires loudly if a future
+    mlgidbase changes the call shape).
+  - **Rings are never tracked by upstream**: a ring's
+    `angle_width = inf` makes every IoU against its box NaN,
+    `_track_peaks` zeroes NaNs, so each ring is a 1-member component
+    discarded by the `length` cut. The GUI compensates by tracking
+    rings itself — `phase_tracking.track_rings` runs the same
+    all-against-all / connected-components / `length`-cut algorithm on
+    the 1-D IoU of the radius intervals (rings have no azimuthal
+    position) and appends the ring tracks to the captured payload. A
+    proper upstream fix (ring↔ring radial IoU inside `_track_peaks`,
+    e.g. treating `angle_width = inf` as full-arc overlap) would let
+    the GUI drop this pass — report alongside the return-None and
+    networkx items.
+- Rollback: `pip install mlgidbase==0.1.3` (phase tracking then
+  reports the feature as unavailable; everything else unchanged).

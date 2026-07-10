@@ -103,6 +103,198 @@ def add_peak_kwargs_for(peak) -> dict:
     }
 
 
+def _finite_or(value, fallback: float) -> float:
+    """``float(value)`` when finite, else ``fallback`` — ring fits leave
+    angular shape coefficients NaN/inf, which must not land in stored
+    rows that downstream readers treat as numbers."""
+    import numpy as np
+
+    v = float(value)
+    return v if np.isfinite(v) else float(fallback)
+
+
+def _execute_interpolate_tracks(file_path: Path, kwargs: dict) -> list:
+    """Fill tracked-peak GAP frames with real detected + fitted rows.
+
+    For every injection spec planned by
+    ``phase_tracking.plan_gap_fills`` (``kwargs["plan"]`` =
+    ``{frame: [{"track", "radius", "angle", "radius_width",
+    "angle_width", "is_ring"}, ...]}``): append a detected box at the
+    estimated position/size, run the single-box 2D fit
+    (``manual_fit.fit_one_peak`` — byte-identical to what the pipeline
+    ``run_fitting`` writes for the same box), and persist the fitted
+    row. Ring specs carry a finite quadrant-spanning box (pygidfit
+    classifies rings geometrically and runs its radial ring fit on
+    them); the persisted ring row uses mlgidLAB's ring convention
+    (``angle 45 / angle_width inf / is_ring``). The host chains
+    ``run_matching`` command(s) over the affected frames afterwards —
+    segments and rings separately, CIF-restricted per frame — so the
+    new peaks join each frame's matched solutions.
+
+    The injected detected row carries ``score=1.0`` — the box exists on
+    the strength of its track (a peak fitted on both bracketing frames),
+    not an mlgidDETECT confidence, and must not vanish under the
+    Display dock's min-score slider.
+
+    Returns ``[{"track", "frame", "detected_id", "fitted_id"}, ...]``
+    for the boxes whose fit succeeded — the host appends these as new
+    track members. A box whose fit fails is skipped and its injected
+    detected row deleted again (no orphan geometry in the file); the
+    skip is logged. Frames with missing geometry / datasets are skipped
+    whole. ``kwargs["fit_params"]`` carries the Pipeline panel's fit
+    config so the fills use the SAME settings the next ``run_fitting``
+    would.
+
+    Emits one ``Saved fitted peaks … frame: N`` log line per completed
+    frame — the exact shape ``workers._FrameProgressHandler`` counts,
+    so the host's progress bar ticks per frame.
+    """
+    import logging as _logging
+
+    import h5py
+    import numpy as np
+
+    from mlgidlab import file_model
+    from mlgidlab.manual_fit import ManualFitError, fit_one_peak
+
+    log = _logging.getLogger("mlgidBASE")
+    entry = str(kwargs.get("entry") or "")
+    plan = kwargs.get("plan") or {}
+    fit_params = dict(kwargs.get("fit_params") or {})
+    if not entry or not plan:
+        return []
+
+    results: list = []
+    for frame in sorted(plan):
+        specs = plan[frame]
+        frame = int(frame)
+        if not specs:
+            continue
+        geom = file_model.read_geometry_for_entry(
+            file_path, entry, frame=frame
+        )
+        if geom is None:
+            log.warning(
+                "interpolate_tracks: missing instrument geometry for "
+                "entry %s — skipping frame %d", entry, frame,
+            )
+            continue
+        geom = dict(geom)
+        geom.pop("q_z_axis", None)
+        try:
+            with h5py.File(file_path, "r") as f:
+                grp = f[entry]
+                cart = np.asarray(grp[file_model.IMG_REL][frame])
+                q_xy = np.asarray(
+                    grp[file_model.QXY_REL][()], dtype=float
+                )
+                q_z = np.asarray(grp[file_model.QZ_REL][()], dtype=float)
+        except Exception as exc:
+            log.warning(
+                "interpolate_tracks: could not read frame %d of %s: %s",
+                frame, entry, exc,
+            )
+            continue
+        for spec in specs:
+            is_ring = bool(spec.get("is_ring", False))
+            try:
+                # Ring boxes are stored with their FINITE quadrant-
+                # spanning geometry (pygidfit classifies rings
+                # geometrically and an inf width breaks its grid math
+                # on a later whole-frame refit); the is_ring flag makes
+                # the viewer draw the box as a ring, not a segment.
+                det_id = int(file_model.add_detected_peak_row(
+                    file_path, entry, frame,
+                    angle=float(spec["angle"]),
+                    angle_width=float(spec["angle_width"]),
+                    radius=float(spec["radius"]),
+                    radius_width=float(spec["radius_width"]),
+                    score=1.0, is_ring=is_ring,
+                ))
+            except Exception as exc:
+                log.warning(
+                    "interpolate_tracks: could not inject a detected box "
+                    "on frame %d (track %s): %s",
+                    frame, spec.get("track"), exc,
+                )
+                continue
+            try:
+                fit = fit_one_peak(
+                    cart, q_xy, q_z,
+                    radius=float(spec["radius"]),
+                    radius_width=float(spec["radius_width"]),
+                    angle=float(spec["angle"]),
+                    angle_width=float(spec["angle_width"]),
+                    crit_angle=float(fit_params.get("crit_angle", 0.0)),
+                    theta_fixed=bool(fit_params.get("theta_fixed", True)),
+                    clustering_distance_peaks=float(
+                        fit_params.get("clustering_distance_peaks", 10.0)
+                    ),
+                    clustering_distance_rings=float(
+                        fit_params.get("clustering_distance_rings", 10.0)
+                    ),
+                    clustering_extend=int(
+                        fit_params.get("clustering_extend", 2)
+                    ),
+                    **geom,
+                )
+            except ManualFitError as exc:
+                # No orphan geometry: the injected detected box exists
+                # only to be fitted, so remove it again on failure.
+                try:
+                    file_model.delete_peak_row(
+                        file_path, entry, frame, "detected", det_id
+                    )
+                except Exception:
+                    logger.debug(
+                        "suppressed exception cleaning up an injected "
+                        "detected box", exc_info=True,
+                    )
+                log.warning(
+                    "interpolate_tracks: 2D fit failed on frame %d "
+                    "(track %s) — gap left unfilled: %s",
+                    frame, spec.get("track"), exc,
+                )
+                continue
+            # Persist. A ring fit returns angle = NaN / angle_width =
+            # inf (pygidfit fits rings radially); store mlgidLAB's ring
+            # row convention (angle 45, angle_width inf, is_ring) so
+            # the row reads like every other ring in the file. Non-
+            # finite shape coefficients collapse to 0.0.
+            fit_angle = float(fit.angle)
+            fit_aw = float(fit.angle_width)
+            if is_ring or not np.isfinite(fit_angle):
+                fit_angle = 45.0
+            if is_ring:
+                fit_aw = float("inf")
+            elif not np.isfinite(fit_aw):
+                fit_aw = float(spec["angle_width"])
+            new_fid = int(file_model.add_fitted_peak_row(
+                file_path, entry, frame,
+                radius=fit.radius, radius_width=fit.radius_width,
+                angle=fit_angle, angle_width=fit_aw,
+                amplitude=fit.amplitude, is_ring=is_ring,
+                theta=_finite_or(fit.theta, 0.0),
+                A=_finite_or(fit.A, 0.0),
+                B=_finite_or(fit.B, 0.0),
+                C=_finite_or(fit.C, 0.0),
+            ))
+            results.append({
+                "track": int(spec["track"]),
+                "frame": frame,
+                "detected_id": det_id,
+                "fitted_id": new_fid,
+                "is_ring": is_ring,
+            })
+        # One per-frame completion line, in the exact shape
+        # _FrameProgressHandler counts for the progress bar.
+        log.info(
+            f"Saved fitted peaks to file: {Path(file_path).name}, "
+            f"entry: {entry}, frame: {frame}"
+        )
+    return results
+
+
 def execute(file_path: Path, command: PipelineCommand) -> Any:
     """Run one pipeline command on a NeXus file. Lazily imports mlgidbase.
 
@@ -163,6 +355,13 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
                 f"selection survived a file swap."
             )
 
+    # Interpolate-tracks runs entirely on mlgidlab primitives (h5py +
+    # pygidfit via manual_fit) — deliberately BEFORE the mlgidbase
+    # import so it neither needs the private backend nor competes with
+    # a pygid r+ handle on the same file.
+    if command.op_name == "interpolate_tracks":
+        return _execute_interpolate_tracks(file_path, dict(command.kwargs))
+
     # Some labeled training files (e.g. ``organic_labeled.h5``) carry
     # fitted_peaks rows that only have polar coordinates — Cartesian
     # ``q_xy`` / ``q_z`` and ``amplitude`` are stored as zeros. mlgidmatch
@@ -170,8 +369,11 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
     # intensity_threshold``, so without back-filling every peak collapses
     # to the origin with zero intensity and matching silently returns
     # "no solutions". Normalise *before* opening the file via mlgidBASE
-    # so the rebuilt analysis sees the patched dataset.
-    if command.op_name == "run_matching":
+    # so the rebuilt analysis sees the patched dataset. track_peaks
+    # needs the same treatment: its trajectory payload reads q_xy/q_z
+    # straight off the fitted rows, so polar-only rows would collapse
+    # every track to the origin in the views.
+    if command.op_name in ("run_matching", "track_peaks"):
         try:
             _backfill_fitted_peaks_polar_to_cartesian(
                 file_path, command.kwargs.get("entry"),
@@ -265,10 +467,50 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
             except Exception:
                 logger.debug("suppressed exception in execute", exc_info=True)
                 pass
+    if command.op_name == "track_peaks" and not hasattr(analysis, "track_peaks"):
+        # Feature-gate by capability, not version: the first mlgidbase
+        # build with tracking (main @ 561edfa) still self-labels 0.1.3,
+        # so a version compare cannot distinguish it from the release.
+        raise RuntimeError(
+            "The installed mlgidbase has no track_peaks — peak tracking "
+            "needs a build newer than the 0.1.3 release (mlgidBASE main "
+            "@ 561edfa or the release containing it). See "
+            "mlgidLAB/docs/backend_compatibility.md."
+        )
     method = getattr(analysis, command.op_name)
     if command.op_name == "run_detection":
         with detection_on_gpu():
             result = method(**kwargs)
+    elif command.op_name == "track_peaks":
+        # Upstream's first tracking implementation returns None and
+        # only draws figures — the data is recovered through the
+        # capture hook (see phase_tracking.capture_tracking). Force
+        # the capture contract regardless of what the caller put in
+        # kwargs: plot_result must be truthy for the hook to fire (no
+        # matplotlib runs — the recorder replaces the plot call) and
+        # axis='amplitude' makes one call carry every view's data.
+        from mlgidlab.phase_tracking import build_payload, capture_tracking
+
+        kwargs["axis"] = "amplitude"
+        kwargs["plot_params"] = {"plot_result": True, "save_fig": False}
+        try:
+            with capture_tracking() as rec:
+                method(**kwargs)
+        except ValueError as exc:
+            # np.vstack on an empty box list — the entry has no fitted
+            # peaks at all. Name the actual remedy instead of leaking
+            # "need at least one array to concatenate".
+            raise RuntimeError(
+                f"track_peaks found no fitted peaks in entry "
+                f"{kwargs.get('entry')!r} — run Fitting (all frames) "
+                f"first. ({exc})"
+            ) from exc
+        result = build_payload(
+            rec,
+            entry=str(kwargs.get("entry") or ""),
+            threshold=float(kwargs.get("threshold", 0.5)),
+            length=int(kwargs.get("length", 10)),
+        )
     else:
         result = method(**kwargs)
 

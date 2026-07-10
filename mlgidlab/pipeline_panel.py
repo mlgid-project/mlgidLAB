@@ -286,6 +286,21 @@ class PipelinePanel(QWidget):
         """
         if not hasattr(self, "_progress_bar"):
             return
+        if op_name == "track_peaks":
+            # track_peaks is one opaque mlgidBASE call dominated by the
+            # file open and the all-against-all IoU/graph step, not the
+            # (fast) per-frame reads — a determinate "N/M frames" bar
+            # just sits at 0 then flickers to full. Show a busy
+            # indicator (indeterminate marquee) for the whole run
+            # instead; set it up once (later ticks carry no new info).
+            if getattr(self, "_frame_progress_last_state", None) != ("track_peaks",):
+                self._frame_progress_last_state = ("track_peaks",)
+                self._progress_bar.setRange(0, 0)   # 0..0 == busy marquee
+                self._progress_label.setText("Tracking peaks…")
+                self._progress_label.show()
+                self._progress_bar.show()
+                self._frame_progress_last_visible = True
+            return
         if total <= 1:
             if getattr(self, "_frame_progress_last_visible", True):
                 self._progress_bar.hide()
@@ -626,12 +641,23 @@ class PipelinePanel(QWidget):
         )
         self.btn_parse_cifs.clicked.connect(self._on_parse_cifs)
         self.btn_parse_cifs.setEnabled(False)
+        # Compact busy bar shown while the parse worker runs. CifPattern
+        # simulates every CIF in one opaque call (no per-CIF callback to
+        # hook), so the bar is indeterminate — but it moves, which the
+        # static "Parsing…" text alone does not.
+        self.cif_parse_bar = QProgressBar()
+        self.cif_parse_bar.setRange(0, 0)
+        self.cif_parse_bar.setTextVisible(False)
+        self.cif_parse_bar.setFixedWidth(110)
+        self.cif_parse_bar.setFixedHeight(14)
+        self.cif_parse_bar.hide()
         self.cif_cache_label = QLabel("Not parsed")
         self.cif_cache_label.setStyleSheet("color: #aaa; font-style: italic;")
         cif_parse_row = QWidget()
         cif_parse_h = QHBoxLayout(cif_parse_row)
         cif_parse_h.setContentsMargins(0, 0, 0, 0)
         cif_parse_h.addWidget(self.btn_parse_cifs)
+        cif_parse_h.addWidget(self.cif_parse_bar)
         cif_parse_h.addWidget(self.cif_cache_label, 1)
         form.addRow("", cif_parse_row)
         # Any edit invalidates the cache and re-enables the button.
@@ -808,34 +834,57 @@ class PipelinePanel(QWidget):
         self._on_run_fitting()
         self._on_run_matching()
 
-    def _on_run_matching(self) -> None:
-        # The Source selector decides which input is used; the inactive
-        # row is greyed out and its content ignored. mlgidBASE.run_matching's
-        # ``load_cif_prepr`` accepts a path-to-pickle string verbatim, so
-        # the pickle path is forwarded untouched. For raw CIFs we reuse
-        # the cached CifPattern when the input hasn't changed since the
-        # last parse, otherwise we send the string and let the worker
-        # build the pattern.
+    def matching_kwargs(self) -> dict | None:
+        """Base ``run_matching`` kwargs (no entry/frame scope) from the
+        panel's current CIF source + parameters, or ``None`` when no
+        CIF source is configured.
+
+        The Source selector decides which input is used; the inactive
+        row is greyed out and its content ignored. mlgidBASE.run_matching's
+        ``load_cif_prepr`` accepts a path-to-pickle string verbatim, so
+        the pickle path is forwarded untouched. For raw CIFs we reuse
+        the cached CifPattern when the input hasn't changed since the
+        last parse, otherwise we send the string and let the worker
+        build the pattern. Public so the host can chain a matching pass
+        (e.g. after Interpolate-track's gap fills) with the SAME
+        settings the panel's own Run matching would use.
+        """
         if self._use_pickle_source():
             pkl = self.pickle_path.text().strip()
             if not pkl:
-                return
+                return None
             cif_value: object = pkl
         else:
             cif = self.cif_path.text().strip()
             if not cif:
-                return
+                return None
             if self._cached_cif_obj is not None and self._cached_cif_input == cif:
                 cif_value = self._cached_cif_obj
             else:
                 cif_value = cif
-        kwargs: dict = {
+        return {
             "cif_prepr": cif_value,
             "peaks_type": self.peaks_type.currentText(),
             "threshold": float(self.threshold.value()),
             "intensity_threshold": float(self.intensity_threshold.value()),
             "device": self.device.currentText(),
         }
+
+    def cif_source_text(self) -> str:
+        """The RAW .cif source text (folder / file / ``;``-list) when
+        the CIF input row is active — ``""`` for the pickle source or
+        an empty field. Lets the host build CIF-restricted matching
+        commands (Interpolate track) even when ``matching_kwargs()``
+        returns the cached pre-parsed ``CifPattern`` object, which
+        cannot be subset."""
+        if self._use_pickle_source():
+            return ""
+        return self.cif_path.text().strip()
+
+    def _on_run_matching(self) -> None:
+        kwargs = self.matching_kwargs()
+        if kwargs is None:
+            return
         self._inject_entry_scope(self.match_entry_scope, kwargs)
         self._inject_frame_scope(self.match_frame_scope, kwargs)
         self.runRequested.emit(PipelineCommand("run_matching", kwargs))
@@ -849,6 +898,7 @@ class PipelinePanel(QWidget):
         # set_cif_pattern.
         self.btn_parse_cifs.setEnabled(False)
         self.btn_parse_cifs.setText("Parsing…")
+        self.cif_parse_bar.show()
         self.cif_cache_label.setText("Parsing…")
         self.cif_cache_label.setStyleSheet("color: #ffeb3b; font-style: italic;")
         self.parseCifsRequested.emit(text)
@@ -899,6 +949,7 @@ class PipelinePanel(QWidget):
         """
         self.btn_parse_cifs.setText("Parse CIFs")
         self.btn_parse_cifs.setEnabled(True)
+        self.cif_parse_bar.hide()
         if error is not None or obj is None:
             self._cached_cif_obj = None
             self._cached_cif_input = None

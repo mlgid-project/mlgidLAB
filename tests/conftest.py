@@ -306,6 +306,72 @@ def synthetic_nexus_with_peaks(tmp_path):
 
 
 @pytest.fixture
+def synthetic_fitted_scan(tmp_path):
+    """A pygid-valid NeXus scan with fitted peaks on every frame.
+
+    6 frames; one persistent fitted peak drifting slowly in radius
+    (frames 0-5, id 0 each) plus one single-frame blip on frame 2
+    (id 1). Built for the phase-tracking tests: the ``axes`` attr on
+    the data group is REQUIRED — ``pygid.NexusFile.get_entry_type``
+    rejects entries without it (nexus_reader.py:526), and mlgidBASE's
+    ``track_peaks`` opens the file through pygid. The blip forms a
+    1-member IoU component, so upstream's ``length`` cut (strictly
+    greater) drops it for any ``length >= 1``.
+
+    Imports are local so the conftest environment lockdown is fully
+    applied before h5py touches HDF5.
+    """
+    import h5py
+    import numpy as np
+
+    path = tmp_path / "synthetic_fitted_scan.h5"
+    n_frames, n_qz, n_qxy = 6, 16, 24
+    dt = np.dtype(PYGID_PEAK_DTYPE)
+    rng = np.random.default_rng(0)
+
+    def _rows(specs):
+        arr = np.zeros(len(specs), dtype=dt)
+        for i, (radius, angle, amp) in enumerate(specs):
+            arr["id"][i] = i
+            arr["score"][i] = 0.9
+            arr["amplitude"][i] = amp
+            arr["angle"][i] = angle
+            arr["radius"][i] = radius
+            arr["angle_width"][i] = 5.0
+            arr["radius_width"][i] = 0.2
+            arr["q_xy"][i] = radius * np.cos(np.deg2rad(angle))
+            arr["q_z"][i] = radius * np.sin(np.deg2rad(angle))
+        return arr
+
+    with h5py.File(path, "w", track_order=True) as f:
+        data = f.create_group("entry_0000/data", track_order=True)
+        data.attrs["signal"] = "img_gid_q"
+        data.attrs["axes"] = ["frame_num", "q_z", "q_xy"]
+        data.create_dataset(
+            "img_gid_q",
+            data=rng.random((n_frames, n_qz, n_qxy), dtype=np.float32),
+        )
+        data.create_dataset(
+            "q_xy", data=np.linspace(-1.0, 3.0, n_qxy, dtype=np.float32)
+        )
+        data.create_dataset(
+            "q_z", data=np.linspace(0.0, 4.0, n_qz, dtype=np.float32)
+        )
+        for frame in range(n_frames):
+            specs = [(1.0 + 0.002 * frame, 45.0, 100.0 + frame)]
+            if frame == 2:
+                specs.append((2.5, 10.0, 50.0))
+            g = data.create_group(
+                f"analysis/frame{frame:05d}", track_order=True
+            )
+            g.create_dataset("fitted_peaks", data=_rows(specs))
+            g.create_dataset(
+                "fitted_peaks_errors", data=np.zeros(0, dtype=dt)
+            )
+    return path
+
+
+@pytest.fixture
 def synthetic_raw(tmp_path):
     """A raw HDF5 file with one qualifying 3-D detector dataset.
 

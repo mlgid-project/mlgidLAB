@@ -261,15 +261,18 @@ def test_update_button_shown_only_when_self_update_supported(
 def test_auto_update_installs_on_launch_when_enabled(main_window, monkeypatch):
     from PySide6.QtCore import QSettings
 
-    started: list[str] = []
+    requested: list[bool] = []
     monkeypatch.setattr(uc, "self_update_supported", lambda *a, **k: (True, ""))
+    # Auto-update on launch goes through the same confirm-then-install flow as
+    # the button (never a silent install), so it routes to
+    # _on_install_update_requested, not _start_update_install directly.
     monkeypatch.setattr(
-        main_window, "_start_update_install", lambda tag: started.append(tag)
+        main_window, "_on_install_update_requested",
+        lambda: requested.append(True),
     )
     QSettings().setValue(main_window._AUTO_UPDATE_KEY, True)
     main_window._on_update_check_finished(("v99.0.0", "http://x/rel"))
-    # Auto-update kicks off the install and skips the banner.
-    assert started == ["v99.0.0"]
+    assert requested == [True]
     assert main_window._update_banner.isHidden()
     # Reset so the setting doesn't leak into other tests in this process.
     QSettings().setValue(main_window._AUTO_UPDATE_KEY, False)
@@ -294,18 +297,19 @@ def test_update_now_menu_confirms_install_when_newer(main_window, monkeypatch):
 def test_auto_update_ignored_for_unsupported_install(main_window, monkeypatch):
     from PySide6.QtCore import QSettings
 
-    started: list[str] = []
+    requested: list[bool] = []
     # Toggle is on, but the install is editable -> never auto-install; the
     # banner is shown without the "Update now" button.
     monkeypatch.setattr(
         uc, "self_update_supported", lambda *a, **k: (False, "editable")
     )
     monkeypatch.setattr(
-        main_window, "_start_update_install", lambda tag: started.append(tag)
+        main_window, "_on_install_update_requested",
+        lambda: requested.append(True),
     )
     QSettings().setValue(main_window._AUTO_UPDATE_KEY, True)
     main_window._on_update_check_finished(("v99.0.0", "http://x/rel"))
-    assert started == []
+    assert requested == []
     assert not main_window._update_banner.isHidden()
     assert main_window._update_banner._update_btn.isHidden()
     QSettings().setValue(main_window._AUTO_UPDATE_KEY, False)

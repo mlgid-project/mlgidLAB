@@ -143,6 +143,20 @@ class CopyWorker(QObject):
             from mlgidlab import file_model  # lazy: avoid import cycle at load
             from mlgidlab.session import NexusSession
 
+            # Standalone image files (TIFF/CBF/EDF) are read via fabio, not
+            # h5py — short-circuit before the HDF5 shallow-list + raw walk
+            # (which would just throw on a non-HDF5 file). They open as a
+            # raw-mode session; the stack entry is built lazily at
+            # activation (main_window._populate_raw_entries) from the bundled
+            # paths, so no per-file entry list is attached here (raw_entries
+            # stays None, exactly like a raw file whose walk found nothing
+            # to pre-cache).
+            if file_model.is_fabio_image(self._original_path):
+                result["kind"] = "raw"
+                self.progress.emit(100, "Done")
+                self.finished.emit(result)
+                return
+
             self.progress.emit(10, "Reading file")
             # SHALLOW listing: read only the master's entry-group link names
             # (``keys()`` does not dereference external links). The previous
@@ -366,7 +380,7 @@ class EntryLoadWorker(QObject):
 
         stack = None
         try:
-            stack = file_model.LazyRawStack(raw_entry)
+            stack = file_model.build_raw_stack(raw_entry)
             stack.acquire()
             stack.get_frame(0)
         except Exception:
@@ -581,6 +595,16 @@ class PipelineWorker(QObject):
         entry = kw.get("entry")
         frame_num = kw.get("frame_num")
         try:
+            # interpolate_tracks carries its work list in kwargs: one
+            # progress tick per planned gap frame (the op logs a
+            # "Saved fitted peaks" line per frame).
+            if self._command.op_name == "interpolate_tracks":
+                plan = kw.get("plan") or {}
+                return len(plan), str(entry or "")
+            # A frame list (e.g. the matching pass chained after
+            # interpolate_tracks) ticks once per listed frame.
+            if isinstance(frame_num, (list, tuple)):
+                return len(frame_num), str(entry or "")
             # Single-frame scope: skip a list_entries open, hide the
             # bar at the panel layer.
             if isinstance(frame_num, int):
@@ -626,6 +650,7 @@ class PipelineWorker(QObject):
         # mlgidbase starts logging its first frame. The host keeps the
         # bar hidden when ``total <= 1`` so single-frame runs stay quiet.
         self.frameProgress.emit(0, total, op_name, entry_label)
+
         try:
             result = execute(self._file_path, self._command)
             # Cap at total on the successful path. mlgidbase may have
@@ -651,6 +676,129 @@ class PipelineWorker(QObject):
             root.removeHandler(handler)
             root.removeHandler(progress_handler)
             root.setLevel(prev_level)
+
+
+class ScanProfileWorker(QObject):
+    """Computes per-scan display aids for the phase-tracking views.
+
+    Two modes, both read-only through the worker's OWN h5py handle
+    (never the viewer's FrameSource), frame by frame so memory stays
+    O(one frame) even on 100+ GB scans:
+
+    - ``"waterfall"``: per frame, resample to polar
+      (``mlgidlab.polar.cartesian_to_polar``) and take the angular
+      nanmean — one radial profile per frame. Result:
+      ``{"kind": "waterfall", "data": (n_frames, n_radius) float32,
+      "radius": (n_radius,), "entry": str}``.
+    - ``"mean_image"``: nan-aware mean of the Cartesian frames in
+      ``[frame_lo, frame_hi]`` (inclusive, clamped). Result:
+      ``{"kind": "mean_image", "data": (n_qz, n_qxy) float32,
+      "q_xy", "q_z", "lo", "hi", "entry"}``.
+
+    Emits ``progress(done, total)`` per frame and
+    ``finished(result_dict | None, Exception | None)``.
+    """
+
+    finished = Signal(object, object)
+    progress = Signal(int, int)
+
+    def __init__(
+        self,
+        file_path: Path,
+        entry: str,
+        mode: str,
+        frame_lo: int | None = None,
+        frame_hi: int | None = None,
+        n_radius: int = 512,
+        n_angle: int = 256,
+    ) -> None:
+        super().__init__()
+        if mode not in ("waterfall", "mean_image"):
+            raise ValueError(f"unknown ScanProfileWorker mode {mode!r}")
+        self._file_path = file_path
+        self._entry = entry
+        self._mode = mode
+        self._frame_lo = frame_lo
+        self._frame_hi = frame_hi
+        self._n_radius = int(n_radius)
+        self._n_angle = int(n_angle)
+
+    def run(self) -> None:
+        try:
+            import warnings
+
+            import h5py
+
+            from mlgidlab.polar import cartesian_to_polar
+
+            with h5py.File(self._file_path, "r") as f:
+                data = f[self._entry]["data"]
+                signal = data.attrs.get("signal")
+                if isinstance(signal, bytes):
+                    signal = signal.decode("utf-8", errors="replace")
+                ds = data[signal]
+                q_xy = np.asarray(data["q_xy"], dtype=float)
+                q_z = np.asarray(data["q_z"], dtype=float)
+                n = int(ds.shape[0])
+
+                if self._mode == "waterfall":
+                    rows = []
+                    radius = None
+                    for i in range(n):
+                        pol = cartesian_to_polar(
+                            np.asarray(ds[i], dtype=np.float32),
+                            q_xy, q_z,
+                            n_radius=self._n_radius,
+                            n_angle=self._n_angle,
+                        )
+                        with warnings.catch_warnings():
+                            # All-NaN rows (uncovered polar regions)
+                            # are expected — nanmean warns per row.
+                            warnings.simplefilter("ignore", RuntimeWarning)
+                            rows.append(np.nanmean(pol.image, axis=1))
+                        radius = pol.radius
+                        self.progress.emit(i + 1, n)
+                    result = {
+                        "kind": "waterfall",
+                        "data": np.vstack(rows).astype(np.float32),
+                        "radius": radius,
+                        "entry": self._entry,
+                    }
+                else:
+                    lo = 0 if self._frame_lo is None else int(self._frame_lo)
+                    hi = n - 1 if self._frame_hi is None else int(self._frame_hi)
+                    lo = max(0, min(lo, n - 1))
+                    hi = max(lo, min(hi, n - 1))
+                    acc = None
+                    count = None
+                    total = hi - lo + 1
+                    for j, i in enumerate(range(lo, hi + 1)):
+                        frame = np.asarray(ds[i], dtype=np.float64)
+                        finite = np.isfinite(frame)
+                        if acc is None:
+                            acc = np.zeros(frame.shape, dtype=np.float64)
+                            count = np.zeros(frame.shape, dtype=np.int64)
+                        acc[finite] += frame[finite]
+                        count += finite
+                        self.progress.emit(j + 1, total)
+                    mean = acc / np.maximum(count, 1)
+                    mean[count == 0] = np.nan
+                    result = {
+                        "kind": "mean_image",
+                        "data": mean.astype(np.float32),
+                        "q_xy": q_xy,
+                        "q_z": q_z,
+                        "lo": lo,
+                        "hi": hi,
+                        "entry": self._entry,
+                    }
+            self.finished.emit(result, None)
+        except Exception as exc:
+            logger.debug(
+                "suppressed exception in ScanProfileWorker.run",
+                exc_info=True,
+            )
+            self.finished.emit(None, exc)
 
 
 class PrefetchWorker(QObject):

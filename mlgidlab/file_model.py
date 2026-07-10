@@ -893,24 +893,74 @@ class _LazyPolarStack:
 # scalar arrays that h5py would otherwise misclassify as 3D.
 RAW_MIN_DETECTOR_HW = 32
 
+# Standalone detector-image formats read via ``fabio`` (the same set
+# pygid's DataLoader documents). These are NOT HDF5 — they open as raw
+# image files, one frame per file, and go through the raw-mode workflow.
+FABIO_EXTENSIONS = frozenset({".tif", ".tiff", ".cbf", ".edf"})
+
+
+def is_fabio_image(path: "Path | str") -> bool:
+    """True when ``path`` is a standalone image file we open via fabio."""
+    return Path(path).suffix.lower() in FABIO_EXTENSIONS
+
+
+_fabio_quieted = False
+
+
+def _quiet_fabio() -> None:
+    """Silence fabio's per-read TIFF chatter once (mirrors pygid's DataLoader).
+
+    Many beamline TIFFs trip fabio's "Non standard TIFF" UserWarning on every
+    open; without this, scrolling a stack would spam one line per frame.
+    Idempotent and lazy so it only runs when images are actually used.
+    """
+    global _fabio_quieted
+    if _fabio_quieted:
+        return
+    import warnings
+
+    warnings.filterwarnings(
+        "ignore", category=UserWarning, module="fabio.TiffIO"
+    )
+    logging.getLogger("fabio.TiffIO").setLevel(logging.ERROR)
+    _fabio_quieted = True
+
 
 @dataclass
 class RawEntry:
-    """One candidate raw-detector dataset within an HDF5 file.
+    """One raw-detector source: an HDF5 dataset or a fabio image stack.
 
     ``dataset_path`` is the absolute path inside the HDF5 file (without
     the leading slash) — pygid's ``DataLoader`` accepts this form
     directly as its ``dataset`` kwarg.
+
+    ``frame_map`` distinguishes the two backings and is the single flag
+    the rest of the code branches on:
+
+    * ``None`` → an HDF5 detector dataset (read via ``LazyRawStack``,
+      the existing path — completely unchanged).
+    * set → a fabio image stack (read via ``LazyFabioStack``). Frame
+      ``i`` maps to ``frame_map[i] == (file, in_file_index)`` (the index
+      is ``0`` for the one-frame-per-file case). ``dataset_path`` is
+      ``""`` because pygid ignores it for non-HDF5 files.
     """
 
     file_path: Path
     dataset_path: str
     shape: tuple[int, int, int]
     dtype: str
+    frame_map: list[tuple[Path, int]] | None = None
 
     @property
     def label(self) -> str:
         """Human-readable identifier for the entry combo / log lines."""
+        if self.frame_map is not None:
+            n = len(self.frame_map)
+            return (
+                self.file_path.name
+                if n == 1
+                else f"{self.file_path.name} (+{n - 1} more)"
+            )
         return f"{self.file_path.name}::{self.dataset_path}"
 
 
@@ -983,6 +1033,37 @@ def list_raw_entries(
             if progress is not None:
                 progress(done, total)
     return out
+
+
+def list_fabio_entries(paths: "list[Path]") -> "list[RawEntry]":
+    """Build one ``RawEntry`` PER image file — separate 1-frame entries.
+
+    Multiple images open as independent entries (not a combined stack), so
+    each file is selected, viewed and converted on its own. Only the FIRST
+    file is read (for ``(H, W)`` + dtype, assumed uniform across the batch)
+    so activation stays off-disk on the GUI thread even for a big folder;
+    the frame pixels themselves are read lazily by ``LazyFabioStack``.
+    ``dataset_path`` is empty — pygid ignores it for non-HDF5 files.
+    """
+    import fabio  # lazy: fabio is only needed when images are actually used
+
+    _quiet_fabio()
+    resolved = [Path(p) for p in paths]
+    if not resolved:
+        raise ValueError("list_fabio_entries requires at least one path")
+    data = np.asarray(fabio.open(str(resolved[0])).data)
+    h, w = int(data.shape[-2]), int(data.shape[-1])
+    dtype = str(data.dtype)
+    return [
+        RawEntry(
+            file_path=p,
+            dataset_path="",
+            shape=(1, h, w),
+            dtype=dtype,
+            frame_map=[(p, 0)],
+        )
+        for p in resolved
+    ]
 
 
 def load_raw_dataset(entry: RawEntry) -> np.ndarray:
@@ -1130,6 +1211,119 @@ class LazyRawStack:
         )
 
 
+class LazyFabioStack:
+    """``(N, H, W)`` indexable view over a fabio image stack.
+
+    Fabio counterpart of ``LazyRawStack`` with the identical surface
+    (``shape`` / ``ndim`` / ``dtype`` / ``len`` / ``stack[i]`` /
+    ``stack[frame, r, c]``, ``acquire`` / ``release``, ``__array__``
+    raises) so the image viewer and ``EntryLoadWorker`` treat both the
+    same. Each frame is a different file, so there is no persistent
+    handle — ``acquire`` just flips an open flag to keep the "not
+    acquired" guard; frames are read on demand via ``fabio.open`` and
+    LRU-cached. Integer frames are upcast to float32 like ``LazyRawStack``.
+    """
+
+    _LRU_MAX = 8
+
+    def __init__(self, entry: RawEntry) -> None:
+        if entry.frame_map is None:
+            raise ValueError("LazyFabioStack requires a fabio RawEntry")
+        self._entry = entry
+        self._frame_map = entry.frame_map
+        self._lru: OrderedDict[int, np.ndarray] = OrderedDict()
+        self._open = False
+
+    @property
+    def entry(self) -> RawEntry:
+        return self._entry
+
+    @property
+    def is_open(self) -> bool:
+        return self._open
+
+    def acquire(self) -> None:
+        """Mark the stack ready to read. Idempotent."""
+        self._open = True
+
+    def release(self) -> None:
+        """Drop cached frames and mark closed. Idempotent."""
+        self._open = False
+        self._lru.clear()
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return self._entry.shape
+
+    @property
+    def ndim(self) -> int:
+        return 3
+
+    @property
+    def dtype(self) -> np.dtype:
+        kind = np.dtype(self._entry.dtype).kind
+        return np.dtype(np.float32) if kind in ("i", "u") else np.dtype(self._entry.dtype)
+
+    def __len__(self) -> int:
+        return self._entry.shape[0]
+
+    def get_frame(self, i: int) -> np.ndarray:
+        """One ``(H, W)`` frame, float32-upcast, LRU-cached."""
+        import fabio
+
+        if not self._open:
+            raise RuntimeError("LazyFabioStack not acquired")
+        if i in self._lru:
+            self._lru.move_to_end(i)
+            return self._lru[i]
+        _quiet_fabio()
+        path, idx = self._frame_map[i]
+        img = fabio.open(str(path))
+        arr = np.asarray(img.data if idx == 0 else img.getframe(idx).data)
+        if arr.dtype.kind in ("i", "u"):
+            arr = arr.astype(np.float32, copy=False)
+        arr = np.ascontiguousarray(arr)
+        self._lru[i] = arr
+        while len(self._lru) > self._LRU_MAX:
+            self._lru.popitem(last=False)
+        return arr
+
+    def __array__(self, *args, **kwargs):
+        raise TypeError(
+            "LazyFabioStack cannot be materialized as a full array; "
+            "read frames individually via stack[i]."
+        )
+
+    def __getitem__(self, key):
+        """``stack[i]`` → 2D frame; ``stack[frame, r, c]`` → one pixel."""
+        if isinstance(key, (int, np.integer)):
+            return self.get_frame(int(key))
+        if isinstance(key, tuple) and len(key) == 3:
+            frame, r, c = key
+            if (
+                isinstance(frame, (int, np.integer))
+                and isinstance(r, (int, np.integer))
+                and isinstance(c, (int, np.integer))
+            ):
+                return self.get_frame(int(frame))[int(r), int(c)]
+        raise TypeError(
+            f"LazyFabioStack supports stack[i] or stack[frame, r, c] "
+            f"only; got {key!r}."
+        )
+
+
+def build_raw_stack(entry: RawEntry):
+    """Return the right lazy stack for ``entry`` (fabio vs HDF5).
+
+    The single switch used by ``EntryLoadWorker.load_raw`` so raw-mode
+    stays backing-agnostic. HDF5 entries (``frame_map is None``) keep
+    using ``LazyRawStack`` unchanged.
+    """
+    if entry.frame_map is not None:
+        return LazyFabioStack(entry)
+    return LazyRawStack(entry)
+
+
 def _frame_analysis_group(
     f: "h5py.File | h5py.Group", entry: str, frame: int
 ) -> "h5py.Group | None":
@@ -1266,6 +1460,17 @@ class MatchedStructure:
     def unique_id(self) -> str:
         """Stable handle within one frame."""
         return f"{self.solution_field}/{self.local_idx}"
+
+    @property
+    def color_key(self) -> tuple:
+        """Cross-frame identity of the structure (CIF + Miller indices).
+
+        Unlike ``unique_id`` (a per-frame dataset position that shifts
+        between frames), this is stable across the whole scan, so the
+        overlay colour and the show/hide state can be keyed to it — a
+        given (CIF, hkl) reads the same colour and honours the same
+        checkbox on every frame."""
+        return (self.cif, int(self.h), int(self.k), int(self.l))
 
     @property
     def label(self) -> str:

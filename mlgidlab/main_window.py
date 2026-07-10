@@ -84,14 +84,16 @@ from mlgidlab import update_check
 from mlgidlab.image_viewer import (
     GIWAXSImageViewer,
     MATCHED_STYLE,
+    UNMATCHED_COLOR,
     ManualPeak,
     OVERLAY_KINDS,
     OVERLAY_STYLE,
     SelectedPeak,
-    matched_pen_for,
 )
 from mlgidlab.parameter_panel import ParameterPanel
+from mlgidlab import phase_tracking
 from mlgidlab.peaks_table_panel import PeaksTablePanel
+from mlgidlab.phase_views_window import PhaseViewsWindow
 from mlgidlab.pipeline import (
     PipelineCommand,
     is_mlgidbase_available,
@@ -99,6 +101,7 @@ from mlgidlab.pipeline import (
 from mlgidlab.pipeline_panel import PipelinePanel
 from mlgidlab.profile_viewer import ProfileViewer
 from mlgidlab.conversion_panel import ConversionPanel
+from mlgidlab.scan_tracking_panel import ScanTrackingPanel
 from mlgidlab.session import BaseSession, NexusSession, RawSession, Session
 from mlgidlab.workers import (
     CifParseWorker,
@@ -114,8 +117,24 @@ logger = logging.getLogger(__name__)
 
 APP_NAME = "mlgidLAB"
 NEXUS_FILTER = "HDF5 / NeXus (*.h5 *.hdf5 *.nxs);;All files (*)"
-# Open dialog now auto-classifies NeXus vs raw; one filter does for both.
-OPEN_FILTER = "HDF5 (*.h5 *.hdf5 *.nxs);;All files (*)"
+# Open dialog auto-classifies NeXus vs raw HDF5 vs fabio image (TIFF/CBF/EDF);
+# one combined filter does for all, with per-family filters below it.
+OPEN_FILTER = (
+    "All supported (*.h5 *.hdf5 *.nxs *.tif *.tiff *.cbf *.edf);;"
+    "HDF5 / NeXus (*.h5 *.hdf5 *.nxs);;"
+    "Detector images (*.tif *.tiff *.cbf *.edf);;"
+    "All files (*)"
+)
+
+
+def _natural_key(path: Path):
+    """Sort key so ``img_2`` precedes ``img_10`` (digits compared numerically)."""
+    import re
+
+    return [
+        int(tok) if tok.isdigit() else tok.lower()
+        for tok in re.split(r"(\d+)", path.name)
+    ]
 
 
 def _make_pen_swatch(style: dict, width: int = 26, height: int = 12) -> QPixmap:
@@ -731,6 +750,47 @@ class MainWindow(QMainWindow):
         self._worker: CopyWorker | None = None
         self._pipe_thread: QThread | None = None
         self._pipe_worker: PipelineWorker | None = None
+        # Phase-tracking (mlgidBASE track_peaks) results. Per-entry and
+        # referencing FITTED rows, so they invalidate on entry switch
+        # and on any fitted mutation — see _invalidate_scan_tracks.
+        self._scan_payload: phase_tracking.TrackingPayload | None = None
+        self._scan_member_ids: list | None = None
+        self._scan_track_entry: str | None = None
+        # Fitted tables read during member-id reconstruction, kept for
+        # the only-tracked display options (gap interpolation anchors,
+        # GUI-side ring tracking). {frame: PeakTable | None}.
+        self._scan_fitted_tables: dict[int, object] = {}
+        # {track_index: [cif, ...]} — the matched crystal phases each
+        # track's tracked peaks belong to (dominant first), for the
+        # phase-views q-map "Color by matched phase" overlay. Empty
+        # until Matching has run; cleared with the rest of the results.
+        self._scan_track_phases: dict = {}
+        # Track indices that are rings — the q-map draws them as dashed
+        # quarter-circle arcs rather than trajectory points.
+        self._scan_ring_tracks: set = set()
+        # Interpolate-track (gap fill) run in flight: the fill records
+        # returned by the interpolate_tracks op (each {"track",
+        # "frame", "detected_id", "fitted_id", "is_ring"}), applied as
+        # new track members once the LAST chained re-match finishes;
+        # and the chain bookkeeping that drives the loading dialog with
+        # the workers' REAL per-frame progress:
+        #   {"commands": [cmd, ...],          # keeps ids alive
+        #    "ticks": {id(cmd): n_frames},    # per-command bar weight
+        #    "total": N, "base": 0}           # overall progress
+        self._interp_fill_result: list | None = None
+        self._interp_chain: dict | None = None
+        # Phase-tracking views window: lazily built on first "Show
+        # views…", kept alive so its settings and computed caches
+        # persist across re-opens (same pattern as _figure_export_window).
+        self._phase_views_window: PhaseViewsWindow | None = None
+        # Modal progress dialog shown during a track_peaks run. The
+        # tracking button lives in the Scan-tracking dock but the
+        # pipeline panel's bar is in a (usually tabbed-away) dock, so a
+        # centred dialog is the only reliably-visible feedback. Its bar
+        # is advanced by a GUI-thread timer (the op has no clean
+        # per-frame progress — see the busy-bar note in pipeline_panel).
+        self._track_progress_dialog: QProgressDialog | None = None
+        self._track_progress_timer: QTimer | None = None
         # pygid normalization is lazy (deferred off the open path). This
         # records which (temp-file, entry) pairs have already been
         # normalized so ``_ensure_entry_normalized`` runs the scoped
@@ -1219,6 +1279,11 @@ class MainWindow(QMainWindow):
         # Bulk wipe invalidates every FileGeomAction and the selection.
         self.viewer.clear_history()
         self.viewer.clear_selection()
+        # Clearing fitted rows orphans any phase-tracking results
+        # (upstream tracks fitted peaks). Detected/matched-only clears
+        # leave fitted intact so tracks stay valid.
+        if kind == "fitted":
+            self._invalidate_scan_tracks()
         if active_entry:
             self._load_entry_into_viewer(active_entry, preserve_view=True)
         self.pipeline_panel.append_log(
@@ -1306,6 +1371,8 @@ class MainWindow(QMainWindow):
         self._update_title()
         self.viewer.clear_history()
         self.viewer.clear_selection()
+        # Reset wipes detected rows — scan-tracking results are orphaned.
+        self._invalidate_scan_tracks()
         # Refresh the displayed entry — the cleared one if the user
         # was looking at it, otherwise the currently-active one.
         if active_entry:
@@ -1464,6 +1531,7 @@ class MainWindow(QMainWindow):
             self._logs_dock,
             self._peaks_dock,
             self._profile_dock,
+            self._scan_tracking_dock,
         ):
             view_menu.addAction(dock.toggleViewAction())
         view_menu.addSeparator()
@@ -1604,6 +1672,7 @@ class MainWindow(QMainWindow):
         for w in (
             getattr(self, "viewer", None),
             getattr(self, "profile_viewer", None),
+            getattr(self, "_phase_views_window", None),
         ):
             fn = getattr(w, "apply_theme_colors", None)
             if fn is not None:
@@ -2066,23 +2135,20 @@ class MainWindow(QMainWindow):
                 self._latest_tag = tag
                 self._latest_url = url
                 supported, _ = update_check.self_update_supported()
-                # Help -> Update now…: user explicitly asked to install, so
-                # go straight to the confirm dialog (never silently).
-                if getattr(self, "_update_install_when_found", False) and supported:
-                    self._on_install_update_requested()
-                    return
-                # Opt-in "install automatically on launch": skip the banner and
-                # go straight to the (still confirmed) install. Only ever when
-                # the install is a normal pip-managed one.
+                # Go straight to the install (via its confirm dialog, never
+                # silently) when the user asked for it — Help -> Update now…
+                # this run, or the opt-in "Automatically install updates"
+                # setting — and self-update is a normal pip install. Otherwise
+                # just surface the banner.
                 auto = (
-                    supported
-                    and str(
-                        QSettings().value(self._AUTO_UPDATE_KEY, "false")
-                    ).lower()
+                    str(QSettings().value(self._AUTO_UPDATE_KEY, "false")).lower()
                     == "true"
                 )
-                if auto:
-                    self._start_update_install(tag)
+                want_install = (
+                    getattr(self, "_update_install_when_found", False) or auto
+                )
+                if supported and want_install:
+                    self._on_install_update_requested()
                 else:
                     self._update_banner.show_update(
                         current, tag, url, can_install=supported
@@ -2897,6 +2963,23 @@ class MainWindow(QMainWindow):
         self._matched_struct_checkboxes: dict[str, QCheckBox] = {}
         matched_master_row.addWidget(self._matched_master_check)
         matched_master_row.addStretch(1)
+        # Matched display style: boxes (default) vs q-map-style markers
+        # (circles for peaks, dashed arcs for rings) — nicer for scan
+        # playback where varying box sizes are distracting.
+        matched_master_row.addWidget(QLabel("style:"))
+        self._matched_style_combo = QComboBox()
+        self._matched_style_combo.addItem("Boxes", userData="boxes")
+        self._matched_style_combo.addItem("Markers", userData="markers")
+        self._matched_style_combo.setToolTip(
+            "How matched structures are drawn on the image: 'Boxes' "
+            "(per-peak boxes) or 'Markers' (hollow circles for peaks, "
+            "dashed arcs for rings — the q-map look, steadier during "
+            "playback since it ignores per-peak box size)."
+        )
+        self._matched_style_combo.currentIndexChanged.connect(
+            self._on_matched_style_changed
+        )
+        matched_master_row.addWidget(self._matched_style_combo)
         matched_master_widget = QWidget()
         matched_master_widget.setLayout(matched_master_row)
         layout.addWidget(matched_master_widget)
@@ -3109,6 +3192,39 @@ class MainWindow(QMainWindow):
         self._peaks_dock.setObjectName("PeaksDock")
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._peaks_dock)
         self.tabifyDockWidget(self._profile_dock, self._peaks_dock)
+        # Scan tracking joins the bottom tab group behind Profiles and
+        # Peaks — it shares their per-peak viewing context (click a
+        # track, see the peak) and, like them, only means something for
+        # converted multi-frame data.
+        self.scan_tracking_panel = ScanTrackingPanel(self)
+        self._scan_tracking_dock = QDockWidget("Scan tracking", self)
+        self._scan_tracking_dock.setWidget(self.scan_tracking_panel)
+        self._scan_tracking_dock.setObjectName("ScanTrackingDock")
+        self.addDockWidget(
+            Qt.DockWidgetArea.BottomDockWidgetArea, self._scan_tracking_dock
+        )
+        self.tabifyDockWidget(self._peaks_dock, self._scan_tracking_dock)
+        self.scan_tracking_panel.trackRequested.connect(
+            self._on_track_scan_requested
+        )
+        self.scan_tracking_panel.showViewsRequested.connect(
+            self._on_show_phase_views
+        )
+        self.scan_tracking_panel.trackRowSelected.connect(
+            self._on_track_row_selected
+        )
+        self.scan_tracking_panel.onlyTrackedToggled.connect(
+            self._on_only_tracked_toggled
+        )
+        self.scan_tracking_panel.interpolateRequested.connect(
+            self._on_interpolate_tracks_requested
+        )
+        # Image -> table sync: selecting a fitted peak anywhere (image
+        # click or Peaks-dock row) highlights its cross-frame track row
+        # and surfaces the frame span in the status bar.
+        self.viewer.selectionChanged.connect(
+            self._forward_selection_to_scan_tracking
+        )
         self._profile_dock.raise_()
         self.resizeDocks(
             [self._profile_dock], [max(self.height() // 3, 280)], Qt.Orientation.Vertical
@@ -3316,7 +3432,24 @@ class MainWindow(QMainWindow):
         """
         queued = False
         for p in paths:
-            if p.is_file():
+            if p.is_dir():
+                # A dropped/opened folder becomes ONE image stack: its fabio
+                # images in natural filename order (so img_2 precedes img_10).
+                # Folders without any image files are reported as rejected.
+                imgs = sorted(
+                    (
+                        q
+                        for q in p.iterdir()
+                        if q.is_file() and file_model.is_fabio_image(q)
+                    ),
+                    key=_natural_key,
+                )
+                if imgs:
+                    self._open_queue.extend(imgs)
+                    queued = True
+                else:
+                    self._pending_rejected.append(p)
+            elif p.is_file():
                 self._open_queue.append(p)
                 queued = True
             else:
@@ -3950,6 +4083,8 @@ class MainWindow(QMainWindow):
         self._profile_dock.setVisible(not is_raw)
         if hasattr(self, "_peaks_dock"):
             self._peaks_dock.setVisible(not is_raw)
+        if hasattr(self, "_scan_tracking_dock"):
+            self._scan_tracking_dock.setVisible(not is_raw)
         if hasattr(self, "parameter_panel"):
             self.parameter_panel.setVisible(not is_raw)
         # Cartesian / Polar radios — meaningless before conversion.
@@ -3964,6 +4099,39 @@ class MainWindow(QMainWindow):
         ):
             if kind_menu is not None:
                 kind_menu.menuAction().setEnabled(not is_raw)
+        self._hide_stale_dock_tab_bars()
+
+    def _hide_stale_dock_tab_bars(self) -> None:
+        """Hide ghost dock tab bars.
+
+        Qt quirk: tabifying the Scan-tracking dock into the existing
+        Profiles/Peaks bottom group can leave the group's OLD two-tab
+        bar behind as a second, stale ``QTabBar`` — painted into the
+        file-browser corner of the window. The ghost's signature is a
+        MainWindow-child dock tab bar whose tab set is a STRICT subset
+        of another dock tab bar's (the real bar of the same group);
+        distinct dock groups have disjoint tab sets and never match.
+        Ran on show and after every dock re-tabify; a no-op when Qt
+        behaves.
+        """
+        from PySide6.QtWidgets import QTabBar
+
+        infos = [
+            (tb, {tb.tabText(i) for i in range(tb.count())})
+            for tb in self.findChildren(QTabBar)
+            if tb.parent() is self
+        ]
+        for tb, labs in infos:
+            if labs and any(
+                labs < other for bar, other in infos if bar is not tb
+            ):
+                tb.hide()
+
+    def showEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        super().showEvent(event)
+        # Dock tab bars only materialise with the first layout pass —
+        # sweep for ghosts right after it (see the method docstring).
+        QTimer.singleShot(0, self._hide_stale_dock_tab_bars)
 
     def _confirm_discard_changes(self, session: BaseSession | None = None) -> bool:
         target = session if session is not None else self._active_session
@@ -4176,7 +4344,12 @@ class MainWindow(QMainWindow):
         # is on the GUI thread, so this must not re-walk a big beamtime
         # file's metadata every time the user switches back to the session.
         cache: dict[str, list] = getattr(self.session, "_raw_entries_cache", None) or {}
-        for raw_path in self.session.raw_paths:
+        # Standalone image files (TIFF/CBF/EDF) are read via fabio, not the
+        # h5 detector walk; they bundle into ONE stack entry below. Keep the
+        # HDF5 raw-walk path exactly as before for the rest.
+        fabio_paths = [p for p in self.session.raw_paths if file_model.is_fabio_image(p)]
+        h5_paths = [p for p in self.session.raw_paths if not file_model.is_fabio_image(p)]
+        for raw_path in h5_paths:
             entries = cache.get(str(raw_path))
             if entries is None:
                 try:
@@ -4193,6 +4366,20 @@ class MainWindow(QMainWindow):
                 self._raw_entries[re.label] = re
                 labels.append(re.label)
         self.session._raw_entries_cache = cache  # type: ignore[attr-defined]
+        # One entry PER image file (each a standalone 1-frame view), read via
+        # LazyFabioStack — multiple images open separately, not as a stack.
+        if fabio_paths:
+            try:
+                fabio_entries = file_model.list_fabio_entries(fabio_paths)
+            except Exception as exc:
+                self.conversion_panel.append_log(
+                    f"Could not read image files: {exc}"
+                )
+            else:
+                for entry in fabio_entries:
+                    self._raw_entries[entry.label] = entry
+                    labels.append(entry.label)
+                    panel_inputs.append((entry.file_path, [entry]))
         # Push the same data into the Conversion panel for its selection
         # tree. Done before populating the combo so the panel paint
         # happens once on activation.
@@ -5739,6 +5926,8 @@ class MainWindow(QMainWindow):
         """
         if self.session is None:
             return
+        if self._view_worker_blocks_pipeline():
+            return
         file_path = self.session.temp_path
         if (
             command.op_name in ("run_detection", "run_fitting", "run_matching")
@@ -5835,6 +6024,7 @@ class MainWindow(QMainWindow):
         self._pause_playback()
         self.pipeline_panel.set_running(True)
         self.parameter_panel.set_busy(True)
+        self.scan_tracking_panel.set_busy(True)
         self.viewer.set_busy(True)
         self._update_status_pipeline(command, running=True)
         # Any pipeline op that reshuffles peak ids (everything except
@@ -6000,7 +6190,7 @@ class MainWindow(QMainWindow):
             self._open_queue.append(Path(out_path))
         self._process_open_queue()
 
-    def _on_pipeline_finished(self, _result: object, error: Exception | None) -> None:
+    def _on_pipeline_finished(self, result: object, error: Exception | None) -> None:
         if self._pipe_thread is not None:
             self._pipe_thread.quit()
             self._pipe_thread.wait()
@@ -6009,6 +6199,16 @@ class MainWindow(QMainWindow):
         if self._pipe_worker is not None:
             self._pipe_worker.deleteLater()
             self._pipe_worker = None
+
+        # Close the tracking loading dialog as soon as its run finishes
+        # (before any error modal), regardless of success/failure. The
+        # Interpolate-track chain keeps it up across all its queued
+        # commands; it closes below when the chain's LAST command lands.
+        if (
+            getattr(self, "_pipe_command", None) is not None
+            and self._pipe_command.op_name == "track_peaks"
+        ):
+            self._close_tracking_progress()
 
         if error is not None:
             self.pipeline_panel.append_log(f"ERROR - {error}")
@@ -6023,6 +6223,58 @@ class MainWindow(QMainWindow):
 
         if self.session is not None and error is None:
             self.session.mark_dirty()
+
+        # A re-fit rewrites the entry's fitted_peaks wholesale, so any
+        # phase-tracking results for that entry are stale. Invalidate
+        # when the finished command was a fitting run touching the
+        # tracked entry (kwargs without an entry ran on every entry).
+        cmd = getattr(self, "_pipe_command", None)
+        if (
+            error is None
+            and self._scan_track_entry is not None
+            and cmd is not None
+            and cmd.op_name == "run_fitting"
+            and cmd.kwargs.get("entry") in (None, self._scan_track_entry)
+        ):
+            self._invalidate_scan_tracks()
+
+        # track_peaks is the one pipeline op whose RESULT the GUI
+        # consumes (the captured TrackingPayload) — every other op's
+        # output is read back from the file.
+        if error is None and cmd is not None and cmd.op_name == "track_peaks":
+            self._on_phase_track_result(result, cmd)
+
+        # interpolate_tracks also returns its result (the gap-fill
+        # records) — stash it until the chained re-match lands, then
+        # apply the new peaks as track members. Applied even when the
+        # re-match itself errored: the fills are real fitted rows either
+        # way, and the error modal above already told the user.
+        if (
+            error is None
+            and cmd is not None
+            and cmd.op_name == "interpolate_tracks"
+        ):
+            self._interp_fill_result = list(result) if result else None
+            if not result:
+                self.pipeline_panel.append_log(
+                    "Interpolate track: no gap could be filled "
+                    "(every fit failed or was skipped — see warnings "
+                    "above)."
+                )
+        # Interpolate-track chain accounting: advance the dialog's
+        # completed-work base, and when the chain's LAST command lands
+        # (the final re-match — or the fill itself when every re-match
+        # was skipped), apply the fills as track members and drop the
+        # dialog. Applied even when a re-match errored: the fills are
+        # real fitted rows either way, and the error modal above
+        # already told the user.
+        chain = self._interp_chain
+        if chain is not None and cmd is not None and id(cmd) in chain["ticks"]:
+            chain["base"] += chain["ticks"].pop(id(cmd))
+            if not chain["ticks"]:
+                self._interp_chain = None
+                self._close_tracking_progress()
+                self._apply_interp_fill_result()
 
         # If more commands are queued, run the next one without
         # tearing down the silx tree / viewer state for the user — keep
@@ -6040,6 +6292,7 @@ class MainWindow(QMainWindow):
         self._entry_queue_pos = 0
         self.pipeline_panel.set_running(False)
         self.parameter_panel.set_busy(False)
+        self.scan_tracking_panel.set_busy(False)
         self.viewer.set_busy(False)
         self._update_status_pipeline(running=False)
         self._reattach_silx_tree()
@@ -7791,6 +8044,818 @@ class MainWindow(QMainWindow):
 
         self.viewer._push_undo(_CallbackAction(_undo, _redo))
 
+    # -- Phase tracking (mlgidBASE track_peaks) --
+
+    def _on_track_scan_requested(self, threshold: float, length: int) -> None:
+        """Enqueue an mlgidBASE ``track_peaks`` run for the active entry.
+
+        Rides the ordinary pipeline queue (silx detach, busy gating,
+        logging, entry snapshot all come for free); the captured
+        ``TrackingPayload`` comes back through ``_on_pipeline_finished``
+        -> ``_on_phase_track_result``.
+        """
+        if self.session is None:
+            return
+        if self._view_worker_blocks_pipeline():
+            return
+        entry = self.entry_combo.currentText()
+        if not entry:
+            return
+        self._entry_queue_total = 1
+        self._entry_queue_pos = 0
+        self._show_tracking_progress()
+        self._enqueue_pipeline(
+            self.session.temp_path,
+            PipelineCommand("track_peaks", {
+                "entry": entry,
+                "threshold": float(threshold),
+                "length": int(length),
+            }),
+        )
+
+    def _show_tracking_progress(
+        self, label: str = "Tracking peaks across the scan…",
+        manual: bool = False,
+    ) -> None:
+        """Show a centred, always-visible loading dialog for the run.
+
+        track_peaks is one opaque mlgidBASE call with no clean per-frame
+        progress (its cost is the file open + IoU/graph, not the reads),
+        so a GUI-thread ``QTimer`` advances the bar asymptotically toward
+        ~95% while the worker runs; ``_close_tracking_progress`` snaps it
+        to 100% on finish. ``setMinimumDuration(0)`` + explicit ``show``
+        defeat QProgressDialog's default 4 s show delay (longer than the
+        whole run).
+
+        ``manual=True`` skips the fake timer entirely: the caller drives
+        the bar with REAL progress values (the Interpolate-track chain
+        feeds it the workers' per-frame ``frameProgress`` ticks via
+        ``_on_pipeline_frame_progress``, so the dialog and the Pipeline
+        panel's bar agree instead of the dialog idling at ~95%)."""
+        self._close_tracking_progress()
+        dlg = QProgressDialog(self)
+        dlg.setWindowTitle("Peak tracking")
+        dlg.setLabelText(label)
+        dlg.setCancelButton(None)          # no clean way to interrupt mlgidBASE
+        dlg.setRange(0, 100)
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setValue(0)
+        dlg.show()
+        self._track_progress_dialog = dlg
+        if manual:
+            return
+
+        timer = QTimer(self)
+        timer.setInterval(80)
+
+        def _tick() -> None:
+            v = dlg.value()
+            if v < 95:
+                dlg.setValue(v + max(1, int((95 - v) * 0.06)))
+
+        timer.timeout.connect(_tick)
+        timer.start()
+        self._track_progress_timer = timer
+
+    def _close_tracking_progress(self) -> None:
+        if self._track_progress_timer is not None:
+            self._track_progress_timer.stop()
+            self._track_progress_timer.deleteLater()
+            self._track_progress_timer = None
+        # Detach the attribute FIRST: setValue on a window-modal
+        # QProgressDialog runs processEvents(), so re-entrant handlers
+        # (frameProgress, opFinished) must already see "no dialog".
+        dlg = self._track_progress_dialog
+        self._track_progress_dialog = None
+        if dlg is not None:
+            dlg.setValue(100)
+            dlg.close()
+            dlg.deleteLater()
+
+    def _on_phase_track_result(self, payload: object, command) -> None:
+        """Install a finished ``track_peaks`` payload (panel + views)."""
+        if self.session is None or not isinstance(
+            payload, phase_tracking.TrackingPayload
+        ):
+            return
+        entry = command.kwargs.get("entry") or payload.entry
+        if self.entry_combo.currentText() != entry:
+            self.statusBar().showMessage(
+                "Peak tracking finished for a no-longer-active entry; "
+                "results discarded.",
+                4000,
+            )
+            return
+        tables = self._read_fitted_tables(payload, entry)
+        ids = (
+            phase_tracking.member_ids(payload, tables)
+            if tables else [None] * payload.n_members
+        )
+        # Upstream cannot track rings (infinite angular width -> NaN
+        # IoU -> zeroed -> single-member components cut by `length`), so
+        # track them GUI-side by 1-D radial IoU and append the ring
+        # tracks to the payload. They then flow through the table, the
+        # views, and the only-tracked filter exactly like spot tracks.
+        if tables:
+            ring_comps = phase_tracking.track_rings(
+                payload, ids, tables, payload.threshold, payload.length
+            )
+            if ring_comps:
+                payload.components = payload.components + ring_comps
+        self._scan_payload = payload
+        self._scan_member_ids = ids
+        self._scan_fitted_tables = tables
+        self._scan_track_entry = entry
+        # Which tracks are rings (any ring member; rings and spots never
+        # mix in a component). The q-map draws these as dashed arcs.
+        self._scan_ring_tracks = self._compute_ring_tracks(payload, ids, tables)
+        # Map each track to the matched crystal phases its tracked peaks
+        # belong to (for the q-map phase-identity overlay). No-op / empty
+        # when Matching hasn't run.
+        matched_tables = self._read_matched_tables(payload, entry, tables)
+        self._scan_track_phases = phase_tracking.match_tracks_to_structures(
+            payload, ids, matched_tables
+        )
+        # Pre-assign overlay colours for every matched identity (sorted,
+        # so the assignment is deterministic no matter which frame is
+        # rendered first).
+        all_keys = sorted({
+            s.color_key
+            for structs in matched_tables.values() if structs
+            for s in structs
+        })
+        self.viewer.seed_matched_colors(all_keys)
+        self.scan_tracking_panel.set_payload(payload, ids)
+        # Re-apply the show-only-tracked overlay filter against the
+        # fresh membership (or lift it if the box is unticked).
+        self._push_tracked_filter()
+        if self._phase_views_window is not None:
+            self._phase_views_window.set_context(
+                self.session.temp_path, entry, self.viewer.n_frames
+            )
+            self._phase_views_window.set_payload(payload)
+            self._phase_views_window.set_ring_tracks(self._scan_ring_tracks)
+            self._phase_views_window.set_track_phases(self._scan_track_phases)
+
+    def _compute_ring_tracks(self, payload, ids, tables) -> set:
+        """Set of track indices whose members are rings (checked via the
+        reconstructed ids against the fitted tables' ``is_ring``)."""
+        rings: set = set()
+        for k, comp in enumerate(payload.components):
+            for i in comp:
+                tagged = ids[int(i)]
+                if tagged is None:
+                    continue
+                t = tables.get(int(tagged[0]))
+                if t is None or len(t) == 0:
+                    continue
+                hits = np.flatnonzero(
+                    np.asarray(t.ids, dtype=int) == int(tagged[1])
+                )
+                if hits.size == 1 and bool(t.is_ring[int(hits[0])]):
+                    rings.add(k)
+                    break
+        return rings
+
+    def _read_fitted_tables(self, payload, entry: str) -> dict:
+        """One-handle read of every payload frame's fitted table.
+
+        Feeds ``phase_tracking.member_ids`` (upstream's capture hook
+        carries no peak ids) and is kept on ``_scan_fitted_tables``
+        for the only-tracked display options (gap interpolation
+        anchors, GUI-side ring tracking). The per-frame tables are tiny.
+        """
+        tables: dict[int, object] = {}
+        try:
+            import h5py
+
+            with h5py.File(self.session.temp_path, "r") as f:
+                for frame in sorted({int(x) for x in payload.frame_num}):
+                    tables[frame] = file_model.read_peaks(
+                        f, entry, frame
+                    )["fitted"]
+        except Exception:
+            logger.debug(
+                "suppressed exception in MainWindow._read_fitted_tables",
+                exc_info=True,
+            )
+            return {}
+        return tables
+
+    def _read_matched_tables(self, payload, entry: str, fitted_tables: dict) -> dict:
+        """One-handle read of every payload frame's matched structures.
+
+        ``read_matched_peaks`` needs the frame's fitted table (already
+        read for member-id reconstruction), so this reuses
+        ``fitted_tables``. Feeds ``match_tracks_to_structures`` for the
+        q-map phase-identity overlay; empty on any error or when
+        Matching hasn't run.
+        """
+        out: dict = {}
+        try:
+            import h5py
+
+            with h5py.File(self.session.temp_path, "r") as f:
+                for frame in sorted({int(x) for x in payload.frame_num}):
+                    out[frame] = file_model.read_matched_peaks(
+                        f, entry, frame, fitted_tables.get(frame)
+                    )
+        except Exception:
+            logger.debug(
+                "suppressed exception in MainWindow._read_matched_tables",
+                exc_info=True,
+            )
+            return {}
+        return out
+
+    def _invalidate_scan_tracks(self) -> None:
+        """Drop phase-tracking results and clear panel + views.
+
+        Called whenever the fitted tables the tracks reference may have
+        changed identity: entry switch, ``run_fitting`` finish,
+        Tools > Clear fitted / Reset.
+        """
+        self._scan_payload = None
+        self._scan_member_ids = None
+        self._scan_fitted_tables = {}
+        self._scan_track_phases = {}
+        self._scan_ring_tracks = set()
+        self._scan_track_entry = None
+        # A gap-fill run in flight references the payload being dropped
+        # — its result must not be applied against fresh tracks.
+        self._interp_fill_result = None
+        self._interp_chain = None
+        # panel.clear() unticks "Show only tracked peaks", whose toggled
+        # emit routes back through _push_tracked_filter and lifts the
+        # viewer filter; the explicit lift below is belt-and-braces for
+        # the box-already-unticked path.
+        self.scan_tracking_panel.clear()
+        self.viewer.set_fitted_visible_only(None)
+        if self._phase_views_window is not None:
+            self._phase_views_window.clear()
+
+    def _on_show_phase_views(self) -> None:
+        """Open (lazily building) and raise the phase-tracking views."""
+        if self._phase_views_window is None:
+            self._phase_views_window = PhaseViewsWindow(
+                self,
+                busy_probe=lambda: self._pipe_thread is not None,
+            )
+            self._phase_views_window.frameJumpRequested.connect(
+                self._on_phase_view_frame_jump
+            )
+            self._phase_views_window.saveFiguresRequested.connect(
+                self._on_save_official_figures
+            )
+        if self.session is not None:
+            entry = self.entry_combo.currentText()
+            if entry:
+                self._phase_views_window.set_context(
+                    self.session.temp_path, entry, self.viewer.n_frames
+                )
+        self._phase_views_window.set_payload(self._scan_payload)
+        self._phase_views_window.set_ring_tracks(self._scan_ring_tracks)
+        self._phase_views_window.set_track_phases(self._scan_track_phases)
+        self._phase_views_window.show()
+        self._phase_views_window.raise_()
+        self._phase_views_window.activateWindow()
+
+    def _view_worker_blocks_pipeline(self) -> bool:
+        """True (+ status message) while a phase-views worker holds a
+        read handle on the file.
+
+        pygid opens the NeXus file in r+ mode even for reads
+        (nexus_reader.get_dataset), and HDF5 refuses an r+ open while
+        another same-process handle has the file open read-only — so a
+        pipeline run starting during a waterfall / mean-image
+        computation dies with "Unable to synchronously open file (file
+        is already open for read-only)". The silx detach dance cannot
+        release that worker mid-loop; refusing to start is the honest
+        fix (the views window refuses in the opposite direction via
+        its busy_probe).
+        """
+        w = self._phase_views_window
+        if w is not None and w.worker_active:
+            self.statusBar().showMessage(
+                "Wait for the phase-views computation (waterfall / mean "
+                "image) to finish before running pipeline commands — it "
+                "holds a read handle on the file.",
+                6000,
+            )
+            return True
+        return False
+
+    def _on_only_tracked_toggled(self, _checked: bool) -> None:
+        self._push_tracked_filter()
+
+    def _push_tracked_filter(self) -> None:
+        """Apply (or lift) the show-only-tracked overlay filter.
+
+        Builds ``{frame: {fitted_id, ...}}`` from the surviving tracks'
+        members via the reconstructed ids (members whose id could not
+        be matched back are unavoidably hidden — best-effort, flagged
+        in the checkbox tooltip) and pushes it to
+        ``viewer.set_fitted_visible_only``. Anything else lifts it.
+
+        Rings are tracked too: ``_on_phase_track_result`` appended the
+        GUI-side ring tracks (``phase_tracking.track_rings``) to
+        ``payload.components``, so tracked rings are whitelisted here
+        like any spot track and untracked rings are hidden — no
+        special-casing needed at this layer. Gap frames filled by
+        "Interpolate track" join the whitelist the same way: their new
+        fitted rows are appended as track members.
+        """
+        panel = self.scan_tracking_panel
+        payload = self._scan_payload
+        ids = self._scan_member_ids
+        if (
+            not panel.only_tracked_checked
+            or payload is None
+            or ids is None
+        ):
+            self.viewer.set_fitted_visible_only(None)
+        else:
+            allowed: dict[int, set[int]] = {}
+            for comp in payload.components:
+                for i in comp:
+                    tagged = ids[int(i)]
+                    if tagged is not None:
+                        allowed.setdefault(int(tagged[0]), set()).add(
+                            int(tagged[1])
+                        )
+            self.viewer.set_fitted_visible_only(allowed)
+        # The "Unmatched fitted peaks" dock row exists only while the
+        # frame has unmatched rows the filter lets through — rebuild the
+        # matched panel so the row appears/disappears with the filter.
+        self._refresh_matched_panel(
+            self.viewer.current_frame,
+            self.viewer.matched_structures(self.viewer.current_frame),
+        )
+
+    def _on_interpolate_tracks_requested(self) -> None:
+        """Fill each track's gap frames with REAL peaks (spots + rings).
+
+        Plans the injections (``phase_tracking.plan_gap_fills``), then
+        enqueues an ``interpolate_tracks`` command (inject a detected
+        box/ring per gap at the interpolated position, 2D-fit it,
+        persist the fitted row) followed by ``run_matching`` command(s)
+        scoped to the affected frames — segments and rings separately,
+        and CIF-restricted to the structures the filled tracks were
+        tracked in (see ``_build_interp_match_commands``). The fill
+        records come back through ``_on_pipeline_finished`` and are
+        applied as new track members in ``_apply_interp_fill_result``
+        once the LAST re-match lands. The loading dialog is driven by
+        the workers' real per-frame progress across the whole chain.
+        """
+        if self.session is None or self._view_worker_blocks_pipeline():
+            return
+        payload = self._scan_payload
+        ids = self._scan_member_ids
+        entry = self.entry_combo.currentText()
+        if (
+            payload is None
+            or ids is None
+            or not entry
+            or entry != self._scan_track_entry
+        ):
+            return
+        plan = phase_tracking.plan_gap_fills(
+            payload, ids, self._scan_fitted_tables, self._scan_ring_tracks
+        )
+        if not plan:
+            self.statusBar().showMessage(
+                "Interpolate track: every track already has a fitted "
+                "peak on each frame of its span — nothing to fill.",
+                6000,
+            )
+            return
+        match_kwargs = self.pipeline_panel.matching_kwargs()
+        if match_kwargs is None:
+            QMessageBox.warning(
+                self, "Interpolate track",
+                "Gap filling ends with a re-match of the affected "
+                "frames, but no CIF source is configured. Set the CIF "
+                "file/folder (or pickle) in the Pipeline panel's "
+                "Matching section first.",
+            )
+            return
+        # Same fit config the pipeline panel would use for run_fitting,
+        # so filled boxes are fitted like every other peak.
+        panel = self.pipeline_panel
+        try:
+            fit_params = {
+                "crit_angle": float(panel.fit_crit_angle.value()),
+                "clustering_distance_peaks": float(
+                    panel.fit_dist_peaks.value()
+                ),
+                "clustering_distance_rings": float(
+                    panel.fit_dist_rings.value()
+                ),
+                "clustering_extend": int(panel.fit_cluster_extend.value()),
+                "theta_fixed": bool(panel.fit_theta_fixed.isChecked()),
+            }
+        except Exception:
+            logger.debug(
+                "suppressed exception reading fit params for "
+                "interpolate_tracks", exc_info=True,
+            )
+            fit_params = {}
+        n_boxes = sum(len(v) for v in plan.values())
+        self.pipeline_panel.append_log(
+            f"Interpolate track: filling {n_boxes} gap box(es) across "
+            f"{len(plan)} frame(s) of {entry}…"
+        )
+        fill_cmd = PipelineCommand("interpolate_tracks", {
+            "entry": entry,
+            "plan": plan,
+            "fit_params": fit_params,
+        })
+        match_cmds = self._build_interp_match_commands(
+            plan, entry, match_kwargs
+        )
+        self._interp_fill_result = None
+        self._entry_queue_total = 1
+        self._entry_queue_pos = 0
+        # Chain bookkeeping: one bar tick per gap frame (fill) + per
+        # matched frame (each matching command), driven by the REAL
+        # frameProgress signals in _on_pipeline_frame_progress.
+        commands = [fill_cmd] + match_cmds
+        ticks = {id(fill_cmd): len(plan)}
+        for cmd in match_cmds:
+            ticks[id(cmd)] = len(cmd.kwargs.get("frame_num") or []) or 1
+        self._interp_chain = {
+            "commands": commands,
+            "ticks": ticks,
+            "total": max(1, sum(ticks.values())),
+            "base": 0,
+        }
+        self._show_tracking_progress(
+            "Interpolate track: fitting injected boxes…", manual=True,
+        )
+        for cmd in commands:
+            self._enqueue_pipeline(self.session.temp_path, cmd)
+
+    def _build_interp_match_commands(
+        self, plan: dict, entry: str, match_kwargs: dict
+    ) -> list:
+        """Build the re-match command(s) for the gap-fill chain.
+
+        Segments and rings are matched SEPARATELY (mlgidmatch matches
+        one ``peaks_type`` per run), each command pinned to the frames
+        that gained fills of that type.
+
+        The CIF source is ALWAYS restricted — no new structures can
+        appear from a gap fill. Per frame + type the set is the union
+        of (a) the structures the filled tracks were tracked in
+        (``_scan_track_phases`` — a track matched to one structure
+        re-matches against only that CIF), (b) for a never-matched
+        filled track, every structure identified anywhere in this
+        scan for that type (the peak may belong to one of them; the
+        full panel folder is never used), and (c) the CIFs already
+        matched on the frame for that type — matching REWRITES the
+        frame's ``matched_<type>_*`` datasets wholesale, so dropping
+        an already-identified CIF from the set would erase its
+        existing solutions there. An empty set (nothing identified in
+        the scan) or an unsubsettable source (pickle / missing .cif
+        files) SKIPS that matching pass with a log line — the filled
+        peaks stay unmatched rather than brute-forcing every loaded
+        structure. Frames sharing the same (type, CIF-set) collapse
+        into one command with a ``frame_num`` list.
+        """
+        matched_tables = self._read_matched_tables(
+            self._scan_payload, entry, self._scan_fitted_tables
+        )
+        phases = self._scan_track_phases
+        # Everything identified anywhere in this scan, split by type —
+        # the fallback set for filled tracks that were never matched.
+        scan_cifs = {"matched_segments": set(), "matched_rings": set()}
+        for structs in matched_tables.values():
+            for st in structs:
+                for prefix in scan_cifs:
+                    if st.solution_field.startswith(prefix):
+                        scan_cifs[prefix].add(str(st.cif))
+        # The raw .cif source is preferred for restriction: after a
+        # panel "Parse CIFs" click, matching_kwargs() carries the
+        # cached CifPattern OBJECT, which cannot be subset — the raw
+        # text can.
+        raw_source = self.pipeline_panel.cif_source_text()
+        if not raw_source and isinstance(match_kwargs.get("cif_prepr"), str):
+            raw_source = match_kwargs["cif_prepr"]
+
+        groups: dict = {}   # (peaks_type, frozenset) -> [frames]
+        skipped: list = []
+        for frame, specs in plan.items():
+            for ring_flag, peaks_type, prefix in (
+                (False, "segments", "matched_segments"),
+                (True, "rings", "matched_rings"),
+            ):
+                type_specs = [
+                    s for s in specs
+                    if bool(s.get("is_ring", False)) == ring_flag
+                ]
+                if not type_specs:
+                    continue
+                cifs: set = set()
+                for s in type_specs:
+                    track_cifs = phases.get(int(s["track"]))
+                    if track_cifs:
+                        cifs.update(str(c) for c in track_cifs)
+                    else:
+                        cifs.update(scan_cifs[prefix])
+                for st in matched_tables.get(int(frame), []):
+                    if st.solution_field.startswith(prefix):
+                        cifs.add(str(st.cif))
+                if not cifs:
+                    skipped.append((peaks_type, int(frame), "no structures"))
+                    continue
+                groups.setdefault(
+                    (peaks_type, frozenset(cifs)), []
+                ).append(int(frame))
+        cmds: list = []
+        for (peaks_type, cif_key), frames in sorted(
+            groups.items(), key=lambda kv: (kv[0][0], min(kv[1]))
+        ):
+            restricted = self._restrict_cif_source(raw_source, set(cif_key))
+            if restricted is None:
+                for f in frames:
+                    skipped.append((peaks_type, f, "source not subsettable"))
+                continue
+            cmds.append(PipelineCommand("run_matching", {
+                **match_kwargs,
+                "entry": entry,
+                "frame_num": sorted(set(frames)),
+                "peaks_type": peaks_type,
+                "cif_prepr": restricted,
+            }))
+        if skipped:
+            by_reason: dict = {}
+            for peaks_type, f, reason in skipped:
+                by_reason.setdefault(reason, set()).add(f)
+            for reason, frames in sorted(by_reason.items()):
+                self.pipeline_panel.append_log(
+                    "Interpolate track: skipping the re-match on frame(s) "
+                    f"{sorted(frames)} ({reason}) — filled peaks there "
+                    "stay unmatched; no new structures are introduced. "
+                    "Use a .cif folder/file source (not a pickle) and "
+                    "keep the identified structures' files in place to "
+                    "enable restricted re-matching."
+                )
+        return cmds
+
+    def _restrict_cif_source(self, base, cifs: set):
+        """Semicolon-joined ``.cif`` paths covering exactly ``cifs``.
+
+        ``base`` is the panel's raw ``cif_prepr`` string (a folder, a
+        single ``.cif``, or a ``;``-separated list — the forms
+        ``pipeline._build_cif_pattern_from_raw`` accepts). Returns
+        ``None`` when the source cannot be subset: a pickle path, a
+        pre-parsed ``CifPattern`` object, or any tracked CIF whose file
+        is missing from the source (restricting would silently drop
+        that structure — the caller falls back to the full source).
+        CIF names are matched case-insensitively against file stems
+        (``MatchedStructure.cif`` is the extensionless basename).
+        """
+        import os
+
+        if not cifs or not isinstance(base, str) or not base.strip():
+            return None
+        paths = [p.strip() for p in base.split(";") if p.strip()]
+        if len(paths) == 1 and paths[0].lower().endswith((".pickle", ".pkl")):
+            return None
+        wanted = {str(c).lower() for c in cifs}
+        try:
+            if len(paths) == 1 and os.path.isdir(paths[0]):
+                folder = paths[0]
+                hits = [
+                    os.path.join(folder, f)
+                    for f in sorted(os.listdir(folder))
+                    if f.lower().endswith(".cif")
+                    and os.path.splitext(f)[0].lower() in wanted
+                ]
+            else:
+                hits = [
+                    p for p in paths
+                    if p.lower().endswith(".cif")
+                    and os.path.splitext(os.path.basename(p))[0].lower()
+                    in wanted
+                ]
+        except Exception:
+            logger.debug(
+                "suppressed exception restricting the CIF source",
+                exc_info=True,
+            )
+            return None
+        found = {
+            os.path.splitext(os.path.basename(p))[0].lower() for p in hits
+        }
+        if not hits or found != wanted:
+            return None
+        return ";".join(hits)
+
+    def _apply_interp_fill_result(self) -> None:
+        """Append the gap-fill peaks as members of their origin tracks.
+
+        Runs after the chained re-match finishes. Each fill record's
+        fitted row is re-read from the file (fresh table → exact
+        coordinates), appended to the payload's member arrays, and its
+        index added to ``components[track]`` — so the track's span/count
+        update everywhere (panel table, views, only-tracked whitelist)
+        without a re-run of ``track_peaks``. Member ids and the q-map
+        phase mapping are then rebuilt against the fresh tables.
+        """
+        result = self._interp_fill_result
+        self._interp_fill_result = None
+        payload = self._scan_payload
+        entry = self._scan_track_entry
+        if not result or payload is None or entry is None or self.session is None:
+            return
+        # Fresh fitted tables for the affected frames (they just gained
+        # rows; ids beyond the old table are unknown to the cache).
+        affected = sorted({int(rec["frame"]) for rec in result})
+        try:
+            import h5py
+
+            with h5py.File(self.session.temp_path, "r") as f:
+                for frame in affected:
+                    self._scan_fitted_tables[frame] = file_model.read_peaks(
+                        f, entry, frame
+                    )["fitted"]
+        except Exception:
+            logger.debug(
+                "suppressed exception re-reading fitted tables after "
+                "interpolate_tracks", exc_info=True,
+            )
+            return
+        appended = 0
+        for rec in result:
+            frame = int(rec["frame"])
+            fid = int(rec["fitted_id"])
+            track = int(rec["track"])
+            table = self._scan_fitted_tables.get(frame)
+            if table is None or not (0 <= track < len(payload.components)):
+                continue
+            hits = np.flatnonzero(np.asarray(table.ids, dtype=int) == fid)
+            if hits.size != 1:
+                continue
+            j = int(hits[0])
+            new_index = payload.n_members
+            payload.q_xy = np.append(payload.q_xy, float(table.q_xy[j]))
+            payload.q_z = np.append(payload.q_z, float(table.q_z[j]))
+            payload.frame_num = np.append(payload.frame_num, frame)
+            payload.amplitude = np.append(
+                payload.amplitude, float(table.amplitude[j])
+            )
+            comp = list(payload.components[track])
+            comp.append(new_index)
+            payload.components[track] = comp
+            appended += 1
+        if not appended:
+            return
+        # Rebuild the derived state against the fresh membership.
+        self._scan_member_ids = phase_tracking.member_ids(
+            payload, self._scan_fitted_tables
+        )
+        matched_tables = self._read_matched_tables(
+            payload, entry, self._scan_fitted_tables
+        )
+        self._scan_track_phases = phase_tracking.match_tracks_to_structures(
+            payload, self._scan_member_ids, matched_tables
+        )
+        self.scan_tracking_panel.set_payload(
+            payload, self._scan_member_ids
+        )
+        self._push_tracked_filter()
+        if self._phase_views_window is not None:
+            self._phase_views_window.set_payload(payload)
+            self._phase_views_window.set_ring_tracks(self._scan_ring_tracks)
+            self._phase_views_window.set_track_phases(self._scan_track_phases)
+        self.statusBar().showMessage(
+            f"Interpolate track: filled {appended} gap peak(s) "
+            f"(fitted + matched) across {len(affected)} frame(s).",
+            8000,
+        )
+
+    def _on_phase_view_frame_jump(self, frame: int) -> None:
+        if self.viewer.n_frames <= 0:
+            return
+        self.viewer.set_frame(
+            max(0, min(int(frame), self.viewer.n_frames - 1))
+        )
+
+    def _on_save_official_figures(self, path: str, axis: str) -> None:
+        """Run upstream's real matplotlib export (save_fig=True).
+
+        GUI thread on purpose: the run is quick (fitted-table reads +
+        two Agg savefigs) and matplotlib's pyplot state machine is not
+        worker-thread-safe under a Qt backend. The silx tree is
+        detached around mlgidBASE's file open, same as pipeline runs.
+        """
+        if self.session is None or self._pipe_thread is not None:
+            return
+        payload = self._scan_payload
+        entry = self._scan_track_entry
+        if payload is None or not entry:
+            return
+        try:
+            with self._detached_silx_tree():
+                from mlgidbase import mlgidBASE  # noqa: N814
+
+                analysis = mlgidBASE(filename=str(self.session.temp_path))
+                analysis.track_peaks(
+                    entry=entry,
+                    threshold=payload.threshold,
+                    length=payload.length,
+                    axis=axis,
+                    plot_params={
+                        "plot_result": False,
+                        "save_fig": True,
+                        "path_to_save_fig": path,
+                    },
+                )
+        except Exception as exc:
+            QMessageBox.critical(self, "Save figures", str(exc))
+            return
+        self.statusBar().showMessage(
+            f"Saved mlgidBASE tracking figures next to {path}", 6000
+        )
+
+    def _forward_selection_to_scan_tracking(self, sel) -> None:
+        """Mirror a FITTED-peak selection onto the Scan-tracking table.
+
+        The reverse of ``_on_track_row_selected``: clicking ANY member
+        peak of a track (any frame, image or Peaks dock) highlights the
+        track's row — whose columns carry the first/last/frames span —
+        and echoes "track N: frames x-y" to the status bar. Non-fitted
+        or trackless selections just clear the row highlight. The panel
+        applies the highlight under its ``_applying_external`` guard,
+        so this never bounces the viewer to another frame.
+        """
+        if self._scan_payload is None or self._scan_track_entry is None:
+            return
+        if self.entry_combo.currentText() != self._scan_track_entry:
+            return
+        if sel is None or getattr(sel, "kind", None) != "fitted":
+            self.scan_tracking_panel.clear_external_selection()
+            return
+        track = self.scan_tracking_panel.set_external_peak(
+            int(sel.frame), int(sel.peak_id)
+        )
+        if track is not None:
+            first, last, n_frames, _members = self._scan_payload.track_span(
+                track
+            )
+            span = (
+                f"frame {first}" if first == last
+                else f"frames {first}-{last}"
+            )
+            self.statusBar().showMessage(
+                f"Fitted peak {int(sel.peak_id)} (frame {int(sel.frame)}) "
+                f"belongs to track {track}: {span}, present in "
+                f"{n_frames} frame(s)",
+                6000,
+            )
+
+    def _on_track_row_selected(self, frame: int, peak_id: int) -> None:
+        """Jump to a clicked track's representative member (+select).
+
+        ``peak_id`` is -1 when no fitted id could be reconstructed for
+        the track — then the click only jumps to the frame.
+        """
+        if self.session is None or self._scan_track_entry is None:
+            return
+        entry = self.entry_combo.currentText()
+        if entry != self._scan_track_entry:
+            return
+        frame = int(frame)
+        if int(self.viewer.current_frame) != frame:
+            # frameChanged is wired synchronously to _load_frame_peaks,
+            # so the frame's tables are in _frame_peaks afterwards.
+            self.viewer.set_frame(frame)
+        if int(peak_id) < 0:
+            return
+        table = self.viewer._frame_peaks.get(frame, {}).get("fitted")
+        if table is None:
+            try:
+                table = file_model.load_peaks(
+                    self.session.temp_path, entry, frame
+                ).get("fitted")
+            except Exception:
+                logger.debug(
+                    "suppressed exception in MainWindow._on_track_row_selected",
+                    exc_info=True,
+                )
+                return
+        if table is None or len(table) == 0:
+            return
+        ids = [int(x) for x in table.ids]
+        if int(peak_id) in ids:
+            self._select_table_row(
+                frame, "fitted", table, ids.index(int(peak_id))
+            )
+
     def _on_peak_row_write_requested(
         self, frame: int, kind: str, peak_id: int, polar: dict
     ) -> None:
@@ -7927,6 +8992,26 @@ class MainWindow(QMainWindow):
         # (preserve_view=True) re-reads fresh peaks as frames are revisited.
         self._loaded_peaks_entry = entry
         self._loaded_peak_frames = set()
+        # Phase-tracking results are per-entry: another entry's tracks
+        # reference different frames/ids. Same-entry overlay refreshes
+        # (peak edits, pipeline reattach) keep them.
+        if self._scan_track_entry is not None and entry != self._scan_track_entry:
+            self._invalidate_scan_tracks()
+        if not is_mlgidbase_available():
+            self.scan_tracking_panel.set_scan_available(
+                False,
+                reason="Peak tracking needs the [pipeline] backends "
+                       "(mlgidbase) installed.",
+            )
+        else:
+            self.scan_tracking_panel.set_scan_available(
+                self.viewer.n_frames > 1,
+                reason="Peak tracking needs a multi-frame entry.",
+            )
+        if self._phase_views_window is not None and self.session is not None:
+            self._phase_views_window.set_context(
+                self.session.temp_path, entry, self.viewer.n_frames
+            )
         cur = self.viewer.current_frame
         if overlays is not None and overlays[0] == cur:
             # Peaks for the landed frame were read off-thread (worker) — install
@@ -8120,14 +9205,20 @@ class MainWindow(QMainWindow):
         self._matched_struct_rows.clear()
         self._matched_struct_probs.clear()
 
-        if not structures:
+        # Fitted rows no loaded structure claims (tracked filter
+        # applied) get their own sub-row below the structures.
+        has_unmatched = self.viewer.has_unmatched_fitted(_frame)
+
+        if not structures and not has_unmatched:
             self._matched_empty_label = QLabel("<i>No matched solutions for this frame.</i>")
             self._matched_empty_label.setWordWrap(True)
             self._matched_struct_layout.addWidget(self._matched_empty_label)
             return
 
         for i, s in enumerate(structures):
-            pen = matched_pen_for(i)
+            # Stable per-identity pen (CIF + hkl) so the swatch matches
+            # the overlay and stays the same colour across frames.
+            pen = self.viewer.matched_pen(s)
             row = QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(6)
@@ -8158,8 +9249,41 @@ class MainWindow(QMainWindow):
         # Reset the min-probability slider so each frame's first
         # render shows every structure; the user can drag up to
         # filter weak matches.
-        self._seed_matched_prob_slider(structures)
-        self._apply_matched_filter()
+        if structures:
+            self._seed_matched_prob_slider(structures)
+            self._apply_matched_filter()
+
+        # "Unmatched fitted peaks" sub-row: the grey pseudo-group of
+        # fitted rows no loaded structure claims, rendered in the
+        # matched display style (markers/boxes). Off by default (the
+        # fitted overlay already draws these rows); the checkbox state
+        # persists across frames. Deliberately NOT registered in
+        # _matched_struct_checkboxes/rows so the CIF-substring and
+        # min-probability filters never touch it.
+        if has_unmatched:
+            pen = {"color": UNMATCHED_COLOR, **MATCHED_STYLE}
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            swatch = QLabel()
+            swatch.setPixmap(_make_pen_swatch(pen))
+            row.addWidget(swatch)
+            chk = QCheckBox("Unmatched fitted peaks")
+            chk.setToolTip(
+                "Show every fitted peak that is NOT part of any matched "
+                "structure, in neutral grey, using the matched display "
+                "style (boxes or markers). Follows the Matched master "
+                "toggle and the \"Show only tracked peaks\" filter — "
+                "handy for viewing tracked-but-unmatched peaks as "
+                "markers alongside the structures."
+            )
+            chk.setChecked(self.viewer.unmatched_visible())
+            chk.toggled.connect(self.viewer.set_unmatched_visible)
+            row.addWidget(chk)
+            row.addStretch(1)
+            row_widget = QWidget()
+            row_widget.setLayout(row)
+            self._matched_struct_layout.addWidget(row_widget)
 
     def _on_matched_prob_changed(self, value: int) -> None:
         """Slider 0–100 → readable 0.00–1.00 in the side label, then
@@ -8321,6 +9445,12 @@ class MainWindow(QMainWindow):
             with QSignalBlocker(chk):
                 chk.setChecked(checked)
             self.viewer.set_matched_structure_visible(uid, checked)
+
+    def _on_matched_style_changed(self, _index: int) -> None:
+        """Switch the matched overlay between boxes and q-map markers."""
+        self.viewer.set_matched_display_style(
+            self._matched_style_combo.currentData()
+        )
 
     def _on_matched_structure_toggled(self, uid: str, checked: bool) -> None:
         """Per-structure toggle. Promotes a ``check while master is off``
@@ -8537,7 +9667,50 @@ class MainWindow(QMainWindow):
         ``frameProgress`` signals per second and an unchanged
         ``setText`` still schedules a paint event.
         """
-        if total <= 1:
+        # Interpolate-track chain: drive the loading dialog with the
+        # SAME per-frame ticks the Pipeline panel's bar shows, summed
+        # across the chain's commands (fill + re-match passes), so the
+        # two never disagree and the dialog no longer idles at ~95%.
+        chain = self._interp_chain
+        cmd = getattr(self, "_pipe_command", None)
+        dlg = self._track_progress_dialog
+        if (
+            chain is not None
+            and dlg is not None
+            and cmd is not None
+            and id(cmd) in chain["ticks"]
+        ):
+            ticks = chain["ticks"][id(cmd)]
+            overall = chain["base"] + min(int(done), ticks)
+            if op_name == "interpolate_tracks":
+                dlg.setLabelText(
+                    "Interpolate track: fitting injected boxes… "
+                    f"({min(int(done), ticks)}/{ticks} frames)"
+                )
+            elif op_name == "run_matching":
+                dlg.setLabelText(
+                    "Interpolate track: matching "
+                    f"{cmd.kwargs.get('peaks_type', 'segments')}… "
+                    f"({min(int(done), ticks)}/{ticks} frames)"
+                )
+            # setValue MUST come last: on a window-modal QProgressDialog
+            # it runs processEvents(), which can deliver this command's
+            # queued opFinished re-entrantly — completing the chain and
+            # tearing the dialog down (``_track_progress_dialog`` is
+            # None again on return). Nothing may touch the dialog after
+            # this call.
+            dlg.setValue(int(round(100 * overall / chain["total"])))
+
+        # If that re-entrant opFinished drained the queue, the status
+        # bar already reads "idle" — do not resurrect a stale
+        # "running: …" line for a command that is finished.
+        if self._pipe_thread is None and not self._pipeline_queue:
+            return
+
+        if op_name == "track_peaks":
+            # Busy (indeterminate) in the panel — no frame count to show.
+            new_tail = " · tracking…"
+        elif total <= 1:
             new_tail = ""
         else:
             new_tail = f" · {done}/{total} frames"
@@ -8680,6 +9853,11 @@ class MainWindow(QMainWindow):
         if self._conv_thread is not None:
             self._conv_thread.quit()
             self._conv_thread.wait()
+        # Close the phase-tracking views window (its closeEvent waits
+        # for any in-flight view-computation worker).
+        if self._phase_views_window is not None:
+            self._phase_views_window.close()
+        self._close_tracking_progress()
         # Shut the background prefetch worker down cleanly. Release
         # its h5py handle first (so the worker stops trying to read
         # frames), then quit + wait the thread so its event loop

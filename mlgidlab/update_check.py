@@ -28,17 +28,19 @@ from packaging.version import InvalidVersion, Version
 
 logger = logging.getLogger("mlgidlab")
 
-_OWNER_REPO = "mlgid-project/mlgidBASE_GUI"
+# Single source of truth for the GitHub repo. The repo was renamed from
+# ``mlgidBASE_GUI`` to ``mlgidLAB``; GitHub still redirects the old name, but
+# we use the canonical one everywhere (Releases API, releases page, and the
+# git URL the install commands use) so nothing depends on that redirect.
+_OWNER_REPO = "mlgid-project/mlgidLAB"
 RELEASES_API = f"https://api.github.com/repos/{_OWNER_REPO}/releases"
 RELEASES_PAGE = f"https://github.com/{_OWNER_REPO}/releases"
 
-# Our own installed distribution + the git URL used to (re)install it. This is
-# the URL every install command in the README / getting_started / CHANGELOG
-# uses (``pip install "git+https://github.com/mlgid-project/mlgidLAB@vX"``) and
-# is deliberately the ``mlgidLAB`` repo, NOT ``_OWNER_REPO`` above — the latter
-# is only the name the GitHub *Releases* API happens to be published under.
+# Our own installed distribution + the git URL used to (re)install it (the
+# same ``pip install "git+https://github.com/mlgid-project/mlgidLAB@vX"`` the
+# README / getting_started / CHANGELOG document).
 DIST_NAME = "mlgidlab"
-REPO_GIT_URL = "https://github.com/mlgid-project/mlgidLAB"
+REPO_GIT_URL = f"https://github.com/{_OWNER_REPO}"
 # The distribution that anchors the heavy ``[pipeline]`` extra. If it is
 # installed we keep the extra on self-update so the backend stays wired up.
 _PIPELINE_ANCHOR_DIST = "mlgidbase"

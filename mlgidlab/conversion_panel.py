@@ -96,6 +96,31 @@ class RawScan:
     frame_num: int | list[int] | None = None
 
 
+def _expand_fabio_scans(
+    entry: RawEntry, frame_num: int | list[int] | None
+) -> list[RawScan]:
+    """Turn a selected fabio stack entry into one ``RawScan`` per frame-file.
+
+    pygid reads a fabio image via ``fabio.open(path).data`` (frame 0 only)
+    and ignores both ``dataset`` and ``frame_num``, so each converted frame
+    must be its OWN single-file scan (``entry=""``, ``frame_num=None``).
+    Here ``frame_num`` selects WHICH stack frames to convert (and therefore
+    which files), following the panel's frame mode: ``None`` → every file,
+    ``int`` → one, ``list`` → a subset. Out-of-range indices are dropped.
+    """
+    fmap = entry.frame_map or []
+    n = len(fmap)
+    if frame_num is None:
+        idxs: list[int] = list(range(n))
+    elif isinstance(frame_num, int):
+        idxs = [frame_num] if 0 <= frame_num < n else []
+    else:
+        idxs = [i for i in frame_num if 0 <= i < n]
+    return [
+        RawScan(file_path=fmap[i][0], entry="", frame_num=None) for i in idxs
+    ]
+
+
 @dataclass
 class ConversionConfig:
     """Everything the conversion engine needs except the scan list."""
@@ -509,8 +534,15 @@ class ConversionPanel(QWidget):
             file_item.setToolTip(0, str(file_path))
             for re in entries:
                 shape = "×".join(str(s) for s in re.shape)
+                # Fabio images have no internal dataset path — label the child
+                # by frame count instead of the empty string.
+                if getattr(re, "frame_map", None) is not None:
+                    n = len(re.frame_map)
+                    child_text = f"image ({n} frame{'s' if n != 1 else ''})"
+                else:
+                    child_text = re.dataset_path
                 child = QTreeWidgetItem([
-                    re.dataset_path, shape, re.dtype,
+                    child_text, shape, re.dtype,
                 ])
                 child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 child.setCheckState(0, Qt.CheckState.Unchecked)
@@ -1282,13 +1314,17 @@ class ConversionPanel(QWidget):
                 re: RawEntry | None = child.data(0, Qt.ItemDataRole.UserRole)
                 if re is None:
                     continue
-                scans.append(
-                    RawScan(
-                        file_path=re.file_path,
-                        entry=re.dataset_path,
-                        frame_num=frame_num,
+                if getattr(re, "frame_map", None) is not None:
+                    # Fabio stack: one per-file scan per selected frame.
+                    scans.extend(_expand_fabio_scans(re, frame_num))
+                else:
+                    scans.append(
+                        RawScan(
+                            file_path=re.file_path,
+                            entry=re.dataset_path,
+                            frame_num=frame_num,
+                        )
                     )
-                )
         return scans
 
     def _resolve_frame_num(self) -> int | list[int] | None:

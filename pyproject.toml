@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlgidlab"
-version = "0.1.0a10"
+version = "0.1.0a11"
 description = "mlgidLAB: graphical interface for the mlgidBASE GIWAXS analysis pipeline"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -44,6 +44,10 @@ dependencies = [
     # inside the button handlers so a broken pyFAI install doesn't
     # block cold startup.
     "pyFAI>=2024.1",
+    # Reading standalone detector images (TIFF/CBF/EDF) in raw mode. Already
+    # present transitively via silx[full]/pyFAI; pinned here so the image
+    # open path has an explicit floor.
+    "fabio>=2024.1",
 ]
 
 [project.optional-dependencies]

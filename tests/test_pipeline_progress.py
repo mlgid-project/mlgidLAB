@@ -163,6 +163,31 @@ def test_panel_shows_progress_on_multi_frame_run(main_window, qtbot):
     assert "3/12" in panel._progress_label.text()
 
 
+def test_panel_shows_busy_bar_for_track_peaks(main_window, qtbot):
+    """track_peaks is one opaque call (file open + IoU/graph dominate,
+    per-frame reads are ~3%), so its progress row is an indeterminate
+    busy bar (range 0..0) rather than a misleading frame counter. A
+    later determinate run restores the normal bar."""
+    panel = main_window.pipeline_panel
+    if not getattr(panel, "_available", True):
+        pytest.skip("mlgidbase not installed in this env")
+    main_window.show()
+    qtbot.waitExposed(main_window)
+    # total is passed (frame count) but ignored — the bar goes busy.
+    panel.on_frame_progress(done=0, total=310, op_name="track_peaks", entry="scan")
+    assert panel._progress_bar.isVisible()
+    assert panel._progress_bar.minimum() == 0 and panel._progress_bar.maximum() == 0
+    assert "Tracking" in panel._progress_label.text()
+    # Later ticks don't disturb the busy bar.
+    panel.on_frame_progress(done=200, total=310, op_name="track_peaks", entry="scan")
+    assert panel._progress_bar.maximum() == 0
+    # A subsequent determinate run restores a normal counter.
+    panel.set_running(False)
+    panel.on_frame_progress(done=3, total=12, op_name="run_detection", entry="e")
+    assert panel._progress_bar.maximum() == 12
+    assert panel._progress_bar.value() == 3
+
+
 def test_panel_hides_progress_when_set_running_false(main_window, qtbot):
     """``set_running(False)`` is the cleanup hook the host calls when
     the queue drains; the progress row must hide regardless of the
@@ -233,3 +258,32 @@ def test_panel_hides_both_bars_when_set_running_false(main_window, qtbot):
     assert not panel._progress_label.isVisible()
     assert not panel._entry_progress_bar.isVisible()
     assert not panel._entry_progress_label.isVisible()
+
+
+def test_cif_parse_busy_bar_lifecycle(main_window, qtbot):
+    """"Parse CIFs" shows a compact indeterminate busy bar while the
+    parse worker runs and hides it when the result (or error) lands —
+    CifPattern has no per-CIF callback, so busy is the honest mode."""
+    panel = main_window.pipeline_panel
+    if not getattr(panel, "_available", True):
+        pytest.skip("mlgidbase not installed in this env")
+    # isHidden() (the widget's OWN state) rather than isVisible():
+    # the Pipeline dock may be tabbed away in the fixture window, which
+    # zeroes isVisible() for every child regardless of show()/hide().
+    assert panel.cif_parse_bar.isHidden()
+    # Swallow the emitted request so no real parse worker starts.
+    panel.parseCifsRequested.disconnect()
+    panel.cif_path.setText("some/folder")
+    panel._on_parse_cifs()
+    assert not panel.cif_parse_bar.isHidden()
+    assert panel.cif_parse_bar.minimum() == 0 and panel.cif_parse_bar.maximum() == 0
+    # Success hides it...
+    class _Fake:
+        cifs = ["A.cif"]
+    panel.set_cif_pattern(_Fake(), None)
+    assert panel.cif_parse_bar.isHidden()
+    # ...and so does a parse failure.
+    panel._on_parse_cifs()
+    assert not panel.cif_parse_bar.isHidden()
+    panel.set_cif_pattern(None, RuntimeError("boom"))
+    assert panel.cif_parse_bar.isHidden()

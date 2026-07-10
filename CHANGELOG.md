@@ -4,6 +4,81 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## 0.1.0a11 — eleventh alpha (2026-07-10)
+
+Feature alpha on `0.1.0a10`: cross-frame peak tracking with interactive
+views, gap filling and export. No on-disk schema changes; the
+`[pipeline]` pins are unchanged. The tracking features need an
+mlgidbase build newer than the pinned `0.1.3` release (`track_peaks`);
+they detect a too-old build and say so — everything else runs on the
+pins.
+
+### Added
+
+- **Cross-frame peak tracking.** A new **Scan tracking** dock runs
+  mlgidBASE's `track_peaks` over the active entry and lists the surviving
+  tracks (frame span, member count, matched structures). Clicking a row
+  jumps the viewer to the track's first frame and selects its fitted peak;
+  selecting a tracked peak mid-scan highlights its row without bouncing the
+  frame. A **Show only tracked peaks** filter hides all non-tracked
+  fitted/matched peaks during playback. Rings are tracked GUI-side (radial
+  overlap across frames), since upstream tracking covers spots only.
+  Results invalidate automatically when fitting rewrites the entry.
+- **Phase tracking views.** **Show views…** opens a window with four
+  interactive tabs: per-track trajectories of any axis vs frame (click a
+  point to jump the viewer there); a (q_xy, q_z) map of the tracks,
+  optionally over a nan-mean image of a chosen frame window; amplitude
+  evolution with smoothing/normalization, grouping by matched structure, a
+  median-per-structure mode with a transparent interquartile band, and thin
+  dashed max/min reference lines per structure; and a frame × |q| radial
+  waterfall of the whole scan. Tracks colour by matched phase (CIF) with
+  per-structure show/hide toggles that govern every view at once, and
+  **Save official mlgidBASE figures…** writes upstream's own matplotlib
+  exports.
+- **Plot data + image export.** Every views-window plot exports its numbers
+  to CSV — complete tables with track/structure identity per row; the
+  amplitude export follows the displayed mode (median rows carry
+  median/quartile columns) and matrix exports carry their axes — and its
+  rendering to PNG/SVG. The image export is styled interactively: choose
+  the structures to include, line width/style, marker size, output width
+  and an optional white background. Both work per plot or for several
+  plots at once.
+- **Interpolate track (real gap filling).** For a tracked spot peak fitted
+  on some frames of its span but missing in between, the Scan-tracking
+  dock's **Interpolate track** button injects a detected box at the
+  estimated position (size from the bracketing frames), runs the same 2D
+  fit the pipeline uses, re-matches it ONLY against the structures the
+  track was found in (a gap fill can never introduce a new structure), and
+  adds the new peaks to the track. Ring tracks are filled along |q| with
+  the ring conventions preserved; a progress dialog mirrors the pipeline
+  panel's per-frame progress across the fit + re-match chain.
+- **Matched display styles.** A style combo next to the Matched-peaks
+  toggle: **Boxes** (as before) or **Markers** — screen-fixed circles for
+  peaks and dashed arcs for rings, one colour per structure with the shape
+  distinguishing ring from peak. The palette is a new set of ten
+  well-separated hues, so ten structures stay tellable apart.
+- **"Unmatched fitted peaks" display group.** A grey row under Matched
+  peaks showing every fitted peak no loaded structure claims (off by
+  default) — the whole frame can read in marker style, and tracking
+  coverage is easy to judge.
+- **CIF-parse progress.** A small busy indicator next to "Parse CIFs"
+  while the CIF files are being parsed.
+- **Open detector images (TIFF/CBF/EDF).** Standalone image files now open in
+  raw mode alongside HDF5 detector files, using the same view + Conversion
+  workflow (pygid reads them via `fabio`). Selecting several images — or
+  dropping a folder of them — opens each as its own entry (one per file, in
+  natural filename order), switchable from the entry combo and the file
+  browser; converting writes each checked image to NeXus. HDF5/NeXus handling
+  is unchanged.
+
+### Fixed
+
+- **Matched-structure colours and visibility are stable across frames.**
+  Both were keyed by the structure's position in the per-frame list, so a
+  structure could change colour from frame to frame and hiding it did not
+  persist to other frames; both now key to the structure's identity
+  (CIF + hkl).
+
 ## 0.1.0a10 — tenth alpha (2026-07-01)
 
 Feature alpha on `0.1.0a9`. No on-disk schema or backend changes; the

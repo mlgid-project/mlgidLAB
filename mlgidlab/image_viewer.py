@@ -98,17 +98,22 @@ FITTED_PREVIEW_OPACITY = 0.45
 # insertion order so multiple structures in one frame are easy to tell apart.
 # Avoids the existing detected/fitted/manual hues to prevent confusion.
 MATCHED_PALETTE: tuple[str, ...] = (
-    "#1f77ff",  # azure
-    "#bf5af2",  # violet
-    "#30d158",  # green
-    "#ff9f0a",  # orange
-    "#64d2ff",  # light cyan
-    "#ff375f",  # rose
-    "#a8e10c",  # lime
-    "#ffd60a",  # amber
-    "#5ac8fa",  # sky
-    "#ac8e68",  # taupe
+    "#3b82f6",  # blue
+    "#84cc16",  # lime
+    "#ef4444",  # red
+    "#c0c0c0",  # silver
+    "#eab308",  # yellow
+    "#ec4899",  # pink
+    "#a855f7",  # purple
+    "#06b6d4",  # cyan
+    "#22c55e",  # green
+    "#f97316",  # orange
 )
+# Ordered farthest-point-first (each hue is the most perceptually distant
+# from all already-assigned ones), so the first N structures pick up the
+# most mutually distinguishable colours; every pair is >=34 dE (CIE76)
+# apart. The previous palette had two near-identical cyans (~5 dE), which
+# read as "the same colour" for adjacent structures.
 # Line styles cycled after the palette wraps. Combined with
 # MATCHED_PALETTE this yields ``len(palette) * len(styles)`` unique
 # pens before any (colour, style) pair repeats — enough headroom for
@@ -125,6 +130,24 @@ MATCHED_LINE_WIDTH = 1.6
 # can keep using this dict. New code should prefer ``matched_pen_for``
 # which combines the palette + line-style cycle.
 MATCHED_STYLE = {"style": MATCHED_LINE_STYLES[0], "width": MATCHED_LINE_WIDTH}
+
+# Screen-fixed diameter (px) of the circular markers used by the
+# "Markers" matched-display style (peaks as hollow circles, rings as
+# dashed arcs — the q-map look, easier on the eye during scan playback
+# than boxes whose size varies with each peak's width).
+MATCHED_MARKER_SIZE = 11
+
+# Pseudo-group for fitted peaks NOT claimed by any matched structure.
+# Rendered through the matched overlay machinery (same display style,
+# master toggle, tracked-peak filter) so unmatched peaks can be shown
+# as markers alongside the structures — neutral grey, matching the hue
+# the phase views use for unmatched tracks. Off by default: the fitted
+# overlay already draws every fitted row, so this group is an opt-in
+# view. The sentinel uid/key ride the existing per-item and
+# per-identity bookkeeping without colliding with real structures.
+UNMATCHED_COLOR = "#969696"
+UNMATCHED_UID = "__unmatched__"
+UNMATCHED_KEY = ("__unmatched__", 0, 0, 0)
 
 
 def matched_pen_for(index: int) -> dict:
@@ -1057,10 +1080,22 @@ class GIWAXSImageViewer(QWidget):
         # Items in ``_matched_items`` belong to the *currently rendered* frame
         # only — they're torn down and rebuilt on frame change.
         self._matched_per_frame: dict[int, list[MatchedStructure]] = {}
-        # Per-(frame, unique_id) state lets us preserve user toggles when the
-        # frame changes back. Defaults to True on first sight.
-        self._matched_visibility: dict[tuple[int, str], bool] = {}
+        # Show/hide state keyed by a structure's CROSS-FRAME identity
+        # (``MatchedStructure.color_key`` = CIF + hkl), so unchecking a
+        # structure on one frame hides it on every frame it appears.
+        # Defaults to True on first sight.
+        self._matched_visibility: dict[tuple, bool] = {}
+        # Stable colour index per structure identity, assigned first-seen
+        # so a given (CIF, hkl) keeps its colour across the whole scan
+        # (previously coloured by per-frame position, which shuffled as
+        # the structure set changed frame to frame).
+        self._matched_color_index: dict[tuple, int] = {}
         self._matched_master_visible: bool = True
+        # How matched structures are drawn: "boxes" (default, per-peak
+        # boxes) or "markers" (hollow circles for peaks + dashed arcs for
+        # rings, like the q-map). A display preference, not reset on
+        # file close.
+        self._matched_display_style: str = "boxes"
         # ``unique_id``s currently hidden by the Display-dock search
         # filter. Independent of ``_matched_visibility`` (which
         # tracks checkbox state); the filter set overrides checkbox
@@ -1072,7 +1107,16 @@ class GIWAXSImageViewer(QWidget):
         # default) lets every detected peak through; raising it
         # hides weak detections without mutating the file.
         self._detected_score_cutoff: float = 0.0
+        # When not None, ONLY these fitted rows render, per frame
+        # (``{frame: {fitted_id, ...}}``; frames absent from the mapping
+        # show no fitted rows at all). Driven by the Scan-tracking
+        # dock's "Show only tracked peaks" toggle, so the user can
+        # verify track consistency by scrubbing. None = filter off.
+        self._fitted_visible_only: dict[int, set[int]] | None = None
         self._matched_items: list[tuple[str, _PeakShapeItem]] = []
+        # Identities whose tracked-peak subset is empty on the rendered
+        # frame (kept hidden against later visibility refreshes).
+        self._matched_empty_uids: set = set()
 
         self._mode = MODE_POLAR
         self._log_scale: bool = False
@@ -1686,13 +1730,12 @@ class GIWAXSImageViewer(QWidget):
         is the one currently shown.
         """
         self._matched_per_frame[frame] = list(structures)
-        # Drop visibility entries for structures no longer present.
-        present_ids = {(frame, s.unique_id) for s in structures}
-        existing = {k for k in self._matched_visibility if k[0] == frame}
-        for stale in existing - present_ids:
-            self._matched_visibility.pop(stale, None)
+        # Visibility is identity-keyed and persists across frames, so
+        # there is nothing to prune here; new identities default to
+        # visible via the ``.get(..., True)`` lookups. Assign each a
+        # stable colour index up front so the swatch/overlay agree.
         for s in structures:
-            self._matched_visibility.setdefault((frame, s.unique_id), True)
+            self._color_index_for(s)
         if frame == self.current_frame:
             self._render_overlays(frame)
             self.matchedStructuresChanged.emit(frame, list(structures))
@@ -1707,33 +1750,170 @@ class GIWAXSImageViewer(QWidget):
         """
         return self.matched_pen(structure)["color"]
 
+    def _color_index_for_key(self, key: tuple) -> int:
+        """Stable palette index for a structure identity (``color_key``),
+        assigned on first sight and reused thereafter so the colour is
+        constant across frames and shared by the real overlay, the
+        interpolated overlay, and the Display-dock swatch."""
+        return self._matched_color_index.setdefault(
+            key, len(self._matched_color_index)
+        )
+
+    def _color_index_for(self, structure: MatchedStructure) -> int:
+        return self._color_index_for_key(structure.color_key)
+
+    def seed_matched_colors(self, keys) -> None:
+        """Pre-assign palette indices for ``keys`` (an ordered iterable of
+        ``color_key`` tuples) so colours are deterministic regardless of
+        which frame is rendered first. Idempotent: keys already assigned
+        keep their index. The host seeds this from the full set of matched
+        identities (sorted) when a scan is tracked, so a structure seen
+        only via interpolation gets the same colour as on its real frames.
+        """
+        for key in keys:
+            self._color_index_for_key(tuple(key))
+
     def matched_pen(self, structure: MatchedStructure) -> dict:
         """Return the full ``{color, style, width}`` pen for ``structure``.
 
-        Pairs with ``matched_pen_for(index)`` — the panel uses this so
-        each row's swatch reproduces the exact line style on screen.
+        Keyed by the structure's cross-frame identity so the panel swatch
+        and the overlay share one stable colour on every frame.
         """
-        frame = self.current_frame
-        lst = self._matched_per_frame.get(frame, [])
-        for i, s in enumerate(lst):
-            if s.unique_id == structure.unique_id:
-                return matched_pen_for(i)
-        return matched_pen_for(0)
+        return matched_pen_for(self._color_index_for(structure))
 
     def matched_visibility(self, frame: int, unique_id: str) -> bool:
-        return self._matched_visibility.get((frame, unique_id), True)
+        """Show/hide state for the structure with ``unique_id`` on
+        ``frame`` — resolved to its cross-frame identity so the state
+        follows the structure between frames."""
+        for s in self._matched_per_frame.get(frame, []):
+            if s.unique_id == unique_id:
+                return self._matched_visibility.get(s.color_key, True)
+        return True
+
+    def unmatched_visible(self) -> bool:
+        """Checkbox state of the unmatched-fitted pseudo-group (defaults
+        OFF — the fitted overlay already draws every fitted row)."""
+        return bool(self._matched_visibility.get(UNMATCHED_KEY, False))
+
+    def set_unmatched_visible(self, visible: bool) -> None:
+        """Show/hide the unmatched-fitted pseudo-group. Persists across
+        frames like a structure checkbox (identity-keyed)."""
+        self._matched_visibility[UNMATCHED_KEY] = bool(visible)
+        self._apply_matched_item_visibility()
+
+    def has_unmatched_fitted(self, frame: int) -> bool:
+        """True when ``frame`` has fitted rows not claimed by any
+        matched structure (tracked-peak filter applied) — drives the
+        Display dock's "Unmatched fitted peaks" row."""
+        return self._unmatched_fitted_subset(frame) is not None
+
+    def _unmatched_fitted_subset(self, frame: int):
+        """Fitted rows on ``frame`` outside every matched structure's
+        ``peaks.ids`` (minus rows the tracked-peak filter hides), or
+        ``None`` when there are none."""
+        fit = self._frame_peaks.get(frame, {}).get("fitted")
+        if fit is None or len(fit) == 0:
+            return None
+        claimed: set = set()
+        for s in self._matched_per_frame.get(frame, []):
+            claimed.update(
+                int(p) for p in np.asarray(s.peaks.ids, dtype=int)
+            )
+        kept = [
+            int(pid) for pid in fit.ids
+            if int(pid) not in claimed
+            and not self._fitted_row_hidden(frame, int(pid))
+        ]
+        if not kept:
+            return None
+        if len(kept) == len(fit):
+            return fit
+        return _peaks_subset(fit, kept)
+
+    def set_matched_display_style(self, style: str) -> None:
+        """Switch the matched overlay between ``"boxes"`` and
+        ``"markers"`` (hollow circles for peaks, dashed arcs/lines for
+        rings — the q-map look). Re-renders the current frame; no other
+        overlay is affected."""
+        style = "markers" if style == "markers" else "boxes"
+        if style == self._matched_display_style:
+            return
+        self._matched_display_style = style
+        self._render_overlays(self.current_frame)
+
+    def _matched_marker_items(self, peaks, color, extent) -> list:
+        """Build q-map-style items for one structure's peaks: a hollow
+        circle scatter for the spots and a dashed arc (Cartesian) /
+        constant-radius line (polar) per ring. Returns pg items to add
+        and track alongside the box items."""
+        items: list = []
+        if peaks is None or len(peaks) == 0:
+            return items
+        is_ring = np.asarray(peaks.is_ring, dtype=bool)
+        spot = np.flatnonzero(~is_ring)
+        if spot.size:
+            r = np.asarray(peaks.radius, dtype=float)[spot]
+            ang = np.asarray(peaks.angle, dtype=float)[spot]
+            if self._mode == MODE_POLAR:
+                xs, ys = r, ang
+            else:
+                a = np.deg2rad(ang)
+                xs, ys = r * np.cos(a), r * np.sin(a)
+            items.append(pg.ScatterPlotItem(
+                x=xs, y=ys, symbol="o", size=MATCHED_MARKER_SIZE,
+                pen=pg.mkPen(QColor(color), width=1.5), brush=None,
+            ))
+        # Ring and peak share the structure's colour; the SHAPE tells
+        # them apart (a big dashed quarter-circle arc vs small circles),
+        # so one well-distinguishable colour per structure is enough and
+        # the eye isn't asked to separate two shades of the same hue.
+        for i in np.flatnonzero(is_ring):
+            clip = _clip_angle(
+                float(peaks.angle[i]), float(peaks.angle_width[i]),
+                extent=extent,
+            )
+            if clip is None:
+                continue
+            a_lo, a_hi = clip
+            r = float(peaks.radius[i])
+            pen = pg.mkPen(QColor(color), width=1.5, style=Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            if self._mode == MODE_POLAR:
+                curve = pg.PlotCurveItem(
+                    x=np.array([r, r]), y=np.array([a_lo, a_hi]), pen=pen,
+                )
+            else:
+                th = np.linspace(np.deg2rad(a_lo), np.deg2rad(a_hi), 100)
+                curve = pg.PlotCurveItem(
+                    x=r * np.cos(th), y=r * np.sin(th), pen=pen,
+                )
+            items.append(curve)
+        return items
+
+    def _apply_matched_item_visibility(self) -> None:
+        """Refresh visibility of every current-frame matched item
+        (gated by ``_is_matched_item_visible``)."""
+        for uid, item in self._matched_items:
+            item.setVisible(self._is_matched_item_visible(uid))
 
     def set_matched_master_visible(self, visible: bool) -> None:
         self._matched_master_visible = visible
-        for _uid, item in self._matched_items:
-            item.setVisible(self._is_matched_item_visible(_uid))
+        self._apply_matched_item_visibility()
 
     def set_matched_structure_visible(self, unique_id: str, visible: bool) -> None:
-        frame = self.current_frame
-        self._matched_visibility[(frame, unique_id)] = visible
-        for uid, item in self._matched_items:
-            if uid == unique_id:
-                item.setVisible(self._is_matched_item_visible(uid))
+        # Store against the structure's cross-frame identity so the
+        # choice persists as the user scrubs frames.
+        key = None
+        for s in self._matched_per_frame.get(self.current_frame, []):
+            if s.unique_id == unique_id:
+                key = s.color_key
+                break
+        if key is None:
+            return
+        self._matched_visibility[key] = visible
+        # Refresh every current-frame item (cheap; small list) so any
+        # item sharing this identity updates too.
+        self._apply_matched_item_visibility()
 
     def set_detected_score_cutoff(self, value: float) -> None:
         """Hide detected-overlay rows whose score is below ``value``.
@@ -1746,6 +1926,41 @@ class GIWAXSImageViewer(QWidget):
         """
         self._detected_score_cutoff = float(value)
         self._render_overlays(self.current_frame)
+
+    def set_fitted_visible_only(
+        self, mapping: dict[int, set[int]] | None
+    ) -> None:
+        """Render ONLY the given fitted rows (``{frame: {id, ...}}``).
+
+        Driven by the Scan-tracking dock's "Show only tracked peaks"
+        toggle: pass the per-frame member ids of the surviving tracks
+        and every other fitted row disappears from the overlay (frames
+        not in the mapping show none), so scrubbing the scan reveals
+        whether the tracks are visually consistent. Pass ``None`` to
+        disable the filter entirely. Non-destructive render-time
+        subset, like the Display dock's min-score cutoff; re-renders
+        the current frame immediately.
+        """
+        if mapping is None:
+            self._fitted_visible_only = None
+        else:
+            self._fitted_visible_only = {
+                int(f): {int(i) for i in ids}
+                for f, ids in mapping.items()
+            }
+        self._render_overlays(self.current_frame)
+
+    def _fitted_row_hidden(self, frame: int, peak_id: int) -> bool:
+        """True when the "show only tracked peaks" filter is active and
+        this fitted row is not in the visible whitelist for ``frame``.
+
+        Such a row is not rendered, so it must not be click- or
+        Ctrl+A-selectable either — what you can't see, you can't select.
+        Used by every fitted hit-test path in ``_on_select_at`` and by
+        ``_select_all_of_kind_on_frame``.
+        """
+        vo = self._fitted_visible_only
+        return vo is not None and int(peak_id) not in vo.get(int(frame), set())
 
     def set_matched_filter_hidden(self, hidden_ids) -> None:
         """Hide overlays for structures filtered out of the
@@ -1766,11 +1981,24 @@ class GIWAXSImageViewer(QWidget):
     def _is_matched_item_visible(self, unique_id: str) -> bool:
         if not self._matched_master_visible:
             return False
+        # The unmatched-fitted pseudo-group has no per-frame structure
+        # to resolve; its own identity-keyed checkbox (default OFF)
+        # decides, under the master toggle above.
+        if unique_id == UNMATCHED_UID:
+            return bool(self._matched_visibility.get(UNMATCHED_KEY, False))
+        # Structures whose tracked-peak subset is empty on this frame were
+        # rendered with nothing to draw; they must stay hidden even when a
+        # later visibility refresh (e.g. the Display-dock filter) re-runs.
+        if unique_id in self._matched_empty_uids:
+            return False
         if unique_id in self._matched_filter_hidden:
             return False
-        return self._matched_visibility.get(
-            (self.current_frame, unique_id), True
-        )
+        # Resolve the current-frame item to its cross-frame identity and
+        # read the identity-keyed checkbox state.
+        for s in self._matched_per_frame.get(self.current_frame, []):
+            if s.unique_id == unique_id:
+                return self._matched_visibility.get(s.color_key, True)
+        return True
 
     def _overlay_item(self, kind: str) -> _PeakShapeItem | None:
         return {
@@ -1806,12 +2034,15 @@ class GIWAXSImageViewer(QWidget):
         self._fitted_preview_extras_geoms = []
         self._frame_peaks.clear()
         self._manual_peaks.clear()
+        self._fitted_visible_only = None
         self._undo_stack.clear()
         self._redo_stack.clear()
         # Tear down all matched items and forget per-frame state.
         self._teardown_matched_items()
+        self._matched_empty_uids = set()
         self._matched_per_frame.clear()
         self._matched_visibility.clear()
+        self._matched_color_index.clear()
         had_selection = self._selected is not None
         self._selected = None
         self._selected_extras = []
@@ -2802,6 +3033,16 @@ class GIWAXSImageViewer(QWidget):
                 logger.debug("suppressed exception in GIWAXSImageViewer._render_overlays", exc_info=True)
                 pass
 
+        # "Show only tracked peaks" (Scan-tracking dock): when active,
+        # render only the fitted rows that belong to a surviving track
+        # on this frame; frames without members show none. Render-time
+        # subset only — the in-memory tables and the file are untouched.
+        if self._fitted_visible_only is not None and fit is not None and len(fit) > 0:
+            allowed = self._fitted_visible_only.get(frame, set())
+            keep_ids = [int(i) for i in fit.ids if int(i) in allowed]
+            if len(keep_ids) < len(fit):
+                fit = _peaks_subset(fit, keep_ids)
+
         manual_list = list(self._manual_peaks.get(frame, []))
         # Manual boxes are scratch labels — keep them invisible
         # unless they are the active selection. The ManualPeak
@@ -2959,20 +3200,77 @@ class GIWAXSImageViewer(QWidget):
         color, painted in the current display mode (polar / Cartesian).
         """
         self._teardown_matched_items()
+        # Identities rendered with an empty tracked subset this frame —
+        # kept hidden by _is_matched_item_visible against later refreshes.
+        self._matched_empty_uids = set()
         structures = self._matched_per_frame.get(frame, [])
-        if not structures:
-            return
         extent = self.angular_extent()
         vb = self._plot.getViewBox()
         for i, s in enumerate(structures):
-            item = _PeakShapeItem(**matched_pen_for(i))
-            if self._mode == MODE_POLAR:
-                item.set_polar(s.peaks, extent=extent)
+            # "Show only tracked peaks" applies per matched peak: draw
+            # only the boxes around this structure's TRACKED fitted
+            # peaks. A structure whose peaks are all untracked ends up
+            # with an empty subset and paints nothing (hidden below).
+            peaks = s.peaks
+            has_peaks = len(peaks) > 0
+            if self._fitted_visible_only is not None and has_peaks:
+                kept = [
+                    int(pid) for pid in s.peaks.ids
+                    if not self._fitted_row_hidden(frame, int(pid))
+                ]
+                peaks = _peaks_subset(s.peaks, kept)
+                has_peaks = len(peaks) > 0
+            if not has_peaks:
+                self._matched_empty_uids.add(s.unique_id)
+            pen_info = matched_pen_for(self._color_index_for(s))
+            visible = has_peaks and self._is_matched_item_visible(s.unique_id)
+            if self._matched_display_style == "markers":
+                # q-map look: circles for peaks, dashed arcs for rings.
+                # A structure may map to several items (one scatter + N
+                # ring curves); all share the structure's unique_id so
+                # visibility toggling reaches every one.
+                items = self._matched_marker_items(
+                    peaks, pen_info["color"], extent
+                )
             else:
-                item.set_cartesian(s.peaks, extent=extent)
-            item.setVisible(self._is_matched_item_visible(s.unique_id))
-            vb.addItem(item, ignoreBounds=True)
-            self._matched_items.append((s.unique_id, item))
+                box = _PeakShapeItem(**pen_info)
+                if self._mode == MODE_POLAR:
+                    box.set_polar(peaks, extent=extent)
+                else:
+                    box.set_cartesian(peaks, extent=extent)
+                items = [box]
+            for it in items:
+                it.setVisible(visible)
+                vb.addItem(it, ignoreBounds=True)
+                self._matched_items.append((s.unique_id, it))
+
+        # Unmatched-fitted pseudo-group: every fitted row no structure
+        # claims (tracked filter applied), drawn in neutral grey with
+        # the same display style — rendered even when the frame has no
+        # matched structures at all (then EVERY fitted row is
+        # unmatched). Built hidden unless its checkbox is on.
+        un = self._unmatched_fitted_subset(frame)
+        if un is not None:
+            visible = self._is_matched_item_visible(UNMATCHED_UID)
+            if self._matched_display_style == "markers":
+                items = self._matched_marker_items(
+                    un, UNMATCHED_COLOR, extent
+                )
+            else:
+                box = _PeakShapeItem(
+                    color=UNMATCHED_COLOR,
+                    style=MATCHED_STYLE["style"],
+                    width=MATCHED_LINE_WIDTH,
+                )
+                if self._mode == MODE_POLAR:
+                    box.set_polar(un, extent=extent)
+                else:
+                    box.set_cartesian(un, extent=extent)
+                items = [box]
+            for it in items:
+                it.setVisible(visible)
+                vb.addItem(it, ignoreBounds=True)
+                self._matched_items.append((UNMATCHED_UID, it))
 
     def _teardown_matched_items(self) -> None:
         if not self._matched_items:
@@ -3266,6 +3564,10 @@ class GIWAXSImageViewer(QWidget):
                 if table is None or len(table) == 0:
                     continue
                 for i in reversed(range(len(table))):
+                    if kind == "fitted" and self._fitted_row_hidden(
+                        frame, int(table.ids[i])
+                    ):
+                        continue
                     if hit_table(table, i):
                         self._toggle_selected(SelectedPeak(
                             kind=kind,
@@ -3303,6 +3605,10 @@ class GIWAXSImageViewer(QWidget):
             if table is None or len(table) == 0:
                 continue
             for i in reversed(range(len(table))):
+                if kind == "fitted" and self._fitted_row_hidden(
+                    frame, int(table.ids[i])
+                ):
+                    continue
                 if hit_table(table, i):
                     self._set_selected(SelectedPeak(
                         kind=kind,
@@ -3326,8 +3632,17 @@ class GIWAXSImageViewer(QWidget):
                 if not self._is_matched_item_visible(s.unique_id):
                     continue
                 tbl = s.peaks
-                color = matched_pen_for(s_idx)["color"]
+                color = matched_pen_for(self._color_index_for(s))["color"]
+                # Under "show only tracked peaks", only this structure's
+                # tracked peaks are drawn — so only they are clickable,
+                # and the structure-level highlight covers just them.
+                visible_ids = [
+                    int(x) for x in tbl.ids
+                    if not self._fitted_row_hidden(frame, int(x))
+                ]
                 for i in reversed(range(len(tbl))):
+                    if self._fitted_row_hidden(frame, int(tbl.ids[i])):
+                        continue
                     if hit_table(tbl, i):
                         self._set_selected(SelectedPeak(
                             kind="matched",
@@ -3344,11 +3659,11 @@ class GIWAXSImageViewer(QWidget):
                             score=float(tbl.score[i]),
                             amplitude=float(tbl.amplitude[i]),
                             # Clicking any peak of the structure
-                            # promotes the whole structure into the
-                            # selection — overlay highlights every
-                            # peak in it, table syncs the structure
-                            # row.
-                            multi_peak_ids=[int(x) for x in tbl.ids],
+                            # promotes the whole (visible) structure
+                            # into the selection — overlay highlights
+                            # every visible peak in it, table syncs the
+                            # structure row.
+                            multi_peak_ids=visible_ids,
                         ))
                         return
 
@@ -3577,7 +3892,16 @@ class GIWAXSImageViewer(QWidget):
                 amplitude=float(table.amplitude[i]),
             )
 
-        sels = [_sel(i) for i in range(len(table))]
+        # Skip fitted rows hidden by the "show only tracked peaks"
+        # filter — Ctrl+A must not grab invisible untracked peaks.
+        indices = [
+            i for i in range(len(table))
+            if not (kind == "fitted"
+                    and self._fitted_row_hidden(frame, int(table.ids[i])))
+        ]
+        if not indices:
+            return
+        sels = [_sel(i) for i in indices]
         # Bypass _set_selected (which would clear extras) and write
         # the multi-selection in one shot.
         self._selected = sels[0]

@@ -31,10 +31,10 @@ conda create -n mlgidlab python=3.12 -y
 conda activate mlgidlab
 
 # GUI only
-pip install "git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a10"
+pip install "git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a11"
 
 # or, full pipeline (detection / fitting / matching + raw conversion)
-pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a10"
+pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a11"
 ```
 
 ### From a local clone (for development)
@@ -88,8 +88,13 @@ is kept across an update when it is installed.
 ## First-file walkthrough
 
 1. **Open** a file: `File → Open…`, drag-and-drop, or `File → Open
-   recent`. The GUI classifies it as NeXus or raw automatically. The
-   right dock shows **Pipeline** for NeXus, **Conversion** for raw.
+   recent`. Supported inputs are HDF5/NeXus results (`.h5 .hdf5 .nxs`),
+   raw HDF5 detector stacks, and standalone detector images (`.tif .tiff
+   .cbf .edf`). The GUI classifies each automatically; the right dock
+   shows **Pipeline** for NeXus, **Conversion** for raw (including
+   images). Selecting several images — or dropping a folder of them —
+   opens each as its own entry, switchable from the entry combo and the
+   file browser.
 2. **Look around**: left = HDF5 tree; centre = q-image (toggle
    Cartesian / Polar); right-top = Pipeline / Conversion; right-bottom
    = Profiles / Peaks tabs; status bar = file / entry / frame / cursor.
