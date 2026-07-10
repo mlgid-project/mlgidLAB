@@ -13,7 +13,7 @@ visual control.
 > highlights.
 
 A short walktrough: raw detector image to reciprocal space, then ML analysis pipeline (detect, fit, match).
-<video src="https://github.com/user-attachments/assets/1f522b15-c076-4421-89e5-963a3f6e9429" controls muted width="100%"></video>
+<video src="https://github.com/user-attachments/assets/8f4bd640-8166-4d55-af1a-60055fc953c8" controls muted width="100%"></video>
 
 ## Install & launch
 
