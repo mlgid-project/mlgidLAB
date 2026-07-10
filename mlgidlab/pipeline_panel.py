@@ -849,6 +849,10 @@ class PipelinePanel(QWidget):
         (e.g. after Interpolate-track's gap fills) with the SAME
         settings the panel's own Run matching would use.
         """
+        if not self._available:
+            # Backend-less install: the matching widgets were never
+            # built — report "no CIF source configured".
+            return None
         if self._use_pickle_source():
             pkl = self.pickle_path.text().strip()
             if not pkl:
@@ -877,6 +881,10 @@ class PipelinePanel(QWidget):
         commands (Interpolate track) even when ``matching_kwargs()``
         returns the cached pre-parsed ``CifPattern`` object, which
         cannot be subset."""
+        if not self._available:
+            # Backend-less install: the matching widgets were never
+            # built (the panel shows the install hint instead).
+            return ""
         if self._use_pickle_source():
             return ""
         return self.cif_path.text().strip()

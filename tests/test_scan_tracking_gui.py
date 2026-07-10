@@ -414,7 +414,13 @@ def test_interpolate_button_plans_and_enqueues(
     assert spec["radius"] == pytest.approx((1.004 + 1.008) / 2)
     assert spec["angle"] == pytest.approx(45.0)
     assert spec["is_ring"] is False
-    assert set(fill["fit_params"]) >= {"crit_angle", "theta_fixed"}
+    if main_window.pipeline_panel._available:
+        # Backends installed: the panel's fit config rides along.
+        assert set(fill["fit_params"]) >= {"crit_angle", "theta_fixed"}
+    else:
+        # Backend-less (CI): the fit-config widgets don't exist, so the
+        # handler's documented fallback sends {} -> op defaults.
+        assert fill["fit_params"] == {}
     # Chain bookkeeping: one tick for the fill's single frame, and the
     # dialog up in manual (real-progress) mode.
     chain = main_window._interp_chain
@@ -557,7 +563,7 @@ def test_interp_matching_restricted_to_tracked_cifs(
 
 
 def test_interp_match_commands_split_segments_and_rings(
-    main_window, synthetic_fitted_scan, tmp_path,
+    main_window, synthetic_fitted_scan, monkeypatch, tmp_path,
 ):
     """A plan with segment AND ring fills yields one matching command
     per peaks_type, each pinned to its own frames and restricted to its
@@ -570,7 +576,13 @@ def test_interp_match_commands_split_segments_and_rings(
     cif_dir.mkdir()
     for name in ("A.cif", "B.cif", "C.cif"):
         (cif_dir / name).write_text("x")
-    main_window.pipeline_panel.cif_path.setText(str(cif_dir))
+    # Patch the panel's raw-source ACCESSOR, not its cif_path widget:
+    # the widget only exists when the pipeline backends are installed,
+    # and this test must also run on the backend-less CI.
+    monkeypatch.setattr(
+        main_window.pipeline_panel, "cif_source_text",
+        lambda: str(cif_dir),
+    )
     plan = {
         3: [
             {"track": 0, "radius": 1.0, "angle": 45.0,
@@ -596,7 +608,10 @@ def test_interp_match_commands_split_segments_and_rings(
 
     # An unsubsettable source (single foreign .cif file) -> matching
     # SKIPPED entirely rather than run against everything.
-    main_window.pipeline_panel.cif_path.setText("structures.cif")
+    monkeypatch.setattr(
+        main_window.pipeline_panel, "cif_source_text",
+        lambda: "structures.cif",
+    )
     cmds = main_window._build_interp_match_commands(
         plan, ENTRY, {"cif_prepr": "structures.cif", "threshold": 0.5},
     )
@@ -604,7 +619,7 @@ def test_interp_match_commands_split_segments_and_rings(
 
 
 def test_interp_unmatched_track_falls_back_to_scan_cifs(
-    main_window, synthetic_fitted_scan, tmp_path,
+    main_window, synthetic_fitted_scan, monkeypatch, tmp_path,
 ):
     """A filled track that was never matched re-matches against the
     structures identified elsewhere in the SCAN — never the full panel
@@ -618,7 +633,12 @@ def test_interp_unmatched_track_falls_back_to_scan_cifs(
     cif_dir.mkdir()
     (cif_dir / "PbI2.cif").write_text("x")
     (cif_dir / "Other.cif").write_text("x")
-    main_window.pipeline_panel.cif_path.setText(str(cif_dir))
+    # cif_source_text instead of the cif_path widget — see the
+    # segments-and-rings test above (backend-less CI has no widget).
+    monkeypatch.setattr(
+        main_window.pipeline_panel, "cif_source_text",
+        lambda: str(cif_dir),
+    )
     plan = {3: [{"track": 0, "radius": 1.0, "angle": 45.0,
                  "radius_width": 0.1, "angle_width": 5.0,
                  "is_ring": False}]}
