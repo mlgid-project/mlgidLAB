@@ -14,6 +14,7 @@ from mlgidlab.phase_tracking import (
     AXIS_NAMES,
     TrackingPayload,
     UpstreamContractError,
+    amplitudes_from_track_result,
     build_payload,
     match_tracks_to_structures,
     member_ids,
@@ -153,6 +154,25 @@ def test_member_ids_isclose_fallback():
     tables = {0: _table([(3, 1.0 + eps, 1.0 - eps, 10.0 + eps)])}
     ids = member_ids(p, tables)
     assert ids[0] == (0, 3)
+
+
+def test_member_ids_nan_amplitude_resolves_by_coordinates():
+    """Members outside every track carry NaN amplitude since the
+    0.1.4 upstream rework (amplitudes come from the per-component
+    return value) — they must still resolve by coordinates alone,
+    and duplicate coordinates stay ambiguous."""
+    p = _payload(components=[[0]])
+    p.amplitude[:] = np.nan
+    tables = {
+        0: _table([(7, 1.0, 1.0, 10.0)]),
+        2: _table([                      # exact duplicate coordinates
+            (1, 0.5, 2.0, 5.0),
+            (2, 0.5, 2.0, 6.0),
+        ]),
+    }
+    ids = member_ids(p, tables)
+    assert ids[0] == (0, 7)     # unique coordinates, NaN amp ignored
+    assert ids[4] is None       # duplicates cannot be amp-disambiguated
 
 
 # --- plan_gap_fills ---
@@ -442,6 +462,54 @@ def test_match_tracks_to_structures_omits_unmatched_and_empty():
     ) == {}
 
 
+# --- amplitudes_from_track_result (pure) ---
+# The adapter understands exactly the per-component return shape of
+# the pinned mlgidbase (>= 0.1.5); anything else must raise loudly.
+
+
+def _amp_rec():
+    """Capture record for 4 members on frames 0/1/1/2; member 3 is in
+    no component. axis_arr = radius (what the pipeline requests)."""
+    return {
+        "frame_num": np.array([0, 1, 1, 2]),
+        "axis_arr": np.array([1.0, 1.1, 2.0, 9.9]),
+        "components": [[0, 1, 2]],
+    }
+
+
+def test_amplitudes_rejects_flat_pre014_shape():
+    # The flat pre-0.1.4 shape is no longer understood (support dropped
+    # with the ==0.1.5 pin); it must fail loudly, not silently misalign.
+    rec = _amp_rec()
+    ret = (rec["axis_arr"], np.array([10.0, 8.0, 7.0, 5.0]), [[0, 1, 2]])
+    with pytest.raises(UpstreamContractError):
+        amplitudes_from_track_result(ret, rec)
+
+
+def test_amplitudes_from_per_component_014_shape():
+    rec = _amp_rec()
+    # Frame-sorted per-component arrays, exactly what 0.1.4+ returns.
+    # Frames 1 and 1 (members 1/2) are disambiguated by the radius
+    # value carried in the axis array.
+    ret = (
+        [np.array([1.0, 2.0, 1.1])],
+        [np.array([10.0, 7.0, 8.0])],
+        [np.array([0, 1, 1])],
+    )
+    amp = amplitudes_from_track_result(ret, rec)
+    assert amp[0] == 10.0 and amp[1] == 8.0 and amp[2] == 7.0
+    assert np.isnan(amp[3])  # not in any component
+
+
+def test_amplitudes_rejects_unknown_shapes():
+    rec = _amp_rec()
+    with pytest.raises(UpstreamContractError):
+        amplitudes_from_track_result(None, rec)
+    with pytest.raises(UpstreamContractError):
+        # Per-component lists whose length mismatches the components.
+        amplitudes_from_track_result(([], [], []), rec | {"components": [[0]]})
+
+
 # --- capture contract (needs mlgidbase) ---
 # importorskip is called INSIDE each test (not at module level) so the
 # pure tests above still run on CI boxes without the private backend.
@@ -517,7 +585,7 @@ def test_track_peaks_old_backend_named_error(
     from mlgidlab.pipeline import PipelineCommand, execute
 
     monkeypatch.delattr(mlgidBASE, "track_peaks")
-    with pytest.raises(RuntimeError, match="newer than the 0.1.3"):
+    with pytest.raises(RuntimeError, match="needs mlgidbase >= 0.1.5"):
         execute(
             synthetic_fitted_scan,
             PipelineCommand("track_peaks", {

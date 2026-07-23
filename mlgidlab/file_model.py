@@ -203,29 +203,6 @@ def list_entry_names(file_path: Path) -> list[str]:
         return entry_group_names(f)
 
 
-def classify_h5_path(file_path: Path) -> str | None:
-    """Classify an HDF5 file by content: ``"nexus"``, ``"raw"`` or ``None``.
-
-    NeXus = at least one entry whose ``data`` group has
-    ``signal == "img_gid_q"``; raw = any 3-D detector-shaped dataset.
-    Both readers open the file, so this is called **off the GUI thread**
-    (in ``CopyWorker``) — opening a master that links many external scans
-    over slow storage is exactly what froze the open click. Exceptions are
-    swallowed so a non-HDF5 / unreadable file returns ``None``.
-    """
-    try:
-        if list_entries(file_path):
-            return "nexus"
-    except Exception:
-        logger.debug("suppressed exception in classify_h5_path (nexus)", exc_info=True)
-    try:
-        if list_raw_entries(file_path):
-            return "raw"
-    except Exception:
-        logger.debug("suppressed exception in classify_h5_path (raw)", exc_info=True)
-    return None
-
-
 def read_geometry_for_entry(
     file_path: Path, entry: str, frame: int = 0,
 ) -> dict | None:
@@ -657,10 +634,6 @@ class FrameSource:
     @property
     def cart_lru_size(self) -> int:
         return self._cart_lru_max
-
-    @property
-    def polar_lru_size(self) -> int:
-        return self._polar_lru_max
 
     # -- Hot path -----------------------------------------------------------
 
@@ -1492,13 +1465,23 @@ def read_matched_peaks(
     if fitted_peaks is None or len(fitted_peaks) == 0:
         return []
     n_fit = len(fitted_peaks)
-    out: list[MatchedStructure] = []
     group = _frame_analysis_group(f, entry, frame)
     if group is None:
-        return out
+        return []
+    # Merge repeated identifications while reading: mlgidmatch emits
+    # one dataset per alternative multi-phase solution, so the same
+    # (CIF, h, k, l) structure can appear in many datasets with a
+    # different peak subset each time. The write side consolidates new
+    # matches (``pipeline._dedupe_matched_groups``); merging here too
+    # keeps files written before that fix — or by external tooling —
+    # from listing the exact same structure many times over. Key
+    # includes the dataset type prefix so a segments identification
+    # never merges with a rings one.
+    merged: dict[tuple, dict] = {}  # insertion-ordered
     for name in sorted(group.keys()):
         if not name.startswith("matched_"):
             continue
+        type_prefix = "_".join(name.split("_")[:2])
         ds = group[name]
         arr = ds[()]
         for i in range(len(arr)):
@@ -1524,31 +1507,54 @@ def read_matched_peaks(
             idx = idx[(idx >= 0) & (idx < n_fit)]
             if idx.size == 0:
                 continue
-            subset = PeakTable(
-                q_xy=fitted_peaks.q_xy[idx],
-                q_z=fitted_peaks.q_z[idx],
-                angle=fitted_peaks.angle[idx],
-                radius=fitted_peaks.radius[idx],
-                angle_width=fitted_peaks.angle_width[idx],
-                radius_width=fitted_peaks.radius_width[idx],
-                is_ring=fitted_peaks.is_ring[idx],
-                ids=fitted_peaks.ids[idx],
-                score=fitted_peaks.score[idx],
-                amplitude=fitted_peaks.amplitude[idx],
+            hkl = (int(arr["h"][i]), int(arr["k"][i]), int(arr["l"][i]))
+            prob = float(arr["probability"][i])
+            key = (type_prefix, cif_str, *hkl)
+            rec = merged.get(key)
+            if rec is None:
+                merged[key] = {
+                    "solution_field": name,
+                    "local_idx": i,
+                    "cif": cif_str,
+                    "hkl": hkl,
+                    "probability": prob,
+                    "peaks": set(int(v) for v in idx),
+                }
+            else:
+                rec["peaks"].update(int(v) for v in idx)
+                if prob > rec["probability"]:
+                    rec["probability"] = prob
+                    rec["solution_field"] = name
+                    rec["local_idx"] = i
+
+    out: list[MatchedStructure] = []
+    for rec in merged.values():
+        idx = np.asarray(sorted(rec["peaks"]), dtype=int)
+        subset = PeakTable(
+            q_xy=fitted_peaks.q_xy[idx],
+            q_z=fitted_peaks.q_z[idx],
+            angle=fitted_peaks.angle[idx],
+            radius=fitted_peaks.radius[idx],
+            angle_width=fitted_peaks.angle_width[idx],
+            radius_width=fitted_peaks.radius_width[idx],
+            is_ring=fitted_peaks.is_ring[idx],
+            ids=fitted_peaks.ids[idx],
+            score=fitted_peaks.score[idx],
+            amplitude=fitted_peaks.amplitude[idx],
+        )
+        out.append(
+            MatchedStructure(
+                solution_field=rec["solution_field"],
+                local_idx=rec["local_idx"],
+                cif=rec["cif"],
+                h=rec["hkl"][0],
+                k=rec["hkl"][1],
+                l=rec["hkl"][2],
+                probability=rec["probability"],
+                peaks=subset,
+                peak_list=idx,
             )
-            out.append(
-                MatchedStructure(
-                    solution_field=name,
-                    local_idx=i,
-                    cif=cif_str,
-                    h=int(arr["h"][i]),
-                    k=int(arr["k"][i]),
-                    l=int(arr["l"][i]),
-                    probability=float(arr["probability"][i]),
-                    peaks=subset,
-                    peak_list=idx,
-                )
-            )
+        )
     return out
 
 
@@ -1570,6 +1576,119 @@ def load_matched_peaks(
         return []
     with h5py.File(file_path, "r") as f:
         return read_matched_peaks(f, entry, frame, fitted_peaks)
+
+
+def read_matched_raw(
+    file_path: Path, entry: str, frames,
+) -> dict[int, dict[str, np.ndarray]]:
+    """Raw ``matched_*`` dataset arrays for ``frames``.
+
+    Snapshot for ``merge_matched_rows``: the Expected-pattern flows
+    capture a frame's solutions BEFORE their re-match (which rewrites
+    them wholesale) so identifications the re-match fails to reproduce
+    can be restored afterwards. Frames without matched data map to an
+    empty dict.
+    """
+    out: dict[int, dict[str, np.ndarray]] = {}
+    with h5py.File(file_path, "r") as f:
+        for frame in frames:
+            frame = int(frame)
+            out[frame] = {}
+            group = _frame_analysis_group(f, entry, frame)
+            if group is None:
+                continue
+            for name in sorted(group.keys()):
+                if name.startswith("matched_"):
+                    out[frame][name] = group[name][()]
+    return out
+
+
+def merge_matched_rows(
+    file_path: Path, entry: str, frame: int,
+    snapshot: dict[str, np.ndarray],
+) -> int:
+    """Union-merge ``snapshot`` solution rows into a frame's matched data.
+
+    For each peaks type present in the snapshot, the frame's current
+    ``matched_<type>_*`` rows and the snapshot rows are merged by
+    (CIF, h, k, l) — peak lists unioned, probability the maximum —
+    and written back as a single ``matched_<type>_0000`` dataset
+    (the same consolidation shape ``pipeline._dedupe_matched_groups``
+    produces). Safe against the injection flows' row edits: injected
+    fitted rows are APPENDED and only appended rows are ever rolled
+    back, so the snapshot's positional ``peak_list`` indices still
+    reference the same fitted rows.
+
+    Returns the number of structures restored (present in the snapshot
+    but missing from the current data).
+    """
+    by_type: dict[str, list] = {}
+    for name, arr in snapshot.items():
+        prefix = "_".join(name.split("_")[:2])
+        by_type.setdefault(prefix, []).append(arr)
+    if not by_type:
+        return 0
+    restored = 0
+    with h5py.File(file_path, "r+") as f:
+        group = _frame_analysis_group(f, entry, frame)
+        if group is None:
+            return 0
+        for prefix, snap_arrays in by_type.items():
+            current_names = sorted(
+                k for k in group.keys() if k.startswith(prefix + "_")
+            )
+            merged: dict[tuple, dict] = {}
+
+            def _absorb(arr, count_missing: bool) -> None:
+                nonlocal restored
+                for row in arr:
+                    key = (
+                        bytes(row["CIF"]),
+                        int(row["h"]), int(row["k"]), int(row["l"]),
+                    )
+                    peaks = set(
+                        np.asarray(row["peak_list"], dtype=int).tolist()
+                    )
+                    rec = merged.get(key)
+                    if rec is None:
+                        if count_missing:
+                            restored += 1
+                        merged[key] = {
+                            "prob": float(row["probability"]),
+                            "peaks": peaks,
+                        }
+                    else:
+                        rec["peaks"].update(peaks)
+                        rec["prob"] = max(
+                            rec["prob"], float(row["probability"])
+                        )
+
+            for name in current_names:
+                _absorb(group[name][()], count_missing=False)
+            for arr in snap_arrays:
+                _absorb(arr, count_missing=True)
+            if not merged:
+                continue
+            dt = np.dtype([
+                ("CIF", "S64"), ("h", "i4"), ("k", "i4"), ("l", "i4"),
+                ("probability", "f4"),
+                ("peak_list", h5py.vlen_dtype(np.int32)),
+            ])
+            ordered = sorted(
+                merged.items(), key=lambda kv: kv[1]["prob"], reverse=True,
+            )
+            out = np.empty(len(ordered), dtype=dt)
+            for i, (key, rec) in enumerate(ordered):
+                out["CIF"][i] = key[0]
+                out["h"][i], out["k"][i], out["l"][i] = key[1:]
+                out["probability"][i] = rec["prob"]
+                out["peak_list"][i] = np.asarray(
+                    sorted(rec["peaks"]), dtype=np.int32
+                )
+            for name in current_names:
+                del group[name]
+            group.create_dataset(f"{prefix}_0000", data=out)
+    return restored
 
 
 def _add_peak_row(

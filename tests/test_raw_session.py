@@ -1,14 +1,12 @@
-"""Raw-file discovery, RawSession lifecycle, and path classification.
+"""Raw-file discovery and RawSession lifecycle.
 
-The ``list_raw_entries`` / ``RawSession`` parts are pure logic (no
-QApplication); ``_classify_h5_path`` is a ``MainWindow`` method so its
-test carries the ``gui`` marker. Source: file_model.py:595-651,
-session.py:111-162, main_window.py:2349-2371.
+Pure logic (no QApplication). Source: ``file_model.list_raw_entries``
+and ``session.RawSession``. NeXus/raw classification of opened files is
+covered by the CopyWorker tests (it classifies inline, off the GUI
+thread).
 """
 
 from __future__ import annotations
-
-from pathlib import Path
 
 import pytest
 
@@ -39,14 +37,3 @@ def test_raw_session_open_happy(synthetic_raw):
     assert session.kind == "raw"
     assert session.raw_paths == [synthetic_raw.resolve()]
     assert session.temp_path == synthetic_raw.resolve()
-
-
-def test_classify_h5_path(synthetic_nexus, synthetic_raw, tmp_path):
-    # Classification now lives in file_model (called off the GUI thread by
-    # CopyWorker), not on MainWindow.
-    assert file_model.classify_h5_path(synthetic_nexus) == "nexus"
-    assert file_model.classify_h5_path(synthetic_raw) == "raw"
-
-    not_h5 = tmp_path / "garbage.txt"
-    not_h5.write_text("not an hdf5 file")
-    assert file_model.classify_h5_path(Path(not_h5)) is None

@@ -26,7 +26,6 @@ from mlgidlab.conversion_panel import (
     CONV_DET2POL_GID,
     CONV_DET2Q,
     CONV_DET2Q_GID,
-    OUTPUT_SEPARATE_DATASETS,
     OUTPUT_SEPARATE_FILES,
     ConversionConfig,
     RawScan,
@@ -34,14 +33,6 @@ from mlgidlab.conversion_panel import (
 
 import logging
 logger = logging.getLogger(__name__)
-
-
-def is_pygid_available() -> bool:
-    try:
-        import pygid  # noqa: F401
-        return True
-    except ImportError:
-        return False
 
 
 def execute(
@@ -118,7 +109,6 @@ def execute(
     # --- Plan output paths + groups -------------------------------------------
     written: list[Path] = []
     seen_paths: set[Path] = set()
-    is_separate = cfg.output_mode == OUTPUT_SEPARATE_FILES
     # Pre-resolve the per-raw-file output path. Keys are ``Path``, values
     # are the absolute output path for that raw file. In separate-datasets
     # mode every raw file maps to the same shared output path.

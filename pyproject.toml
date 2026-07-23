@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlgidlab"
-version = "0.1.0a11"
+version = "0.1.0a12"
 description = "mlgidLAB: graphical interface for the mlgidBASE GIWAXS analysis pipeline"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -70,11 +70,23 @@ dev = ["pytest>=8.0", "pytest-qt>=4.4"]
 # To move up: bump here, re-run the full suite + the end-to-end demo
 # loop, then commit the new pins.
 pipeline = [
-    "mlgidbase==0.1.3",
-    "pygid==0.2.10",
+    # The 0.1.5 stack (2026-07-23): mlgidbase pins pygid==0.2.13,
+    # mlgiddetect==0.2.8, pygidfit==0.1.3, mlgidmatch==0.1.3 itself; the
+    # explicit repeats below exist because the GUI imports those
+    # packages directly (see comment above). The GPU detection runtime
+    # needs no pin here anymore: mlgiddetect >= 0.2.7 carries its own
+    # per-Python onnxruntime-gpu pins (CUDA 12 builds; 1.26.0 on
+    # Python 3.11+) and gates GPU use on the ORT providers natively.
+    "mlgidbase==0.1.5",
+    "pygid==0.2.13",
     "pygidfit==0.1.3",
     "mlgidmatch==0.1.3",
     "pygidsim==0.1.4",
+    # mlgidbase.peak_operations imports networkx (track_peaks graph
+    # clustering) but mlgidbase does not declare it (still true in
+    # 0.1.5). Usually present transitively via torch; declared here so
+    # tracking never depends on that accident.
+    "networkx",
     "PyYAML",
 ]
 

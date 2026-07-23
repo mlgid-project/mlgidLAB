@@ -23,10 +23,22 @@ class PipelineCommand:
 
 
 def is_mlgidbase_available() -> bool:
+    """True when the pipeline backend imports.
+
+    The real error is logged so "backend unavailable" is diagnosable
+    from the log. (A torch-first import retry lived here while the
+    stack floated on onnxruntime-gpu >= 1.27, which hard-links
+    libcudart.so.13 at import time; mlgiddetect >= 0.2.7 pins the
+    lazily-importing 1.26.0 line, so the retry is gone.)
+    """
     try:
         import mlgidbase  # noqa: F401
         return True
-    except ImportError:
+    except ImportError as exc:
+        logger.warning(
+            "pipeline backend unavailable — import mlgidbase "
+            "failed: %s", exc,
+        )
         return False
 
 
@@ -35,22 +47,20 @@ _ONNX_GPU_PRELOADED = False
 
 @contextlib.contextmanager
 def detection_on_gpu():
-    """Run mlgidDETECT on the GPU whenever an onnxruntime CUDA provider exists.
+    """Preload onnxruntime's CUDA libraries before a detection run.
 
-    mlgidDETECT decides CPU vs GPU with
-    ``"CUDAExecutionProvider" in available_providers and torch.cuda.is_available()
-    and not config.MODEL_FORCE_CPU`` (mlgiddetect/inference/inference.py). But
-    detection runs on onnxruntime, which is independent of torch: in this env
-    torch is CPU-only while ``onnxruntime-gpu`` + the CUDA/cuDNN wheels are
-    installed, so the ``torch.cuda.is_available()`` guard wrongly pins detection
-    to the CPU (~3.9 s/frame vs ~0.13 s on the GPU).
+    mlgiddetect >= 0.2.7 selects CPU vs GPU natively: it gates on the
+    ORT CUDA provider + a driver probe (never on torch) and falls back
+    to CPU if the CUDA EP cannot initialize; ``MODEL_FORCE_CPU`` in the
+    detection config forces CPU. (A ``torch.cuda.is_available``
+    monkeypatch lived here for mlgiddetect <= 0.2.3, which wrongly
+    gated GPU detection on torch's CUDA build.)
 
-    When the CUDA provider is present this (1) loads its libs via
-    ``onnxruntime.preload_dlls()`` (so no ``LD_LIBRARY_PATH`` shim is needed) and
-    (2) reports CUDA as available for the duration of the call so mlgidDETECT
-    selects ``CUDAExecutionProvider``, then restores the original. The patch is
-    scoped to detection; run_matching keeps its own (torch-based) device path,
-    which still needs a real CUDA-torch build to use the GPU.
+    What remains: ``onnxruntime.preload_dlls()`` puts the pip-installed
+    ``nvidia-*`` CUDA/cuDNN wheels on the loader path so the CUDA EP
+    can initialize without an ``LD_LIBRARY_PATH`` shim. run_matching
+    keeps its own (torch-based) device path, which still needs a real
+    CUDA-torch build to use the GPU.
     """
     try:
         import onnxruntime as ort
@@ -68,39 +78,7 @@ def detection_on_gpu():
         except Exception:
             logger.debug("onnxruntime.preload_dlls() unavailable/failed", exc_info=True)
         _ONNX_GPU_PRELOADED = True
-
-    try:
-        import torch
-    except Exception:
-        yield
-        return
-    original = torch.cuda.is_available
-    torch.cuda.is_available = lambda: True
-    logger.info("Detection: onnxruntime CUDA provider available -> using GPU")
-    try:
-        yield
-    finally:
-        torch.cuda.is_available = original
-
-
-def add_peak_kwargs_for(peak) -> dict:
-    """Build the kwargs dict for ``mlgidBASE.add_peak``.
-
-    Always pass polar (angle / angle_width / radius / radius_width) for both
-    rings and segments. mlgidBASE.add_peak (see ``peak_operations._calc_new_peak``)
-    accepts either polar or cartesian: if all four polar values are non-None
-    it uses them verbatim and recomputes ``q_xy / q_z`` from them, otherwise
-    it back-computes polar widths from cartesian widths. The cartesian
-    bounding box of a polar wedge is strictly wider than the polar widths,
-    so the back-converted polar widths come out inflated — which previously
-    made saved segments look much bigger than the user-drawn box.
-    """
-    return {
-        "angle": float(peak.angle),
-        "angle_width": float(peak.angle_width),
-        "radius": float(peak.radius),
-        "radius_width": float(peak.radius_width),
-    }
+    yield
 
 
 def _finite_or(value, fallback: float) -> float:
@@ -113,37 +91,115 @@ def _finite_or(value, fallback: float) -> float:
     return v if np.isfinite(v) else float(fallback)
 
 
+# Plausibility gate for injected-box fits: a fit is only kept when its
+# fitted width stays within this factor of the injected box width (a
+# blow-up means pygidfit modelled the local background, not a peak).
+INJECT_MAX_WIDTH_RATIO = 2.0
+
+
+def _implausible_fit(fit, spec: dict, is_ring: bool) -> str | None:
+    """Why a single-box fit cannot be the peak the box predicted.
+
+    Injected boxes assert "a peak belongs HERE" (a track gap or a
+    forward-simulated reflection); pygidfit happily returns a result
+    even when the box only contains background, and those fits are
+    what pollute the file with unrealistic peaks. Reject the fit when:
+
+    * the amplitude is non-positive/non-finite (nothing was there);
+    * the fitted centre left the injected box (the fit locked onto a
+      different feature — and a peak more than half a box-width off
+      would also fall below the IoM coverage threshold, so the same
+      reflection would be injected AGAIN on the next run);
+    * a fitted width is non-positive or more than
+      ``INJECT_MAX_WIDTH_RATIO`` times the box width (background
+      gradient, not a peak).
+
+    Rings are judged radially only. Returns a human-readable reason,
+    or None when the fit is plausible.
+    """
+    import numpy as np
+
+    amp = float(fit.amplitude)
+    if not np.isfinite(amp) or amp <= 0:
+        return "non-positive amplitude"
+    rw = abs(float(spec["radius_width"]))
+    if (
+        not np.isfinite(float(fit.radius))
+        or abs(float(fit.radius) - float(spec["radius"])) > rw / 2
+    ):
+        return "fitted centre left the box radially"
+    frw = float(fit.radius_width)
+    if not np.isfinite(frw) or frw <= 0 or frw > INJECT_MAX_WIDTH_RATIO * rw:
+        return f"implausible radial width ({frw:g} vs box {rw:g})"
+    if not is_ring:
+        aw = abs(float(spec["angle_width"]))
+        if (
+            not np.isfinite(float(fit.angle))
+            or abs(float(fit.angle) - float(spec["angle"])) > aw / 2
+        ):
+            return "fitted centre left the box in angle"
+        faw = float(fit.angle_width)
+        # Non-finite angular width is tolerated (substituted with the
+        # box width on persist — long-standing behaviour for spots
+        # whose angular profile degenerates).
+        if np.isfinite(faw) and (
+            faw <= 0 or faw > INJECT_MAX_WIDTH_RATIO * aw
+        ):
+            return f"implausible angular width ({faw:g} vs box {aw:g})"
+    return None
+
+
 def _execute_interpolate_tracks(file_path: Path, kwargs: dict) -> list:
     """Fill tracked-peak GAP frames with real detected + fitted rows.
 
-    For every injection spec planned by
-    ``phase_tracking.plan_gap_fills`` (``kwargs["plan"]`` =
-    ``{frame: [{"track", "radius", "angle", "radius_width",
-    "angle_width", "is_ring"}, ...]}``): append a detected box at the
-    estimated position/size, run the single-box 2D fit
-    (``manual_fit.fit_one_peak`` — byte-identical to what the pipeline
-    ``run_fitting`` writes for the same box), and persist the fitted
-    row. Ring specs carry a finite quadrant-spanning box (pygidfit
-    classifies rings geometrically and runs its radial ring fit on
-    them); the persisted ring row uses mlgidLAB's ring convention
-    (``angle 45 / angle_width inf / is_ring``). The host chains
-    ``run_matching`` command(s) over the affected frames afterwards —
-    segments and rings separately, CIF-restricted per frame — so the
-    new peaks join each frame's matched solutions.
+    Thin wrapper around ``_execute_peak_injection`` kept so log lines
+    and the ``execute`` dispatch keep reading "interpolate_tracks".
+    Specs come from ``phase_tracking.plan_gap_fills`` and carry a
+    ``track`` field, which is echoed into each result record — the
+    host appends the fills as new track members.
+    """
+    return _execute_peak_injection(
+        file_path, kwargs, op_label="interpolate_tracks"
+    )
+
+
+def _execute_peak_injection(
+    file_path: Path, kwargs: dict, op_label: str
+) -> list:
+    """Inject detected boxes, 2D-fit each, persist the fitted rows.
+
+    Shared executor behind ``interpolate_tracks`` (gap-filling planned
+    by ``phase_tracking.plan_gap_fills``; specs carry a ``track``) and
+    ``inject_fitted_peaks`` (predicted reflections selected on the
+    "Expected pattern" overlay; no ``track``). ``kwargs["plan"]`` =
+    ``{frame: [{"radius", "angle", "radius_width", "angle_width",
+    "is_ring"[, "track"]}, ...]}``.
+
+    Per spec: append a detected box at the given position/size, run the
+    single-box 2D fit (``manual_fit.fit_one_peak`` — byte-identical to
+    what the pipeline ``run_fitting`` writes for the same box), and
+    persist the fitted row. Ring specs carry a finite quadrant-spanning
+    box (pygidfit classifies rings geometrically and runs its radial
+    ring fit on them); the persisted ring row uses mlgidLAB's ring
+    convention (``angle 45 / angle_width inf / is_ring``). The host
+    chains ``run_matching`` command(s) over the affected frames
+    afterwards — segments and rings separately — so the new peaks join
+    each frame's matched solutions.
 
     The injected detected row carries ``score=1.0`` — the box exists on
-    the strength of its track (a peak fitted on both bracketing frames),
-    not an mlgidDETECT confidence, and must not vanish under the
-    Display dock's min-score slider.
+    the strength of its provenance (a track spanning the gap, or a
+    forward-simulated reflection the user vetted), not an mlgidDETECT
+    confidence, and must not vanish under the Display dock's min-score
+    slider.
 
-    Returns ``[{"track", "frame", "detected_id", "fitted_id"}, ...]``
-    for the boxes whose fit succeeded — the host appends these as new
-    track members. A box whose fit fails is skipped and its injected
-    detected row deleted again (no orphan geometry in the file); the
-    skip is logged. Frames with missing geometry / datasets are skipped
-    whole. ``kwargs["fit_params"]`` carries the Pipeline panel's fit
-    config so the fills use the SAME settings the next ``run_fitting``
-    would.
+    Returns ``[{"frame", "detected_id", "fitted_id", "is_ring"
+    [, "track"]}, ...]`` for the boxes whose fit succeeded (``track``
+    present iff the spec carried it). A box whose fit fails is skipped
+    and its injected detected row deleted again (no orphan geometry in
+    the file); the skip is logged. Frames with missing geometry /
+    datasets are skipped whole. ``kwargs["fit_params"]`` carries the
+    Pipeline panel's fit config so the fills use the SAME settings the
+    next ``run_fitting`` would.
 
     Emits one ``Saved fitted peaks … frame: N`` log line per completed
     frame — the exact shape ``workers._FrameProgressHandler`` counts,
@@ -164,6 +220,12 @@ def _execute_interpolate_tracks(file_path: Path, kwargs: dict) -> list:
     if not entry or not plan:
         return []
 
+    def _src(spec: dict) -> str:
+        return (
+            f"track {spec['track']}" if "track" in spec
+            else "predicted box"
+        )
+
     results: list = []
     for frame in sorted(plan):
         specs = plan[frame]
@@ -175,8 +237,8 @@ def _execute_interpolate_tracks(file_path: Path, kwargs: dict) -> list:
         )
         if geom is None:
             log.warning(
-                "interpolate_tracks: missing instrument geometry for "
-                "entry %s — skipping frame %d", entry, frame,
+                "%s: missing instrument geometry for "
+                "entry %s — skipping frame %d", op_label, entry, frame,
             )
             continue
         geom = dict(geom)
@@ -191,8 +253,8 @@ def _execute_interpolate_tracks(file_path: Path, kwargs: dict) -> list:
                 q_z = np.asarray(grp[file_model.QZ_REL][()], dtype=float)
         except Exception as exc:
             log.warning(
-                "interpolate_tracks: could not read frame %d of %s: %s",
-                frame, entry, exc,
+                "%s: could not read frame %d of %s: %s",
+                op_label, frame, entry, exc,
             )
             continue
         for spec in specs:
@@ -213,9 +275,9 @@ def _execute_interpolate_tracks(file_path: Path, kwargs: dict) -> list:
                 ))
             except Exception as exc:
                 log.warning(
-                    "interpolate_tracks: could not inject a detected box "
-                    "on frame %d (track %s): %s",
-                    frame, spec.get("track"), exc,
+                    "%s: could not inject a detected box "
+                    "on frame %d (%s): %s",
+                    op_label, frame, _src(spec), exc,
                 )
                 continue
             try:
@@ -251,9 +313,29 @@ def _execute_interpolate_tracks(file_path: Path, kwargs: dict) -> list:
                         "detected box", exc_info=True,
                     )
                 log.warning(
-                    "interpolate_tracks: 2D fit failed on frame %d "
-                    "(track %s) — gap left unfilled: %s",
-                    frame, spec.get("track"), exc,
+                    "%s: 2D fit failed on frame %d "
+                    "(%s) — box skipped: %s",
+                    op_label, frame, _src(spec), exc,
+                )
+                continue
+            problem = _implausible_fit(fit, spec, is_ring)
+            if problem is not None:
+                # The fit converged onto something that cannot be the
+                # predicted peak — treat it like a failed fit so no
+                # unrealistic rows reach the file or the matcher.
+                try:
+                    file_model.delete_peak_row(
+                        file_path, entry, frame, "detected", det_id
+                    )
+                except Exception:
+                    logger.debug(
+                        "suppressed exception cleaning up an injected "
+                        "detected box", exc_info=True,
+                    )
+                log.warning(
+                    "%s: implausible fit on frame %d "
+                    "(%s) — box skipped: %s",
+                    op_label, frame, _src(spec), problem,
                 )
                 continue
             # Persist. A ring fit returns angle = NaN / angle_width =
@@ -279,13 +361,17 @@ def _execute_interpolate_tracks(file_path: Path, kwargs: dict) -> list:
                 B=_finite_or(fit.B, 0.0),
                 C=_finite_or(fit.C, 0.0),
             ))
-            results.append({
-                "track": int(spec["track"]),
+            record = {
                 "frame": frame,
                 "detected_id": det_id,
                 "fitted_id": new_fid,
                 "is_ring": is_ring,
-            })
+            }
+            # Gap-fill specs carry their origin track; predicted-box
+            # specs don't (there is no track to append the fill to).
+            if "track" in spec:
+                record["track"] = int(spec["track"])
+            results.append(record)
         # One per-frame completion line, in the exact shape
         # _FrameProgressHandler counts for the progress bar.
         log.info(
@@ -355,12 +441,16 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
                 f"selection survived a file swap."
             )
 
-    # Interpolate-tracks runs entirely on mlgidlab primitives (h5py +
+    # The injection ops run entirely on mlgidlab primitives (h5py +
     # pygidfit via manual_fit) — deliberately BEFORE the mlgidbase
-    # import so it neither needs the private backend nor competes with
+    # import so they neither need the private backend nor compete with
     # a pygid r+ handle on the same file.
     if command.op_name == "interpolate_tracks":
         return _execute_interpolate_tracks(file_path, dict(command.kwargs))
+    if command.op_name == "inject_fitted_peaks":
+        return _execute_peak_injection(
+            file_path, dict(command.kwargs), op_label="inject_fitted_peaks"
+        )
 
     # Some labeled training files (e.g. ``organic_labeled.h5``) carry
     # fitted_peaks rows that only have polar coordinates — Cartesian
@@ -468,13 +558,12 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
                 logger.debug("suppressed exception in execute", exc_info=True)
                 pass
     if command.op_name == "track_peaks" and not hasattr(analysis, "track_peaks"):
-        # Feature-gate by capability, not version: the first mlgidbase
-        # build with tracking (main @ 561edfa) still self-labels 0.1.3,
-        # so a version compare cannot distinguish it from the release.
+        # Feature-gate by capability so a stale env (older than the
+        # pinned mlgidbase) fails with a named remedy, not an
+        # AttributeError.
         raise RuntimeError(
             "The installed mlgidbase has no track_peaks — peak tracking "
-            "needs a build newer than the 0.1.3 release (mlgidBASE main "
-            "@ 561edfa or the release containing it). See "
+            "needs mlgidbase >= 0.1.5 (the [pipeline] pin). See "
             "mlgidLAB/docs/backend_compatibility.md."
         )
     method = getattr(analysis, command.op_name)
@@ -482,20 +571,24 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
         with detection_on_gpu():
             result = method(**kwargs)
     elif command.op_name == "track_peaks":
-        # Upstream's first tracking implementation returns None and
-        # only draws figures — the data is recovered through the
-        # capture hook (see phase_tracking.capture_tracking). Force
-        # the capture contract regardless of what the caller put in
-        # kwargs: plot_result must be truthy for the hook to fire (no
-        # matplotlib runs — the recorder replaces the plot call) and
-        # axis='amplitude' makes one call carry every view's data.
-        from mlgidlab.phase_tracking import build_payload, capture_tracking
+        # The member-level tracking data is recovered through the
+        # capture hook (see phase_tracking.capture_tracking); the
+        # amplitudes come from the RETURN value, whose axis table has
+        # no 'amplitude' entry. Force the capture contract regardless
+        # of what the caller put in kwargs: plot_result must be truthy
+        # for the hook to fire (no matplotlib runs — the recorder
+        # replaces the plot call) and axis='radius' is always valid.
+        from mlgidlab.phase_tracking import (
+            amplitudes_from_track_result,
+            build_payload,
+            capture_tracking,
+        )
 
-        kwargs["axis"] = "amplitude"
+        kwargs["axis"] = "radius"
         kwargs["plot_params"] = {"plot_result": True, "save_fig": False}
         try:
             with capture_tracking() as rec:
-                method(**kwargs)
+                ret = method(**kwargs)
         except ValueError as exc:
             # np.vstack on an empty box list — the entry has no fitted
             # peaks at all. Name the actual remedy instead of leaking
@@ -510,18 +603,19 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
             entry=str(kwargs.get("entry") or ""),
             threshold=float(kwargs.get("threshold", 0.5)),
             length=int(kwargs.get("length", 10)),
+            amplitudes=amplitudes_from_track_result(ret, rec),
         )
     else:
         result = method(**kwargs)
 
     # Consolidate matched_<type>_NNNN groups produced by mlgidmatch.
     # mlgidmatch returns one "solution" per consistent combination of
-    # structures, so the same (CIF, h, k, l, peak_list) tuple often
-    # appears across many groups when one structure is shared across
-    # multiple combinations — visually noisy in the GUI's matched
-    # overlay. Replace the per-solution groups with a single group
-    # holding one row per unique identification (highest-probability
-    # instance kept).
+    # structures, so the same (CIF, h, k, l) structure appears across
+    # many groups — usually with a different peak subset each time —
+    # when it is shared across multiple combinations. Visually that
+    # reads as the exact same structure listed many times over.
+    # Replace the per-solution groups with a single group holding one
+    # row per unique structure (peak lists unioned, max probability).
     if command.op_name == "run_matching":
         try:
             _dedupe_matched_groups(
@@ -649,19 +743,23 @@ def _dedupe_matched_groups(
 
     mlgidmatch emits one ``matched_<type>_NNNN`` group per "solution"
     (a self-consistent combination of structures). When a single
-    structure participates in many combinations, its
-    (CIF, h, k, l, peak_list) row gets written into every one of those
-    groups, cluttering the saved data and the GUI's matched overlay.
+    structure participates in many combinations, a (CIF, h, k, l) row
+    for it gets written into every one of those groups — usually with
+    a DIFFERENT peak subset per combination, because the tree search
+    reaches the structure with different peaks already consumed. The
+    GUI then lists the exact same structure many times over.
 
     This helper, run after each ``run_matching`` call, walks the
     affected ``data/analysis/frameNNNNN`` groups, gathers every row
-    across all ``matched_<peaks_type>_*`` datasets, deduplicates by
-    the (CIF, h, k, l, sorted-peak-list) key (keeping the highest
-    probability), and rewrites the result as a single
-    ``matched_<peaks_type>_0000`` dataset. The original groups are
-    deleted in the same write pass.
+    across all ``matched_<peaks_type>_*`` datasets, merges rows by the
+    (CIF, h, k, l) key — peak lists are UNIONED, the probability is
+    the maximum over the merged rows — and rewrites the result as a
+    single ``matched_<peaks_type>_0000`` dataset. The original groups
+    are deleted in the same write pass.
 
-    No-op when at most one group exists already.
+    No-op when at most one group exists already (a single mlgidmatch
+    solution never repeats a structure, and our own consolidated
+    output is already unique).
     """
     import h5py
     import numpy as np
@@ -704,8 +802,8 @@ def _dedupe_matched_groups(
                 ref_ds = frame_grp[matched_keys[0]]
                 ref_dtype = ref_ds.dtype
 
-                # Map (cif, h, k, l, peak_list_tuple) -> best row.
-                best: dict[tuple, Any] = {}
+                # Map (cif, h, k, l) -> best row + unioned peak set.
+                best: dict[tuple, dict] = {}
                 row_count_in = 0
                 for mk in matched_keys:
                     rows = frame_grp[mk][()]
@@ -715,13 +813,24 @@ def _dedupe_matched_groups(
                         key = (
                             bytes(row["CIF"]),
                             int(row["h"]), int(row["k"]), int(row["l"]),
-                            tuple(np.sort(peak_arr).tolist()),
                         )
                         prev = best.get(key)
-                        if prev is None or float(row["probability"]) > float(prev["probability"]):
+                        if prev is None:
                             # Copy the row so freeing the source array
                             # doesn't take the data with it.
-                            best[key] = np.asarray(row, dtype=ref_dtype).copy()
+                            best[key] = {
+                                "row": np.asarray(row, dtype=ref_dtype).copy(),
+                                "peaks": set(peak_arr.tolist()),
+                            }
+                        else:
+                            prev["peaks"].update(peak_arr.tolist())
+                            if (
+                                float(row["probability"])
+                                > float(prev["row"]["probability"])
+                            ):
+                                prev["row"] = np.asarray(
+                                    row, dtype=ref_dtype
+                                ).copy()
 
                 if not best:
                     continue
@@ -730,12 +839,15 @@ def _dedupe_matched_groups(
                 # the highest-confidence identifications come first.
                 ordered = sorted(
                     best.values(),
-                    key=lambda r: float(r["probability"]),
+                    key=lambda e: float(e["row"]["probability"]),
                     reverse=True,
                 )
                 consolidated = np.empty(len(ordered), dtype=ref_dtype)
-                for i, row in enumerate(ordered):
-                    consolidated[i] = row
+                for i, entry_rec in enumerate(ordered):
+                    consolidated[i] = entry_rec["row"]
+                    consolidated["peak_list"][i] = np.asarray(
+                        sorted(entry_rec["peaks"]), dtype=np.int32
+                    )
 
                 # Delete every existing matched_<type>_NNNN dataset
                 # before writing the consolidated one — pygid's
@@ -818,7 +930,6 @@ def parse_cif_input(
     valid for that entry. The panel uses this so caches stay in sync
     with the active entry on multi-energy datasets.
     """
-    import os
     import pickle
 
     paths = [p.strip() for p in (cif_input or "").split(";") if p.strip()]

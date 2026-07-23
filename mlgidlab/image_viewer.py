@@ -44,7 +44,8 @@ from mlgidlab.file_model import (
     _LazyImageStack,
     _LazyPolarStack,
 )
-from mlgidlab.polar import polar_to_qxyz, stack_to_polar  # noqa: F401 (stack_to_polar retained as a reference impl)
+from mlgidlab.polar import polar_to_qxyz
+from mlgidlab import simulation_pattern
 
 import logging
 logger = logging.getLogger(__name__)
@@ -56,8 +57,6 @@ MODE_POLAR = "polar"
 # when a RawSession is active; converted-NeXus sessions never visit this
 # mode and their existing Cartesian / Polar paths are unchanged.
 MODE_RAW = "raw"
-
-LABEL_MODIFIERS = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier
 
 # Subdivisions along the angular edge for the full 0–90° range; narrower
 # segments scale down proportionally (with a small minimum for sharp corners).
@@ -148,6 +147,40 @@ MATCHED_MARKER_SIZE = 11
 UNMATCHED_COLOR = "#969696"
 UNMATCHED_UID = "__unmatched__"
 UNMATCHED_KEY = ("__unmatched__", 0, 0, 0)
+
+# "Expected pattern" simulation overlay: forward-simulated reflections
+# of a parsed CIF drawn as faint hollow diamonds (spots) and dashed
+# arcs (rings). Orange = predicted but not explained by any matched
+# peak, green = explained by a matched box, white = selected for
+# injection. Diamonds (vs the matched style's circles) so simulated
+# and matched markers stay distinguishable when they coincide.
+SIM_MISSED_COLOR = "#ff9f43"
+SIM_EXPLAINED_COLOR = "#4ade80"
+SIM_SELECTED_COLOR = "#ffffff"
+# Render-state precedence: selected > explained > missed. Iteration
+# order also fixes z-order (later buckets paint on top), so selected
+# reflections always read above the rest.
+_SIM_STATE_COLORS = {
+    "missed": SIM_MISSED_COLOR,
+    "explained": SIM_EXPLAINED_COLOR,
+    "selected": SIM_SELECTED_COLOR,
+}
+SIM_OVERLAY_OPACITY = 0.55
+# Marker diameter encodes relative simulated intensity, log-scaled
+# across three decades (rel=1 -> MAX, rel<=1e-3 -> MIN).
+SIM_MARKER_MIN_PX = 5.0
+SIM_MARKER_MAX_PX = 14.0
+
+
+def _sim_intensity_scale(rel_intensity: float) -> float:
+    """Map a (0, 1] relative intensity to [0, 1] over three decades."""
+    t = 1.0 + np.log10(max(float(rel_intensity), 1e-12)) / 3.0
+    return min(1.0, max(0.0, t))
+
+
+def _sim_marker_size(rel_intensity: float) -> float:
+    t = _sim_intensity_scale(rel_intensity)
+    return SIM_MARKER_MIN_PX + t * (SIM_MARKER_MAX_PX - SIM_MARKER_MIN_PX)
 
 
 def matched_pen_for(index: int) -> dict:
@@ -436,16 +469,6 @@ class FileGeomAction:
 
     def redo(self, viewer: "GIWAXSImageViewer") -> None:
         viewer._apply_file_geom(self.frame, self.kind, self.peak_id, self.after)
-
-
-def _action_targets_manual(action: _Action, peak: ManualPeak) -> bool:
-    """True when ``action`` references the ManualPeak ``peak`` by identity.
-
-    Used by ``commit_manual_peak`` to scrub any stale stack entries that
-    point at a peak we just persisted to the file.
-    """
-    target = getattr(action, "peak", None)
-    return target is peak
 
 
 def _peaks_subset(table: PeakTable, ids: list[int]) -> PeakTable:
@@ -858,7 +881,6 @@ class GIWAXSImageViewer(QWidget):
     _ASPECT_RATIO_KEY = "viewerAspectRatio"
 
     frameChanged = Signal(int)
-    modeChanged = Signal(str)
     # Cursor readout — emits a dict describing the data point under the
     # cursor (q-mode vs pixel-mode), or None when the pointer leaves
     # the viewport. Consumers (status bar) format the dict for display.
@@ -889,6 +911,11 @@ class GIWAXSImageViewer(QWidget):
     # different from what the UI showed last (frame change, fresh load,
     # re-render after pipeline run). Args: (frame, list[MatchedStructure]).
     matchedStructuresChanged = Signal(int, list)
+    # Emitted when the set of simulated reflections selected for
+    # injection changes (click toggle, Select missed, pattern swap,
+    # intensity-cutoff pruning). Carries the sorted reflection indices;
+    # the Display dock's count label + Add button listen.
+    simulationSelectionChanged = Signal(list)
     # Emitted alongside ``selectionChanged`` with the full multi-selection
     # list (primary + extras). Single-peak consumers stay on the legacy
     # ``selectionChanged(SelectedPeak | None)``; multi-aware consumers
@@ -1107,6 +1134,20 @@ class GIWAXSImageViewer(QWidget):
         # default) lets every detected peak through; raising it
         # hides weak detections without mutating the file.
         self._detected_score_cutoff: float = 0.0
+        # "Expected pattern" simulation overlay state. ``_sim_pattern``
+        # is a simulation_pattern.SimulatedPattern (or None); its items
+        # are torn down + rebuilt per render exactly like the matched
+        # overlays. ``_sim_selected`` holds reflection indices chosen
+        # for injection (indices are pattern-scoped, so any pattern
+        # swap clears the selection). ``_sim_visible`` and
+        # ``_sim_min_intensity`` mirror the Display-dock controls and
+        # deliberately survive ``clear()`` (display preferences, not
+        # file state).
+        self._sim_pattern = None
+        self._sim_selected: set[int] = set()
+        self._sim_min_intensity: float = 0.01
+        self._sim_visible: bool = True
+        self._sim_items: list = []
         # When not None, ONLY these fitted rows render, per frame
         # (``{frame: {fitted_id, ...}}``; frames absent from the mapping
         # show no fitted rows at all). Driven by the Scan-tracking
@@ -1656,7 +1697,6 @@ class GIWAXSImageViewer(QWidget):
             menu.insertSeparator(first)
         else:
             menu.addAction(action)
-        self._reset_zoom_action = action  # keep a reference
 
     def set_peaks(self, frame: int, peaks: dict[str, PeakTable | None]) -> None:
         self._frame_peaks[frame] = peaks
@@ -1890,6 +1930,373 @@ class GIWAXSImageViewer(QWidget):
             items.append(curve)
         return items
 
+    # -- "Expected pattern" simulation overlay --
+
+    def set_simulation_pattern(self, pattern) -> None:
+        """Install (or clear, with None) the simulated-pattern overlay.
+
+        ``pattern`` is a ``simulation_pattern.SimulatedPattern``.
+        Replacing it drops any reflection selection — selection indices
+        are only meaningful within one pattern.
+        """
+        self._sim_pattern = pattern
+        if self._sim_selected:
+            self._sim_selected.clear()
+            self.simulationSelectionChanged.emit([])
+        self._render_simulation_overlays(self.current_frame)
+
+    def clear_simulation_pattern(self) -> None:
+        self.set_simulation_pattern(None)
+
+    def set_simulation_visible(self, visible: bool) -> None:
+        self._sim_visible = bool(visible)
+        self._render_simulation_overlays(self.current_frame)
+
+    def set_simulation_min_intensity(self, cutoff: float) -> None:
+        """Hide reflections below ``cutoff`` (relative intensity, 0-1).
+
+        Selected reflections falling below the cutoff drop out of the
+        selection — they are no longer visible, so keeping them queued
+        for injection would act on markers the user can't see.
+        """
+        self._sim_min_intensity = max(0.0, min(1.0, float(cutoff)))
+        if self._sim_pattern is not None and self._sim_selected:
+            visible = {r.index for r in self._visible_sim_reflections()}
+            pruned = self._sim_selected & visible
+            if pruned != self._sim_selected:
+                self._sim_selected = pruned
+                self.simulationSelectionChanged.emit(sorted(pruned))
+        self._render_simulation_overlays(self.current_frame)
+
+    def simulation_pattern(self):
+        return self._sim_pattern
+
+    def simulation_selected(self) -> list[int]:
+        return sorted(self._sim_selected)
+
+    def simulated_visible_reflections(self) -> list:
+        """Reflections above the intensity cutoff (the rendered set)."""
+        return self._visible_sim_reflections()
+
+    def _visible_sim_reflections(self) -> list:
+        if self._sim_pattern is None:
+            return []
+        cut = self._sim_min_intensity
+        return [
+            r for r in self._sim_pattern.reflections
+            if r.rel_intensity >= cut
+        ]
+
+    def _sim_q_max(self) -> float | None:
+        """Largest |q| the current stack can display, or None.
+
+        Used to drop simulated rings that lie entirely outside the
+        data (the upstream powder pattern applies no q-range cut).
+        """
+        if self._polar_cache is not None:
+            _, radius, _ = self._polar_cache
+            if radius.size:
+                return float(np.nanmax(radius))
+        stack = self._stack
+        if stack is None:
+            return None
+        try:
+            return float(np.hypot(
+                np.nanmax(np.abs(np.asarray(stack.q_xy, dtype=float))),
+                np.nanmax(np.abs(np.asarray(stack.q_z, dtype=float))),
+            ))
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _render_simulation_overlays(self, frame: int) -> None:
+        """Tear down + rebuild the simulated-reflection items (same
+        per-frame lifecycle as the matched overlays). Follows the
+        matched display style: "boxes" draws each reflection as the
+        detected box an injection would create; "markers" draws the
+        q-map look (diamonds + dashed arcs). Per-reflection colour
+        encodes state: selected (white) > explained by a matched box
+        (green) > missed (orange)."""
+        self._teardown_sim_items()
+        if (
+            self._sim_pattern is None
+            or not self._sim_visible
+            or self._mode not in (MODE_POLAR, MODE_CARTESIAN)
+        ):
+            return
+        reflections = self._visible_sim_reflections()
+        q_max = self._sim_q_max()
+        if q_max is not None:
+            # Powder patterns carry rings beyond the data's q-range
+            # (no upstream cut) — don't render or hit-test those.
+            reflections = [
+                r for r in reflections
+                if not (r.is_ring and r.radius > q_max)
+            ]
+        if not reflections:
+            return
+        states = self._sim_reflection_states(frame, reflections)
+        if self._matched_display_style == "markers":
+            items = self._sim_marker_style_items(reflections, states)
+        else:
+            items = self._sim_box_style_items(frame, reflections, states)
+        vb = self._plot.getViewBox()
+        for item in items:
+            item.setOpacity(SIM_OVERLAY_OPACITY)
+            vb.addItem(item, ignoreBounds=True)
+            self._sim_items.append(item)
+
+    def _sim_matched_boxes(self, frame: int):
+        """The SELECTED structure's matched boxes on ``frame`` (same
+        CIF stem, any orientation — the matcher may attribute a peak
+        to a different texture of the same phase), merged into one
+        duck-typed table for ``classify_explained``. None when nothing
+        of that phase is matched there. Scoped to the overlay's CIF so
+        "explained" (green) means "matched to THIS phase" — a peak
+        matched to a different structure does not count."""
+        if self._sim_pattern is None:
+            return None
+        want = simulation_pattern.cif_stem(self._sim_pattern.cif)
+        return simulation_pattern.merge_boxes([
+            s.peaks for s in self._matched_per_frame.get(frame, [])
+            if simulation_pattern.cif_stem(s.cif) == want
+        ])
+
+    def _sim_seed_widths(self, frame: int) -> tuple[float, float]:
+        """The injection seed box for ``frame`` (median fitted widths)
+        — also the coverage-recognition floor: fitted rows carry tight
+        2σ widths around the peak's REAL position, so a peak that
+        landed inside the box an injection would use must count as
+        covering its reflection (see ``classify_explained``)."""
+        tables = self._frame_peaks.get(frame) or {}
+        return simulation_pattern.default_box_size(tables.get("fitted"))
+
+    def simulation_explained_mask(self, frame: int) -> np.ndarray:
+        """Which of the visible reflections are explained by the
+        frame's matched boxes (aligned with
+        ``simulated_visible_reflections()``)."""
+        rw, aw = self._sim_seed_widths(frame)
+        return simulation_pattern.classify_explained(
+            self._visible_sim_reflections(),
+            self._sim_matched_boxes(frame),
+            seed_radius_width=rw, seed_angle_width=aw,
+        )
+
+    def _sim_reflection_states(self, frame: int, reflections) -> list[str]:
+        """Per-reflection render state: selected > explained > missed."""
+        rw, aw = self._sim_seed_widths(frame)
+        explained = simulation_pattern.classify_explained(
+            reflections, self._sim_matched_boxes(frame),
+            seed_radius_width=rw, seed_angle_width=aw,
+        )
+        states = []
+        for r, exp in zip(reflections, explained):
+            if r.index in self._sim_selected:
+                states.append("selected")
+            elif exp:
+                states.append("explained")
+            else:
+                states.append("missed")
+        return states
+
+    def _sim_marker_style_items(self, reflections, states) -> list:
+        """q-map look: one hollow-diamond scatter per state bucket for
+        the spots, one dashed curve per ring (state-coloured)."""
+        items: list = []
+        polar = self._mode == MODE_POLAR
+        for state, color in _SIM_STATE_COLORS.items():
+            spots = [
+                r for r, s in zip(reflections, states)
+                if s == state and not r.is_ring
+            ]
+            if not spots:
+                continue
+            selected = state == "selected"
+            if polar:
+                xs = np.array([r.radius for r in spots])
+                ys = np.array([r.angle for r in spots])
+            else:
+                xs = np.array([r.q_xy for r in spots])
+                ys = np.array([r.q_z for r in spots])
+            items.append(pg.ScatterPlotItem(
+                x=xs, y=ys, symbol="d",
+                size=[
+                    _sim_marker_size(r.rel_intensity) + (2 if selected else 0)
+                    for r in spots
+                ],
+                pen=pg.mkPen(QColor(color), width=2.2 if selected else 1.5),
+                brush=None,
+                data=[r.index for r in spots],
+            ))
+        extent = self.angular_extent()
+        a_lo, a_hi = extent if extent is not None else (0.0, 90.0)
+        for r, state in zip(reflections, states):
+            if not r.is_ring:
+                continue
+            selected = state == "selected"
+            width = 1.0 + 1.5 * _sim_intensity_scale(r.rel_intensity)
+            pen = pg.mkPen(
+                QColor(_SIM_STATE_COLORS[state]),
+                width=width + (1.0 if selected else 0.0),
+                style=Qt.PenStyle.DashLine,
+            )
+            pen.setCosmetic(True)
+            if polar:
+                curve = pg.PlotCurveItem(
+                    x=np.array([r.radius, r.radius]),
+                    y=np.array([a_lo, a_hi]), pen=pen,
+                )
+            else:
+                th = np.linspace(np.deg2rad(a_lo), np.deg2rad(a_hi), 100)
+                curve = pg.PlotCurveItem(
+                    x=r.radius * np.cos(th), y=r.radius * np.sin(th),
+                    pen=pen,
+                )
+            items.append(curve)
+        return items
+
+    def _sim_box_style_items(self, frame: int, reflections, states) -> list:
+        """Boxes look (matches the matched 'Boxes' style): each spot is
+        drawn as the detected box an injection would create — centred
+        on the reflection, sized to the frame's median fitted box —
+        and each ring as a full-extent radial band. One dashed
+        ``_PeakShapeItem`` per state bucket carries the colour."""
+        tables = self._frame_peaks.get(frame) or {}
+        rw, aw = simulation_pattern.default_box_size(tables.get("fitted"))
+        extent = self.angular_extent()
+        items: list = []
+        for state, color in _SIM_STATE_COLORS.items():
+            rows = [
+                r for r, s in zip(reflections, states) if s == state
+            ]
+            if not rows:
+                continue
+            selected = state == "selected"
+            table = PeakTable(
+                q_xy=np.array([r.q_xy for r in rows]),
+                q_z=np.array([r.q_z for r in rows]),
+                angle=np.array([
+                    45.0 if r.is_ring else r.angle for r in rows
+                ]),
+                radius=np.array([r.radius for r in rows]),
+                angle_width=np.array([
+                    np.inf if r.is_ring else aw for r in rows
+                ]),
+                radius_width=np.full(len(rows), rw),
+                is_ring=np.array([r.is_ring for r in rows], dtype=bool),
+                ids=np.array([r.index for r in rows]),
+                score=np.zeros(len(rows)),
+                amplitude=np.zeros(len(rows)),
+            )
+            box = _PeakShapeItem(
+                color=color,
+                style=Qt.PenStyle.DashLine,
+                width=2.2 if selected else 1.4,
+            )
+            if self._mode == MODE_POLAR:
+                box.set_polar(table, extent=extent)
+            else:
+                box.set_cartesian(table, extent=extent)
+            items.append(box)
+        return items
+
+    def _sim_hit_reflection(self, x: float, y: float):
+        """Nearest visible simulated reflection within click tolerance
+        of data-space point ``(x, y)``, or None. Distances are computed
+        in screen pixels so the tolerance is zoom-independent."""
+        if self._sim_pattern is None:
+            return None
+        try:
+            px, py = self._plot.getViewBox().viewPixelSize()
+        except Exception:
+            return None
+        if not (np.isfinite(px) and np.isfinite(py)) or px <= 0 or py <= 0:
+            return None
+        polar = self._mode == MODE_POLAR
+        reflections = self._visible_sim_reflections()
+        q_max = self._sim_q_max()
+        best = None
+        best_d = np.inf
+        for r in reflections:
+            if r.is_ring:
+                if q_max is not None and r.radius > q_max:
+                    continue
+                # Radial distance to the ring's constant-|q| line/arc.
+                if polar:
+                    d = abs(x - r.radius) / px
+                else:
+                    d = abs(float(np.hypot(x, y)) - r.radius) / min(px, py)
+                tol = 4.0
+            else:
+                if polar:
+                    dx, dy = (x - r.radius) / px, (y - r.angle) / py
+                else:
+                    dx, dy = (x - r.q_xy) / px, (y - r.q_z) / py
+                d = float(np.hypot(dx, dy))
+                tol = _sim_marker_size(r.rel_intensity) / 2.0 + 2.0
+            if d <= tol and d < best_d:
+                best, best_d = r, d
+        return best
+
+    def _sim_toggle_at(self, x: float, y: float) -> bool:
+        """Toggle the simulated reflection under the click; True when
+        one was hit (the caller stops peak selection)."""
+        hit = self._sim_hit_reflection(x, y)
+        if hit is None:
+            return False
+        if hit.index in self._sim_selected:
+            self._sim_selected.discard(hit.index)
+        else:
+            self._sim_selected.add(hit.index)
+        self._render_simulation_overlays(self.current_frame)
+        self.simulationSelectionChanged.emit(sorted(self._sim_selected))
+        return True
+
+    def select_missed_simulated(self, frame: int | None = None) -> list[int]:
+        """Select every visible reflection not matched to the selected
+        structure on ``frame`` — exactly the ones rendered orange.
+
+        Reflections sitting on fitted-but-unmatched peaks (or on peaks
+        matched to a DIFFERENT phase) are selected too: the injection
+        planner skips duplicate boxes over existing fitted peaks and
+        instead schedules a re-match so those peaks can be claimed.
+        Returns the new selection (sorted reflection indices).
+        """
+        if self._sim_pattern is None:
+            return []
+        frame = self.current_frame if frame is None else int(frame)
+        reflections = self._visible_sim_reflections()
+        rw, aw = self._sim_seed_widths(frame)
+        matched = simulation_pattern.classify_explained(
+            reflections, self._sim_matched_boxes(frame),
+            seed_radius_width=rw, seed_angle_width=aw,
+        )
+        q_max = self._sim_q_max()
+        self._sim_selected = {
+            r.index
+            for r, m in zip(reflections, matched)
+            if not m
+            and not (r.is_ring and q_max is not None and r.radius > q_max)
+        }
+        self._render_simulation_overlays(frame)
+        sel = sorted(self._sim_selected)
+        self.simulationSelectionChanged.emit(sel)
+        return sel
+
+    def clear_simulation_selection(self) -> None:
+        if not self._sim_selected:
+            return
+        self._sim_selected.clear()
+        self._render_simulation_overlays(self.current_frame)
+        self.simulationSelectionChanged.emit([])
+
+    def _teardown_sim_items(self) -> None:
+        if not self._sim_items:
+            return
+        vb = self._plot.getViewBox()
+        for item in self._sim_items:
+            vb.removeItem(item)
+        self._sim_items.clear()
+
     def _apply_matched_item_visibility(self) -> None:
         """Refresh visibility of every current-frame matched item
         (gated by ``_is_matched_item_visible``)."""
@@ -2017,7 +2424,6 @@ class GIWAXSImageViewer(QWidget):
             self._radio_cart.setChecked(True)
         self._sync_roi()  # ROI exists only in polar mode
         self._render_active_mode()
-        self.modeChanged.emit(mode)
 
     @property
     def mode(self) -> str:
@@ -2043,6 +2449,13 @@ class GIWAXSImageViewer(QWidget):
         self._matched_per_frame.clear()
         self._matched_visibility.clear()
         self._matched_color_index.clear()
+        # Simulated pattern belongs to the closed file's parse; the
+        # visibility + intensity-cutoff prefs survive (dock-mirrored).
+        self._teardown_sim_items()
+        self._sim_pattern = None
+        if self._sim_selected:
+            self._sim_selected.clear()
+            self.simulationSelectionChanged.emit([])
         had_selection = self._selected is not None
         self._selected = None
         self._selected_extras = []
@@ -2195,33 +2608,6 @@ class GIWAXSImageViewer(QWidget):
             and self._selected.manual_ref is peak
         ):
             self.peakGeometryChanged.emit(self._selected)
-
-    def commit_manual_peak(self, frame: int, peak: ManualPeak) -> None:
-        """Drop a manual peak that has been persisted to the NeXus file.
-
-        Like ``remove_manual_peak`` but does not push to the undo stack — the
-        peak now lives in the detected/fitted overlay, so undoing back to its
-        manual state would resurrect a duplicate. Any existing undo/redo
-        entries referencing this peak are scrubbed for the same reason.
-        """
-        peaks = self._manual_peaks.get(frame, [])
-        if peak in peaks:
-            peaks.remove(peak)
-        self._undo_stack = [a for a in self._undo_stack if not _action_targets_manual(a, peak)]
-        self._redo_stack = [a for a in self._redo_stack if not _action_targets_manual(a, peak)]
-        was_selected = (
-            self._selected is not None
-            and self._selected.kind == "manual"
-            and self._selected.manual_ref is peak
-        )
-        if was_selected:
-            self._selected = None
-            self._sync_roi()
-        if frame == self.current_frame:
-            self._render_overlays(frame)
-        if was_selected:
-            self.selectionChanged.emit(None)
-        self.manualPeakRemoved.emit(frame, peak)
 
     def undo_last_action(self) -> None:
         """Reverse the most recent action. No-ops if empty."""
@@ -3193,6 +3579,9 @@ class GIWAXSImageViewer(QWidget):
 
         # Matched overlays: rebuild items for whatever the current frame has.
         self._render_matched_overlays(frame)
+        # Simulated "expected pattern" overlay (frame-independent data,
+        # but rebuilt here so it follows every mode/stack transition).
+        self._render_simulation_overlays(frame)
 
     def _render_matched_overlays(self, frame: int) -> None:
         """Tear down the previous frame's matched items and rebuild for this
@@ -3525,6 +3914,23 @@ class GIWAXSImageViewer(QWidget):
         if self._mode not in (MODE_POLAR, MODE_CARTESIAN) or self._busy:
             return
         x, y = float(pos.x()), float(pos.y())
+        # Simulated-reflection selection preempts peak selection while
+        # the Expected-pattern overlay is visible: a click landing on a
+        # simulated marker/box centre toggles it (bare and Ctrl clicks
+        # alike) and stops here; a miss falls through to the normal
+        # manual > fitted > detected > matched flow untouched. A sim
+        # marker can occlude a peak under it — unticking "Expected
+        # pattern" restores plain selection.
+        if (
+            self._sim_pattern is not None
+            and self._sim_visible
+            and mods in (
+                Qt.KeyboardModifier.NoModifier,
+                Qt.KeyboardModifier.ControlModifier,
+            )
+            and self._sim_toggle_at(x, y)
+        ):
+            return
         cart = self._mode == MODE_CARTESIAN
         frame = self.current_frame
         peaks_for_frame = self._frame_peaks.get(frame) or {}
@@ -3628,7 +4034,7 @@ class GIWAXSImageViewer(QWidget):
         # is the underlying fitted id (which is what delete_peak consumes).
         if self._matched_master_visible:
             structures = self._matched_per_frame.get(frame, [])
-            for s_idx, s in reversed(list(enumerate(structures))):
+            for s in reversed(structures):
                 if not self._is_matched_item_visible(s.unique_id):
                     continue
                 tbl = s.peaks
@@ -3860,10 +4266,6 @@ class GIWAXSImageViewer(QWidget):
             ev.accept()
             return
         super().keyPressEvent(ev)
-
-    def _select_all_detected_on_frame(self) -> None:
-        """Back-compat shim: select all detected peaks on the frame."""
-        self._select_all_of_kind_on_frame("detected")
 
     def _select_all_of_kind_on_frame(self, kind: str) -> None:
         """Replace the selection with every ``kind`` peak on the current frame.

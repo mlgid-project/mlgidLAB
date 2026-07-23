@@ -14,24 +14,20 @@ from mlgidlab.pipeline import (
     execute,
     parse_cif_input,
 )
-from mlgidlab.session import Session
-
 logger = logging.getLogger(__name__)
 
 
 def _trigger_pipeline_imports() -> None:
     """Force ``mlgidbase`` (and its transitive ``pygid`` import) to load.
 
-    Several ``pygid`` submodules (``coordmaps``, ``datasaver``,
-    ``conversion``, ``dataloader``) call ``logging.basicConfig`` at
-    module top — which first **removes every handler already attached
-    to the root logger** before installing their own ``StreamHandler``.
-    If we attached our ``_SignalLogHandler`` and *then* triggered the
-    lazy import, our handler would be ripped out before the first log
-    line ever reaches it. Calling this helper before installing our
-    handler means pygid's destructive `removeHandler` sequence has
-    already run; module bodies don't re-execute on subsequent imports
-    so our handler stays attached for the rest of the worker's run.
+    Importing the backend stack takes seconds (torch, onnxruntime);
+    doing it here keeps that cost on the worker thread, before the
+    first command, instead of stalling mid-run. It also keeps logging
+    setup order deterministic: ``pygid.conversion`` still calls
+    ``logging.basicConfig`` at module top (harmless once a handler
+    exists, but running module bodies before our ``_SignalLogHandler``
+    attaches removes any ordering question — pygid < 0.2.13 even
+    stripped existing root handlers on import).
 
     Failures are swallowed: a missing ``mlgidbase`` install just means
     the worker will surface the actual ``ImportError`` from
@@ -48,8 +44,7 @@ def _trigger_conversion_imports() -> None:
     """Same idea as ``_trigger_pipeline_imports`` for raw conversion.
 
     ``conversion.execute`` lazily imports ``pygid``; make that happen
-    before the worker attaches its log handler so pygid's basicConfig
-    side effect doesn't strip our sink.
+    before the worker attaches its log handler.
     """
     try:
         import pygid  # noqa: F401
@@ -595,10 +590,12 @@ class PipelineWorker(QObject):
         entry = kw.get("entry")
         frame_num = kw.get("frame_num")
         try:
-            # interpolate_tracks carries its work list in kwargs: one
-            # progress tick per planned gap frame (the op logs a
+            # The injection ops carry their work list in kwargs: one
+            # progress tick per planned frame (the op logs a
             # "Saved fitted peaks" line per frame).
-            if self._command.op_name == "interpolate_tracks":
+            if self._command.op_name in (
+                "interpolate_tracks", "inject_fitted_peaks"
+            ):
                 plan = kw.get("plan") or {}
                 return len(plan), str(entry or "")
             # A frame list (e.g. the matching pass chained after

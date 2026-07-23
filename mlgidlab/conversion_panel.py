@@ -75,6 +75,11 @@ def _make_form(parent: QWidget | None = None) -> QFormLayout:
     panel is narrow. This stops form rows from forcing the panel
     wider than the dock and is what makes the parent QScrollArea's
     ``ScrollBarAlwaysOff`` horizontal policy work in practice.
+
+    Deliberate copy of ``pipeline_panel._make_form`` — same rationale
+    as the local ``_CollapsibleSection`` below: importing
+    pipeline_panel would pull its mlgidbase-heavy import chain into
+    the conversion path.
     """
     form = QFormLayout(parent) if parent is not None else QFormLayout()
     form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
@@ -283,19 +288,6 @@ class _CollapsibleSection(QWidget):
         self.body_layout.setSpacing(4)
         self._body.setVisible(expanded)
         outer.addWidget(self._body)
-
-    def is_expanded(self) -> bool:
-        return self._toggle.isChecked()
-
-    def set_expanded(self, expanded: bool) -> None:
-        if self._toggle.isChecked() == expanded:
-            return
-        self._toggle.blockSignals(True)
-        try:
-            self._toggle.setChecked(expanded)
-        finally:
-            self._toggle.blockSignals(False)
-        self._apply_state(expanded)
 
     def _on_toggled(self, checked: bool) -> None:
         self._apply_state(checked)

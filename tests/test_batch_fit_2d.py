@@ -15,10 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import pytest
-from PySide6.QtCore import QPointF
 
 from mlgidlab.image_viewer import SelectedPeak
-from mlgidlab.parameter_panel import ParameterPanel
 from mlgidlab.session import NexusSession
 
 pytestmark = pytest.mark.gui
@@ -58,7 +56,7 @@ class _StubFitResult:
 
 
 def _select_all_three_detected(window):
-    window.viewer._select_all_detected_on_frame()
+    window.viewer._select_all_of_kind_on_frame("detected")
     assert len(window.viewer.selected_peaks()) == 3
 
 

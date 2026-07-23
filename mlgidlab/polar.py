@@ -169,18 +169,3 @@ def cartesian_to_polar(
         cval=np.nan,
     )
     return PolarImage(image=polar, radius=radius, angle=angle)
-
-
-def stack_to_polar(
-    stack: np.ndarray, q_xy: np.ndarray, q_z: np.ndarray, **kwargs
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Apply cartesian_to_polar to each frame of a (frames, q_z, q_xy) stack."""
-    first = cartesian_to_polar(stack[0], q_xy, q_z, **kwargs)
-    out = np.empty(
-        (stack.shape[0], first.image.shape[0], first.image.shape[1]),
-        dtype=first.image.dtype,
-    )
-    out[0] = first.image
-    for i in range(1, stack.shape[0]):
-        out[i] = cartesian_to_polar(stack[i], q_xy, q_z, **kwargs).image
-    return out, first.radius, first.angle

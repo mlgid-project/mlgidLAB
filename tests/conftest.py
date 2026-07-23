@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-from pathlib import Path
 
 # --- environment lockdown (must precede Qt / h5py import) -------------
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -379,8 +378,9 @@ def synthetic_raw(tmp_path):
     spatial dims ≥ ``RAW_MIN_DETECTOR_HW`` (==32) and a numeric dtype
     (file_model.py:595,634-640). This file deliberately includes two
     datasets that must be *filtered out* so the size / ndim guards are
-    exercised, and carries no ``signal`` attr so ``_classify_h5_path``
-    reads it as ``raw`` (not ``nexus``).
+    exercised, and carries no ``entry_*`` groups so the open flow
+    (``CopyWorker``'s inline classification) reads it as ``raw``
+    (not ``nexus``).
 
     Imports are local so the conftest environment lockdown is fully
     applied before h5py touches HDF5.

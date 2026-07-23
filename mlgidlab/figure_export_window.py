@@ -190,14 +190,6 @@ def _row_wrap(layout: QHBoxLayout) -> QWidget:
     return w
 
 
-def _modified_save_path(base: str, entry: str, frame_num: int) -> Path:
-    """Path mlgidbase writes when matched is off or has no
-    solutions: ``{stem}_{entry}_fr_{N:04d}{ext}``.
-    """
-    p = Path(base)
-    return p.with_name(f"{p.stem}_{entry}_fr_{frame_num:04d}{p.suffix}")
-
-
 def _modified_save_paths(base: str, entry: str, frame_num: int) -> list[Path]:
     """All paths mlgidbase might have written for one call: the
     no-matched/no-solutions single file plus the per-solution
@@ -236,9 +228,6 @@ class FigureExportWindow(QMainWindow):
         self.setWindowTitle("Export figure")
 
         self._main = main_window
-        # Path of the file the last render was made against; used by
-        # ``refresh_for_session`` to detect session swaps and reseed.
-        self._analysis_path: Path | None = None
         self._temp_png_base: Path | None = None
         self._last_rendered_path: Path | None = None
         self._render_in_flight = False
@@ -800,7 +789,6 @@ class FigureExportWindow(QMainWindow):
             return
         try:
             analysis = mlgidBASE(filename=str(Path(session.temp_path)))
-            self._analysis_path = Path(session.temp_path)
         except Exception as exc:
             logger.debug("suppressed exception in FigureExportWindow._do_render", exc_info=True)
             self._status_label.setText(f"Couldn't open file: {exc}")
@@ -830,7 +818,7 @@ class FigureExportWindow(QMainWindow):
                 save_fig=True,
                 path_to_save_fig=str(self._temp_png_base),
                 plot_result=False,
-                return_result=False,
+                return_fig=False,
                 **kwargs,
             )
             # mlgidbase writes one file when matched is off / no
@@ -941,7 +929,6 @@ class FigureExportWindow(QMainWindow):
         # preview — pygid still wants ``r+`` on the temp file even
         # when only reading.
         self._save_error: str | None = None
-        self._save_actual: Path | None = None
         try:
             kwargs = self._gather_call_kwargs()
             defaults = self._gather_defaults()
@@ -1016,7 +1003,7 @@ class FigureExportWindow(QMainWindow):
                 save_fig=True,
                 path_to_save_fig=target,
                 plot_result=False,
-                return_result=False,
+                return_fig=False,
                 **kwargs,
             )
             self._save_written_paths = _modified_save_paths(
@@ -1030,10 +1017,9 @@ class FigureExportWindow(QMainWindow):
 
     def refresh_for_session(self) -> None:
         """Called by the host when the active session changes so the
-        basics pane is re-seeded from the new file. We don't cache
-        the ``mlgidBASE`` object across renders, but ``_analysis_path``
-        is tracked for diagnostics."""
-        self._analysis_path = None
+        basics pane is re-seeded from the new file. The ``mlgidBASE``
+        object is never cached across renders, so there is nothing
+        else to invalidate here."""
         # Clear the previous render so the user doesn't stare at
         # stale pixels while the next render kicks off.
         if self._last_rendered_path is not None and self._last_rendered_path.exists():

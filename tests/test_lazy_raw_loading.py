@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 
 from mlgidlab import file_model
-from mlgidlab.session import NexusSession, RawSession
+from mlgidlab.session import NexusSession
 
 
 def _linked_master(tmp_path):

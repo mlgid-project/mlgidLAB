@@ -41,6 +41,7 @@ from PySide6.QtGui import (
     QPixmap,
 )
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QButtonGroup,
     QCheckBox,
@@ -50,17 +51,21 @@ from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QFrame,
     QPlainTextEdit,
     QProgressBar,
     QProgressDialog,
+    QPushButton,
     QRadioButton,
     QDoubleSpinBox,
     QScrollArea,
@@ -79,11 +84,13 @@ from silx.gui.hdf5.NexusSortFilterProxyModel import NexusSortFilterProxyModel
 
 from mlgidlab import file_model
 from mlgidlab import frame_range
+from mlgidlab import manual_fit
 from mlgidlab import peak_clipboard
 from mlgidlab import update_check
 from mlgidlab.image_viewer import (
     GIWAXSImageViewer,
     MATCHED_STYLE,
+    SIM_MISSED_COLOR,
     UNMATCHED_COLOR,
     ManualPeak,
     OVERLAY_KINDS,
@@ -92,6 +99,7 @@ from mlgidlab.image_viewer import (
 )
 from mlgidlab.parameter_panel import ParameterPanel
 from mlgidlab import phase_tracking
+from mlgidlab import simulation_pattern
 from mlgidlab.peaks_table_panel import PeaksTablePanel
 from mlgidlab.phase_views_window import PhaseViewsWindow
 from mlgidlab.pipeline import (
@@ -196,18 +204,6 @@ class _CallbackAction:
 
     def redo(self, _viewer) -> None:
         self._redo_fn()
-
-
-def _make_color_swatch(color: str, width: int = 26, height: int = 12) -> QPixmap:
-    """Solid-line swatch in the given color — used for the matched-peaks
-    master row where only the colour matters and there is no per-row
-    line style to mirror.
-    """
-    return _make_pen_swatch(
-        {"color": color, "style": MATCHED_STYLE["style"]}, width, height
-    )
-
-
 
 
 class _MlgidHdf5TreeModel(Hdf5TreeModel):
@@ -704,6 +700,23 @@ class _UpdateBanner(QFrame):
         self.show()
 
 
+class _ComboWheelBlocker(QObject):
+    """Application-wide event filter that swallows wheel events on
+    CLOSED comboboxes.
+
+    Qt's default lets the mouse wheel step through a combobox's items
+    on hover, so scrolling a dock accidentally changes settings (entry,
+    overlay CIF/orientation, display style, …). Only the closed
+    combobox is filtered — the popup list is a separate widget and
+    keeps normal wheel scrolling.
+    """
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt API)
+        if event.type() == QEvent.Type.Wheel and isinstance(obj, QComboBox):
+            return True
+        return False
+
+
 class MainWindow(QMainWindow):
     # Cross-thread invocation signals for the prefetch worker (queued
     # auto-connection to slots on the worker's own QThread). Emitting
@@ -725,6 +738,13 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
+        # Kill wheel-scrolling through closed comboboxes everywhere
+        # (kept as an attribute — installEventFilter does not own the
+        # filter, so it must not be garbage-collected).
+        self._combo_wheel_blocker = _ComboWheelBlocker(self)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self._combo_wheel_blocker)
         # Multiple files can be open at once — each as its own Session in the
         # file browser. The "active" one drives entry_combo, the image viewer,
         # and per-file actions (save, save-as, close, pipeline). Switching is
@@ -779,6 +799,11 @@ class MainWindow(QMainWindow):
         #    "total": N, "base": 0}           # overall progress
         self._interp_fill_result: list | None = None
         self._interp_chain: dict | None = None
+        # Expected-pattern validation stash: set when an
+        # inject_fitted_peaks chain is enqueued, filled with the fill
+        # records when the inject command lands, consumed by
+        # _finalize_predicted_fill at chain completion.
+        self._predicted_fill: dict | None = None
         # Phase-tracking views window: lazily built on first "Show
         # views…", kept alive so its settings and computed caches
         # persist across re-opens (same pattern as _figure_export_window).
@@ -1083,7 +1108,6 @@ class MainWindow(QMainWindow):
         clear_menu.addSeparator()
         reset_menu = clear_menu.addMenu("&Reset all peaks")
         reset_menu.setToolTipsVisible(True)
-        self._reset_menu = reset_menu
 
         self.action_reset_all = QAction("All entries", self)
         self.action_reset_all.setToolTip(
@@ -1527,6 +1551,7 @@ class MainWindow(QMainWindow):
             self._tree_dock,
             self._display_dock,
             self._pipeline_dock,
+            self._sim_dock,
             self._conversion_dock,
             self._logs_dock,
             self._peaks_dock,
@@ -1610,6 +1635,7 @@ class MainWindow(QMainWindow):
             self._tree_dock,
             self._display_dock,
             self._pipeline_dock,
+            self._sim_dock,
             self._conversion_dock,
             self._logs_dock,
             self._peaks_dock,
@@ -2133,7 +2159,6 @@ class MainWindow(QMainWindow):
             tag, url = result
             if update_check.is_outdated(current, tag):
                 self._latest_tag = tag
-                self._latest_url = url
                 supported, _ = update_check.self_update_supported()
                 # Go straight to the install (via its confirm dialog, never
                 # silently) when the user asked for it — Help -> Update now…
@@ -2798,13 +2823,24 @@ class MainWindow(QMainWindow):
         self.frame_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.frame_slider.setTickInterval(1)
         self.frame_slider.valueChanged.connect(self._on_frame_slider_changed)
-        # Compact "idx / max" readout. The "Frame" word was dropped to
-        # save toolbar space — its meaning is obvious from context
-        # (next to play / prev / next icons and a slider).
+        # Editable frame index next to the slider: type an exact frame
+        # and confirm with Enter (keyboard tracking is off so partial
+        # input like the "2" of "25" doesn't seek mid-typing).
+        self.frame_spin = QSpinBox()
+        self.frame_spin.setRange(0, 0)
+        self.frame_spin.setKeyboardTracking(False)
+        self.frame_spin.setToolTip(
+            "Current frame — type an index and press Enter to jump."
+        )
+        self.frame_spin.valueChanged.connect(self._on_frame_spin_changed)
+        # Compact "/ max" readout completing the spinbox ("idx / max").
+        # The "Frame" word was dropped to save toolbar space — its
+        # meaning is obvious from context (next to play / prev / next
+        # icons and a slider).
         self.frame_label = QLabel("—")
-        self.frame_label.setMinimumWidth(48)
+        self.frame_label.setMinimumWidth(36)
         self.frame_label.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
         # Play / pause toggle. Drives a QTimer that calls
         # viewer.set_frame(current + 1) on every tick; stops when the
@@ -2858,13 +2894,14 @@ class MainWindow(QMainWindow):
         self._play_timer.setInterval(DEFAULT_PLAYBACK_FRAME_MS)
         self._play_timer.timeout.connect(self._on_play_tick)
         layout.addLayout(form)
-        # Hand the controls to the image viewer's toolbar. Order
-        # reads left-to-right: prev / play / next / slider / label.
+        # Hand the controls to the image viewer's toolbar. Order reads
+        # left-to-right: prev / play / next / slider / index / "max".
         self.viewer.insert_frame_controls([
             self.prev_frame_button,
             self.play_button,
             self.next_frame_button,
             self.frame_slider,
+            self.frame_spin,
             self.frame_label,
         ])
         # Start hidden — only useful once a multi-frame stack is loaded.
@@ -3043,13 +3080,250 @@ class MainWindow(QMainWindow):
         # ``_refresh_matched_panel`` and consumed by the min-p
         # slider filter in ``_apply_matched_filter``.
         self._matched_struct_probs: dict[str, float] = {}
-        # Lives in its own field so we can find/remove the placeholder row.
-        self._matched_empty_label: QLabel | None = None
         # Shown when a non-empty filter hides every row (distinct
-        # from the "no matched solutions" empty-list label).
+        # from the "no matched solutions" empty-list label, which is
+        # torn down with the rest of the rows on every rebuild).
         self._matched_filter_empty_label: QLabel | None = None
+
+        # Twin legend for the Expected-pattern dock: the same master
+        # toggle and per-structure rows, rebuilt alongside the Display
+        # ones in _refresh_matched_panel with checkbox state mirrored
+        # both ways, so structures can be shown/hidden without
+        # switching back to the Display tab. Built here so the initial
+        # _refresh_matched_panel call below can populate it; the
+        # container joins the Expected-pattern dock's layout when that
+        # dock is assembled. Deliberately NOT part of
+        # _sim_section_container: matched structures exist (and stay
+        # toggleable) even while no CIF cache is parsed and the rest
+        # of that section is disabled.
+        self._sim_legend_container = QWidget()
+        sim_legend_box = QVBoxLayout(self._sim_legend_container)
+        sim_legend_box.setContentsMargins(0, 0, 0, 0)
+        sim_legend_box.setSpacing(2)
+        sim_legend_master_row = QHBoxLayout()
+        sim_legend_master_row.setContentsMargins(0, 0, 0, 0)
+        sim_legend_master_row.setSpacing(6)
+        self._sim_legend_master_check = QCheckBox("Matched peaks")
+        self._sim_legend_master_check.setChecked(
+            self._matched_master_check.isChecked()
+        )
+        self._sim_legend_master_check.setToolTip(
+            "Mirror of the Display tab's Matched-peaks master toggle "
+            "(the two stay in sync): show or hide every "
+            "matched-structure overlay. The CIF-name filter and the "
+            "min-probability slider live in the Display tab and also "
+            "apply to this list."
+        )
+        self._sim_legend_master_check.toggled.connect(
+            self._on_matched_master_toggled
+        )
+        sim_legend_master_row.addWidget(self._sim_legend_master_check)
+        sim_legend_master_row.addStretch(1)
+        sim_legend_master_widget = QWidget()
+        sim_legend_master_widget.setLayout(sim_legend_master_row)
+        sim_legend_box.addWidget(sim_legend_master_widget)
+        self._sim_legend_struct_container = QWidget()
+        self._sim_legend_struct_layout = QVBoxLayout(
+            self._sim_legend_struct_container
+        )
+        self._sim_legend_struct_layout.setContentsMargins(20, 0, 0, 0)
+        self._sim_legend_struct_layout.setSpacing(2)
+        sim_legend_box.addWidget(self._sim_legend_struct_container)
+        self._sim_legend_struct_checkboxes: dict[str, QCheckBox] = {}
+        self._sim_legend_struct_rows: dict[str, QWidget] = {}
+        self._sim_legend_filter_empty_label: QLabel | None = None
+        # Every "Unmatched fitted peaks" checkbox currently built (one
+        # per legend) — kept for cross-legend sync in
+        # _on_unmatched_row_toggled.
+        self._unmatched_row_checks: list[QCheckBox] = []
+
         self._refresh_matched_panel(0, [])
         self.viewer.matchedStructuresChanged.connect(self._refresh_matched_panel)
+
+        # "Expected pattern": forward-simulated reflections of a parsed
+        # CIF, rendered as a display-only overlay. Fed by the Pipeline
+        # panel's cached CifPattern (Parse CIFs) — the whole section is
+        # disabled until a cache exists. Wrapped in one container so
+        # enable/disable + tooltip reach every row at once. The
+        # cifCacheChanged connection is made after the Pipeline panel
+        # is constructed (it doesn't exist yet at this point).
+        sim_box = QVBoxLayout()
+        sim_box.setContentsMargins(0, 0, 0, 0)
+        sim_box.setSpacing(2)
+        sim_master_row = QHBoxLayout()
+        sim_master_row.setContentsMargins(0, 0, 0, 0)
+        sim_master_row.setSpacing(6)
+        sim_swatch = QLabel()
+        sim_swatch.setPixmap(_make_pen_swatch({
+            "color": SIM_MISSED_COLOR,
+            "style": Qt.PenStyle.DashLine,
+            "width": 1.5,
+        }))
+        sim_master_row.addWidget(sim_swatch)
+        self._sim_master_check = QCheckBox("Show expected pattern")
+        self._sim_master_check.setChecked(False)
+        self._sim_master_check.setToolTip(
+            "Overlay the forward-simulated reflections of a parsed CIF "
+            "(diamonds for spots, dashed arcs for rings; marker size "
+            "encodes simulated intensity). Display-only — nothing is "
+            "written to the file."
+        )
+        self._sim_master_check.toggled.connect(self._on_sim_master_toggled)
+        sim_master_row.addWidget(self._sim_master_check)
+        sim_master_row.addStretch(1)
+        sim_master_widget = QWidget()
+        sim_master_widget.setLayout(sim_master_row)
+        sim_box.addWidget(sim_master_widget)
+
+        sim_cif_row = QHBoxLayout()
+        sim_cif_row.setContentsMargins(20, 0, 0, 0)
+        sim_cif_row.setSpacing(6)
+        sim_cif_row.addWidget(QLabel("CIF:"))
+        self._sim_cif_combo = QComboBox()
+        self._sim_cif_combo.setToolTip(
+            "Structure to simulate, from the parsed CIF cache. Entries "
+            "matched on the current frame are marked."
+        )
+        self._sim_cif_combo.currentIndexChanged.connect(
+            self._on_sim_cif_changed
+        )
+        sim_cif_row.addWidget(self._sim_cif_combo, 1)
+        sim_cif_widget = QWidget()
+        sim_cif_widget.setLayout(sim_cif_row)
+        sim_box.addWidget(sim_cif_widget)
+
+        sim_orient_row = QHBoxLayout()
+        sim_orient_row.setContentsMargins(20, 0, 0, 0)
+        sim_orient_row.setSpacing(6)
+        sim_orient_row.addWidget(QLabel("Orientation:"))
+        self._sim_orient_combo = QComboBox()
+        self._sim_orient_combo.setToolTip(
+            "Texture orientation (hkl) to render. 'Powder (rings)' "
+            "shows the orientation-free ring pattern; the current "
+            "frame's matched orientations are listed first."
+        )
+        self._sim_orient_combo.currentIndexChanged.connect(
+            self._on_sim_orient_changed
+        )
+        sim_orient_row.addWidget(self._sim_orient_combo, 1)
+        sim_orient_widget = QWidget()
+        sim_orient_widget.setLayout(sim_orient_row)
+        sim_box.addWidget(sim_orient_widget)
+
+        sim_int_row = QHBoxLayout()
+        sim_int_row.setContentsMargins(20, 0, 0, 0)
+        sim_int_row.setSpacing(6)
+        sim_int_row.addWidget(QLabel("Min int:"))
+        # Structure-factor intensities span decades, so a linear slider
+        # is useless here (everything interesting sits between 0 and
+        # ~1% of the strongest reflection). A lone spinbox with
+        # adaptive-decimal stepping instead: the arrow/wheel step is
+        # always one decade below the current value's magnitude, so it
+        # moves in useful increments at 0.01% just as at 50%.
+        self._sim_int_spin = QDoubleSpinBox()
+        self._sim_int_spin.setRange(0.0, 100.0)
+        self._sim_int_spin.setDecimals(4)
+        self._sim_int_spin.setStepType(
+            QAbstractSpinBox.StepType.AdaptiveDecimalStepType
+        )
+        self._sim_int_spin.setSuffix(" %")
+        self._sim_int_spin.setValue(1.0)
+        self._sim_int_spin.setToolTip(
+            "Hide simulated reflections whose intensity is below this "
+            "percentage of the pattern's strongest reflection. "
+            "Arrows/wheel step relative to the current value, so tiny "
+            "cutoffs stay reachable."
+        )
+        self._sim_int_spin.valueChanged.connect(
+            self._on_sim_int_spin_changed
+        )
+        sim_int_row.addWidget(self._sim_int_spin, 1)
+        sim_int_widget = QWidget()
+        sim_int_widget.setLayout(sim_int_row)
+        sim_box.addWidget(sim_int_widget)
+
+        # Selection row: bulk-select the reflections the data does not
+        # account for, plus a live count of what's queued. Clicking
+        # individual markers on the image toggles them one by one.
+        sim_sel_row = QHBoxLayout()
+        sim_sel_row.setContentsMargins(20, 0, 0, 0)
+        sim_sel_row.setSpacing(6)
+        self._sim_select_missed_btn = QPushButton("Select missed")
+        self._sim_select_missed_btn.setToolTip(
+            "Select every visible simulated reflection that is neither "
+            "explained by a matched peak nor covered by any fitted "
+            "peak on this frame. Click markers on the image to toggle "
+            "reflections individually."
+        )
+        self._sim_select_missed_btn.clicked.connect(
+            lambda: self.viewer.select_missed_simulated(
+                self.viewer.current_frame
+            )
+        )
+        sim_sel_row.addWidget(self._sim_select_missed_btn)
+        self._sim_sel_count_label = QLabel("0 selected")
+        sim_sel_row.addWidget(self._sim_sel_count_label)
+        sim_sel_row.addStretch(1)
+        sim_sel_widget = QWidget()
+        sim_sel_widget.setLayout(sim_sel_row)
+        sim_box.addWidget(sim_sel_widget)
+        self.viewer.simulationSelectionChanged.connect(
+            self._on_sim_selection_changed
+        )
+
+        # The action button: inject the selected reflections as real
+        # detected boxes, 2D-fit each, re-match the frame. Enabled only
+        # with a non-empty selection on a frame that already has
+        # detected/fitted datasets, while the pipeline is idle.
+        sim_add_row = QHBoxLayout()
+        sim_add_row.setContentsMargins(20, 0, 0, 0)
+        sim_add_row.setSpacing(6)
+        self._sim_add_btn = QPushButton("Add selected peaks (fit + match)")
+        self._sim_add_btn.setEnabled(False)
+        self._sim_add_btn.clicked.connect(self._on_add_predicted_peaks)
+        sim_add_row.addWidget(self._sim_add_btn)
+        sim_add_row.addStretch(1)
+        sim_add_widget = QWidget()
+        sim_add_widget.setLayout(sim_add_row)
+        sim_box.addWidget(sim_add_widget)
+
+        # The all-frames sweep: every matched (CIF, orientation) combo
+        # found anywhere in the entry becomes a template applied to
+        # EVERY frame — "here should be a peak, can we find it?".
+        # Independent of the overlay checkbox and of the reflection
+        # selection.
+        sim_sweep_row = QHBoxLayout()
+        sim_sweep_row.setContentsMargins(20, 0, 0, 0)
+        sim_sweep_row.setSpacing(6)
+        self._sim_sweep_btn = QPushButton(
+            "Find all matched structures (all frames)"
+        )
+        self._sim_sweep_btn.clicked.connect(self._on_fill_all_matched)
+        sim_sweep_row.addWidget(self._sim_sweep_btn)
+        sim_sweep_row.addStretch(1)
+        sim_sweep_widget = QWidget()
+        sim_sweep_widget.setLayout(sim_sweep_row)
+        sim_box.addWidget(sim_sweep_widget)
+        # The per-structure reflection caps live in the sweep's
+        # confirmation dialog (one spinbox per found structure) — a
+        # permanent cap row here would crowd the dock for a setting
+        # that only matters at launch time.
+        self._update_sim_add_button()
+
+        self._sim_section_container = QWidget()
+        self._sim_section_container.setLayout(sim_box)
+        self._sim_section_container.setEnabled(False)
+        # Not added to the Display panel: the whole Expected-pattern
+        # workflow lives in its own tabbed dock (built right after the
+        # Pipeline dock below).
+        # (stem, hkl) of the pattern currently installed in the viewer
+        # (None = overlay clear). Lets frame changes rebuild the combo
+        # labels without re-applying an unchanged pattern — re-applying
+        # would drop the reflection selection.
+        self._sim_applied: tuple | None = None
+        self.viewer.matchedStructuresChanged.connect(
+            self._refresh_sim_matched_entries
+        )
 
         layout.addSpacing(6)
 
@@ -3096,11 +3370,43 @@ class MainWindow(QMainWindow):
         )
         self.pipeline_panel.runRequested.connect(self._on_run_requested)
         self.pipeline_panel.parseCifsRequested.connect(self._on_parse_cifs_requested)
+        self.pipeline_panel.cifCacheChanged.connect(self._on_cif_cache_changed)
+        self._update_sim_section_state()
         self._pipeline_dock = QDockWidget("Pipeline", self)
         self._pipeline_dock.setWidget(self.pipeline_panel)
         self._pipeline_dock.setObjectName("PipelineDock")
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._pipeline_dock)
         self.tabifyDockWidget(self._display_dock, self._pipeline_dock)
+
+        # Expected pattern dock — the forward-simulation overlay plus
+        # the add/sweep workflow, in its own right-side tab so the
+        # Display dock stays a pure view-settings panel. Same scroll
+        # treatment as Display.
+        sim_panel = QWidget()
+        sim_panel_layout = QVBoxLayout(sim_panel)
+        sim_panel_layout.setContentsMargins(8, 8, 8, 8)
+        sim_panel_layout.addWidget(self._sim_section_container)
+        # The matched-structures twin legend (built next to the Display
+        # legend above) — outside the section container so it stays
+        # enabled even when the simulation workflow is greyed out.
+        sim_panel_layout.addSpacing(8)
+        sim_panel_layout.addWidget(self._sim_legend_container)
+        sim_panel_layout.addStretch(1)
+        sim_scroll = QScrollArea(self)
+        sim_scroll.setWidgetResizable(True)
+        sim_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        sim_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        sim_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        sim_scroll.setWidget(sim_panel)
+        self._sim_dock = QDockWidget("Expected pattern", self)
+        self._sim_dock.setWidget(sim_scroll)
+        self._sim_dock.setObjectName("ExpectedPatternDock")
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._sim_dock)
+        self.tabifyDockWidget(self._pipeline_dock, self._sim_dock)
 
         # Peaks panel — sortable per-frame view of detected / fitted /
         # matched peaks with bidirectional click-sync to the image
@@ -3141,7 +3447,7 @@ class MainWindow(QMainWindow):
         # tabified with Pipeline (they're mode-exclusive siblings)
         # so the visible tab triplet is Display | <Pipeline or
         # Conversion> | Logs.
-        self.tabifyDockWidget(self._pipeline_dock, self._conversion_dock)
+        self.tabifyDockWidget(self._sim_dock, self._conversion_dock)
         # Default state matches the default session (none): pipeline dock
         # shown so the user can see what would be available once they
         # open a converted file. ``_apply_session_mode`` handles toggles
@@ -4510,6 +4816,8 @@ class MainWindow(QMainWindow):
             # refreshed in ``_on_entry_loaded`` once the frame is in.
             self._load_entry_async(entry)
             self._update_status_entry()
+            # Multi-energy files: the parsed CIF cache is entry-specific.
+            self._sim_entry_mismatch_hint(entry)
 
     def _on_frame_slider_changed(self, value: int) -> None:
         """User dragged the Display-dock slider — push to the viewer.
@@ -4518,6 +4826,12 @@ class MainWindow(QMainWindow):
         the current frame, so the bidirectional sync (slider→viewer→
         slider via _on_viewer_frame_changed) doesn't recurse.
         """
+        self.viewer.set_frame(value)
+
+    def _on_frame_spin_changed(self, value: int) -> None:
+        """Exact frame index typed (or stepped) — same seek path as the
+        slider; the viewer's no-op on an unchanged frame breaks the
+        sync loop here too."""
         self.viewer.set_frame(value)
 
     def _on_viewer_frame_changed(self, frame: int) -> None:
@@ -4542,6 +4856,9 @@ class MainWindow(QMainWindow):
                 self.frame_slider.setValue(int(frame))
             finally:
                 self.frame_slider.blockSignals(False)
+        if self.frame_spin.value() != frame:
+            with QSignalBlocker(self.frame_spin):
+                self.frame_spin.setValue(int(frame))
         self._refresh_frame_nav_enabled()
         self._update_status_frame()
         # Tell the prefetch worker where the play-head is now. The
@@ -4829,6 +5146,9 @@ class MainWindow(QMainWindow):
                 self.frame_slider.setValue(int(cur))
         finally:
             self.frame_slider.blockSignals(False)
+        with QSignalBlocker(self.frame_spin):
+            self.frame_spin.setRange(0, max(0, n - 1))
+            self.frame_spin.setValue(int(cur) if n > 1 else 0)
         self.frame_label.setText(self._frame_label_text(cur))
         self._set_frame_slider_visible(n > 1)
         self._refresh_frame_nav_enabled()
@@ -4844,6 +5164,7 @@ class MainWindow(QMainWindow):
             self.play_button,
             self.next_frame_button,
             self.frame_slider,
+            self.frame_spin,
             self.frame_label,
         ):
             w.setVisible(visible)
@@ -4967,10 +5288,13 @@ class MainWindow(QMainWindow):
             self._frame_shortcut_actions.append(action)
 
     def _frame_label_text(self, idx: int) -> str:
+        """Suffix completing the frame spinbox: "/ max". The index
+        itself lives in the editable ``frame_spin``; ``idx`` is kept in
+        the signature for the existing call sites."""
         n = self.viewer.n_frames
         if n <= 1:
             return "—"
-        return f"{int(idx)} / {n - 1}"
+        return f"/ {n - 1}"
 
     def _safe_selected_h5_nodes(self) -> list:
         """Return ``selectedH5Nodes`` results, swallowing silx model errors.
@@ -5917,8 +6241,8 @@ class MainWindow(QMainWindow):
         that already names an explicit ``entry`` (or runs on a file with
         a single entry) goes straight through unchanged.
 
-        ``add_peak`` and ``delete_peak`` always carry a specific
-        ``entry`` already; only the run_* ops are subject to expansion.
+        Only the run_* ops are subject to expansion; every other op
+        (inject/track/interpolate) always carries a specific ``entry``.
 
         The file path is snapshotted at this entry point and travels
         with every enqueued tuple, so a mid-queue active-session
@@ -5961,8 +6285,8 @@ class MainWindow(QMainWindow):
                     ),
                 )
         else:
-            # Single-entry command (user picked one explicitly, or
-            # add_peak / delete_peak with their fixed entry). Counter
+            # Single-entry command (user picked one explicitly, or an
+            # op that always carries its fixed entry). Counter
             # collapses to 1 so the panel keeps the entry bar hidden.
             self._entry_queue_total = 1
             self._entry_queue_pos = 0
@@ -6027,12 +6351,10 @@ class MainWindow(QMainWindow):
         self.scan_tracking_panel.set_busy(True)
         self.viewer.set_busy(True)
         self._update_status_pipeline(command, running=True)
-        # Any pipeline op that reshuffles peak ids (everything except
-        # add_peak, which only appends) invalidates pending FileGeomActions.
-        # add_peak is handled by commit_manual_peak's targeted scrub.
-        if command.op_name != "add_peak":
-            self.viewer.clear_history()
-            self.viewer.clear_selection()
+        # Every pipeline op can reshuffle peak ids, which invalidates
+        # pending FileGeomActions — drop history and selection up front.
+        self.viewer.clear_history()
+        self.viewer.clear_selection()
         # Per-run header: include the entry scope when present so the
         # user can see which entry is being processed in a multi-entry
         # batch.
@@ -6261,13 +6583,50 @@ class MainWindow(QMainWindow):
                     "(every fit failed or was skipped — see warnings "
                     "above)."
                 )
-        # Interpolate-track chain accounting: advance the dialog's
-        # completed-work base, and when the chain's LAST command lands
-        # (the final re-match — or the fill itself when every re-match
-        # was skipped), apply the fills as track members and drop the
-        # dialog. Applied even when a re-match errored: the fills are
-        # real fitted rows either way, and the error modal above
-        # already told the user.
+        # Expected-pattern injection: the records are NOT track fills —
+        # never route them into _interp_fill_result (its applier would
+        # try to append them as track members). They land in the
+        # validation stash instead, consumed at chain completion.
+        if (
+            error is None
+            and cmd is not None
+            and cmd.op_name == "inject_fitted_peaks"
+        ):
+            n = len(result) if result else 0
+            if self._predicted_fill is not None:
+                self._predicted_fill["records"] = (
+                    list(result) if result else []
+                )
+            if n:
+                self.pipeline_panel.append_log(
+                    f"Expected pattern: injected and fitted {n} "
+                    "predicted peak(s); validating against the "
+                    "re-match…"
+                )
+            else:
+                self.pipeline_panel.append_log(
+                    "Expected pattern: no predicted peak could be "
+                    "added (every fit failed — see warnings above)."
+                )
+        # A failed re-match must not trigger the validation rollback —
+        # nothing got matched, so every injected peak would be wrongly
+        # discarded for a crash that wasn't its fault.
+        if (
+            error is not None
+            and cmd is not None
+            and cmd.op_name == "run_matching"
+            and self._predicted_fill is not None
+        ):
+            self._predicted_fill["match_ok"] = False
+        # Injection-chain accounting (interpolate-track fills AND
+        # expected-pattern additions share it; both are busy-gated so
+        # they never interleave): advance the dialog's completed-work
+        # base, and when the chain's LAST command lands (the final
+        # re-match — or the fill itself when every re-match was
+        # skipped), apply any stashed track fills and drop the dialog.
+        # Applied even when a re-match errored: the fills are real
+        # fitted rows either way, and the error modal above already
+        # told the user.
         chain = self._interp_chain
         if chain is not None and cmd is not None and id(cmd) in chain["ticks"]:
             chain["base"] += chain["ticks"].pop(id(cmd))
@@ -6275,6 +6634,15 @@ class MainWindow(QMainWindow):
                 self._interp_chain = None
                 self._close_tracking_progress()
                 self._apply_interp_fill_result()
+                if chain.get("label") == "Expected pattern":
+                    # Keep only the injected peaks the matcher
+                    # attributed to the target structure (silx is
+                    # still detached here, so the rollback's r+
+                    # writes are safe), then drop the stale white
+                    # selection — the queue-drain reload below
+                    # re-classifies the survivors green.
+                    self._finalize_predicted_fill()
+                    self.viewer.clear_simulation_selection()
 
         # If more commands are queued, run the next one without
         # tearing down the silx tree / viewer state for the user — keep
@@ -6294,6 +6662,7 @@ class MainWindow(QMainWindow):
         self.parameter_panel.set_busy(False)
         self.scan_tracking_panel.set_busy(False)
         self.viewer.set_busy(False)
+        self._update_sim_add_button()
         self._update_status_pipeline(running=False)
         self._reattach_silx_tree()
         if self.session is not None:
@@ -7546,7 +7915,7 @@ class MainWindow(QMainWindow):
 
     def _run_pygidfit_for_selection(
         self, sel: SelectedPeak, entry: str, frame: int,
-    ) -> tuple["ManualFitResult | None", str | None]:
+    ) -> tuple["manual_fit.ManualFitResult | None", str | None]:
         """Run pygidfit on ``sel`` and return ``(result, error)``.
 
         Silent — no QMessageBox, no logging at warning level. Used by
@@ -7846,7 +8215,6 @@ class MainWindow(QMainWindow):
                 "include the deleted peak(s) lose just those peaks; "
                 "structures that don't reference them are left unchanged."
             )
-        noun = f"{kind_human} peak" + ("s" if n > 1 else "")
         target = (
             f"id={ids[0]} on frame {frame}" if n == 1
             else f"{n} {kind_human} peaks on frame {frame}"
@@ -8154,12 +8522,26 @@ class MainWindow(QMainWindow):
             phase_tracking.member_ids(payload, tables)
             if tables else [None] * payload.n_members
         )
-        # Upstream cannot track rings (infinite angular width -> NaN
-        # IoU -> zeroed -> single-member components cut by `length`), so
-        # track them GUI-side by 1-D radial IoU and append the ring
-        # tracks to the payload. They then flow through the table, the
-        # views, and the only-tracked filter exactly like spot tracks.
+        # Rings are tracked GUI-side by 1-D radial IoU (rings span the
+        # whole arc, so radius intervals are the right overlap measure)
+        # and appended to the payload; they then flow through the
+        # table, the views, and the only-tracked filter exactly like
+        # spot tracks. Upstream cannot fully track rings: pygidfit
+        # persists rings with angle = NaN, which still poisons the
+        # (angle, radius) IoU box. But since mlgidbase 0.1.5 clamps
+        # ring angle_width inf -> 45 inside track_peaks, rings stored
+        # with a FINITE angle (the GUI's injected rings persist
+        # angle = 45) CAN form native components — drop those first so
+        # track_rings stays the single source of ring tracks (no
+        # duplicated tracks, and NaN-angle members join the same
+        # radial-IoU track instead of being split off).
         if tables:
+            native_ring = self._compute_ring_tracks(payload, ids, tables)
+            if native_ring:
+                payload.components = [
+                    c for k, c in enumerate(payload.components)
+                    if k not in native_ring
+                ]
             ring_comps = phase_tracking.track_rings(
                 payload, ids, tables, payload.threshold, payload.length
             )
@@ -8395,6 +8777,34 @@ class MainWindow(QMainWindow):
             self.viewer.matched_structures(self.viewer.current_frame),
         )
 
+    def _panel_fit_params(self) -> dict:
+        """The Pipeline panel's fit config as ``fit_one_peak`` kwargs.
+
+        Injected boxes (gap fills, predicted reflections) are fitted
+        with the SAME settings the next ``run_fitting`` would use.
+        Empty dict when the widgets are unavailable (backend-less
+        stub panel) — the executor falls back to pygidfit defaults.
+        """
+        panel = self.pipeline_panel
+        try:
+            return {
+                "crit_angle": float(panel.fit_crit_angle.value()),
+                "clustering_distance_peaks": float(
+                    panel.fit_dist_peaks.value()
+                ),
+                "clustering_distance_rings": float(
+                    panel.fit_dist_rings.value()
+                ),
+                "clustering_extend": int(panel.fit_cluster_extend.value()),
+                "theta_fixed": bool(panel.fit_theta_fixed.isChecked()),
+            }
+        except Exception:
+            logger.debug(
+                "suppressed exception reading the panel fit params",
+                exc_info=True,
+            )
+            return {}
+
     def _on_interpolate_tracks_requested(self) -> None:
         """Fill each track's gap frames with REAL peaks (spots + rings).
 
@@ -8442,27 +8852,7 @@ class MainWindow(QMainWindow):
                 "Matching section first.",
             )
             return
-        # Same fit config the pipeline panel would use for run_fitting,
-        # so filled boxes are fitted like every other peak.
-        panel = self.pipeline_panel
-        try:
-            fit_params = {
-                "crit_angle": float(panel.fit_crit_angle.value()),
-                "clustering_distance_peaks": float(
-                    panel.fit_dist_peaks.value()
-                ),
-                "clustering_distance_rings": float(
-                    panel.fit_dist_rings.value()
-                ),
-                "clustering_extend": int(panel.fit_cluster_extend.value()),
-                "theta_fixed": bool(panel.fit_theta_fixed.isChecked()),
-            }
-        except Exception:
-            logger.debug(
-                "suppressed exception reading fit params for "
-                "interpolate_tracks", exc_info=True,
-            )
-            fit_params = {}
+        fit_params = self._panel_fit_params()
         n_boxes = sum(len(v) for v in plan.values())
         self.pipeline_panel.append_log(
             f"Interpolate track: filling {n_boxes} gap box(es) across "
@@ -9189,57 +9579,61 @@ class MainWindow(QMainWindow):
         away the old QCheckBox widgets and create new ones — the structure
         list is small (1-N rows) so this is cheap.
 
+        Every row is built twice: once for the Display dock and once for
+        the Expected-pattern dock's twin legend. The twins share their
+        toggled handlers, which mirror each change to the counterpart
+        (``_on_matched_structure_toggled``, ``_on_matched_master_toggled``,
+        ``_on_unmatched_row_toggled``).
+
         The active filter (see ``_apply_matched_filter``) is re-applied
         at the end so newly-built rows respect the current search
         text without the user needing to retype.
         """
-        # Clear children of the dynamic container.
-        while self._matched_struct_layout.count():
-            item = self._matched_struct_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-        self._matched_empty_label = None
+        # Clear children of both dynamic containers.
+        for lay in (
+            self._matched_struct_layout, self._sim_legend_struct_layout,
+        ):
+            while lay.count():
+                item = lay.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
         self._matched_filter_empty_label = None
+        self._sim_legend_filter_empty_label = None
         self._matched_struct_checkboxes.clear()
         self._matched_struct_rows.clear()
         self._matched_struct_probs.clear()
+        self._sim_legend_struct_checkboxes.clear()
+        self._sim_legend_struct_rows.clear()
+        self._unmatched_row_checks.clear()
 
         # Fitted rows no loaded structure claims (tracked filter
         # applied) get their own sub-row below the structures.
         has_unmatched = self.viewer.has_unmatched_fitted(_frame)
 
         if not structures and not has_unmatched:
-            self._matched_empty_label = QLabel("<i>No matched solutions for this frame.</i>")
-            self._matched_empty_label.setWordWrap(True)
-            self._matched_struct_layout.addWidget(self._matched_empty_label)
+            self._add_matched_empty_label(self._matched_struct_layout)
+            self._add_matched_empty_label(self._sim_legend_struct_layout)
             return
 
-        for i, s in enumerate(structures):
+        for s in structures:
             # Stable per-identity pen (CIF + hkl) so the swatch matches
             # the overlay and stays the same colour across frames.
             pen = self.viewer.matched_pen(s)
-            row = QHBoxLayout()
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(6)
-            swatch = QLabel()
-            # Mirror the *exact* pen used to render the structure on the
-            # image so the user can map a row to its overlay shape even
-            # when colour repeats — the dashed/dotted swatch flags it.
-            swatch.setPixmap(_make_pen_swatch(pen))
-            row.addWidget(swatch)
-            chk = QCheckBox(s.label)
-            chk.setChecked(self.viewer.matched_visibility(_frame, s.unique_id))
-            chk.toggled.connect(
-                lambda v, uid=s.unique_id: self._on_matched_structure_toggled(uid, v)
-            )
-            row.addWidget(chk)
-            row.addStretch(1)
-            row_widget = QWidget()
-            row_widget.setLayout(row)
-            self._matched_struct_layout.addWidget(row_widget)
-            self._matched_struct_checkboxes[s.unique_id] = chk
-            self._matched_struct_rows[s.unique_id] = row_widget
+            for checks, rows, lay in (
+                (self._matched_struct_checkboxes,
+                 self._matched_struct_rows,
+                 self._matched_struct_layout),
+                (self._sim_legend_struct_checkboxes,
+                 self._sim_legend_struct_rows,
+                 self._sim_legend_struct_layout),
+            ):
+                row_widget, chk = self._make_matched_struct_row(
+                    s, pen, _frame
+                )
+                lay.addWidget(row_widget)
+                checks[s.unique_id] = chk
+                rows[s.unique_id] = row_widget
             try:
                 self._matched_struct_probs[s.unique_id] = float(s.probability)
             except Exception:
@@ -9262,28 +9656,74 @@ class MainWindow(QMainWindow):
         # min-probability filters never touch it.
         if has_unmatched:
             pen = {"color": UNMATCHED_COLOR, **MATCHED_STYLE}
-            row = QHBoxLayout()
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(6)
-            swatch = QLabel()
-            swatch.setPixmap(_make_pen_swatch(pen))
-            row.addWidget(swatch)
-            chk = QCheckBox("Unmatched fitted peaks")
-            chk.setToolTip(
-                "Show every fitted peak that is NOT part of any matched "
-                "structure, in neutral grey, using the matched display "
-                "style (boxes or markers). Follows the Matched master "
-                "toggle and the \"Show only tracked peaks\" filter — "
-                "handy for viewing tracked-but-unmatched peaks as "
-                "markers alongside the structures."
-            )
-            chk.setChecked(self.viewer.unmatched_visible())
-            chk.toggled.connect(self.viewer.set_unmatched_visible)
-            row.addWidget(chk)
-            row.addStretch(1)
-            row_widget = QWidget()
-            row_widget.setLayout(row)
-            self._matched_struct_layout.addWidget(row_widget)
+            for lay in (
+                self._matched_struct_layout, self._sim_legend_struct_layout,
+            ):
+                row = QHBoxLayout()
+                row.setContentsMargins(0, 0, 0, 0)
+                row.setSpacing(6)
+                swatch = QLabel()
+                swatch.setPixmap(_make_pen_swatch(pen))
+                row.addWidget(swatch)
+                chk = QCheckBox("Unmatched fitted peaks")
+                chk.setToolTip(
+                    "Show every fitted peak that is NOT part of any matched "
+                    "structure, in neutral grey, using the matched display "
+                    "style (boxes or markers). Follows the Matched master "
+                    "toggle and the \"Show only tracked peaks\" filter — "
+                    "handy for viewing tracked-but-unmatched peaks as "
+                    "markers alongside the structures."
+                )
+                chk.setChecked(self.viewer.unmatched_visible())
+                chk.toggled.connect(self._on_unmatched_row_toggled)
+                row.addWidget(chk)
+                row.addStretch(1)
+                row_widget = QWidget()
+                row_widget.setLayout(row)
+                lay.addWidget(row_widget)
+                self._unmatched_row_checks.append(chk)
+
+    def _add_matched_empty_label(self, layout) -> None:
+        """Append the "no matched solutions" placeholder to ``layout``.
+        Torn down with the rest of the rows on the next rebuild."""
+        label = QLabel("<i>No matched solutions for this frame.</i>")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+    def _make_matched_struct_row(
+        self, s, pen: dict, frame: int
+    ) -> tuple[QWidget, QCheckBox]:
+        """One legend row (pen swatch + visibility checkbox) for
+        structure ``s``. Called once per legend; the checkbox routes
+        through ``_on_matched_structure_toggled``, which keeps the
+        Display and Expected-pattern twins in sync."""
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        swatch = QLabel()
+        # Mirror the *exact* pen used to render the structure on the
+        # image so the user can map a row to its overlay shape even
+        # when colour repeats — the dashed/dotted swatch flags it.
+        swatch.setPixmap(_make_pen_swatch(pen))
+        row.addWidget(swatch)
+        chk = QCheckBox(s.label)
+        chk.setChecked(self.viewer.matched_visibility(frame, s.unique_id))
+        chk.toggled.connect(
+            lambda v, uid=s.unique_id: self._on_matched_structure_toggled(uid, v)
+        )
+        row.addWidget(chk)
+        row.addStretch(1)
+        row_widget = QWidget()
+        row_widget.setLayout(row)
+        return row_widget, chk
+
+    def _on_unmatched_row_toggled(self, checked: bool) -> None:
+        """"Unmatched fitted peaks" toggle (either legend): mirror the
+        state to the twin checkbox, then forward to the viewer."""
+        for chk in self._unmatched_row_checks:
+            with QSignalBlocker(chk):
+                chk.setChecked(checked)
+        self.viewer.set_unmatched_visible(checked)
 
     def _on_matched_prob_changed(self, value: int) -> None:
         """Slider 0–100 → readable 0.00–1.00 in the side label, then
@@ -9382,10 +9822,13 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_matched_prob_slider"):
             prob_cutoff = self._matched_prob_slider.value() / 100.0
 
-        # Drop a leftover "no filter matches" hint before recomputing.
+        # Drop leftover "no filter matches" hints before recomputing.
         if self._matched_filter_empty_label is not None:
             self._matched_filter_empty_label.deleteLater()
             self._matched_filter_empty_label = None
+        if self._sim_legend_filter_empty_label is not None:
+            self._sim_legend_filter_empty_label.deleteLater()
+            self._sim_legend_filter_empty_label = None
 
         any_visible = False
         hidden_uids: set[str] = set()
@@ -9400,6 +9843,12 @@ class MainWindow(QMainWindow):
             prob_ok = prob >= prob_cutoff - 0.005
             visible = substring_ok and prob_ok
             row_widget.setVisible(visible)
+            # The Expected-pattern twin row follows: a checkbox whose
+            # overlay is filter-hidden would otherwise look like a
+            # no-op over there.
+            twin_row = self._sim_legend_struct_rows.get(uid)
+            if twin_row is not None:
+                twin_row.setVisible(visible)
             if visible:
                 any_visible = True
             else:
@@ -9414,7 +9863,8 @@ class MainWindow(QMainWindow):
 
         # Only show the "no matches" hint when an active filter has
         # zeroed the list — pure "no matched solutions for this
-        # frame" is handled by ``_matched_empty_label`` separately.
+        # frame" is handled by ``_add_matched_empty_label`` in
+        # ``_refresh_matched_panel`` separately.
         filter_active = bool(text) or prob_cutoff > 0.0
         if filter_active and self._matched_struct_rows and not any_visible:
             reasons = []
@@ -9424,14 +9874,22 @@ class MainWindow(QMainWindow):
                 )
             if prob_cutoff > 0.0:
                 reasons.append(f"p ≥ {prob_cutoff:.2f}")
-            self._matched_filter_empty_label = QLabel(
-                f"<i>No structures match {' and '.join(reasons)}.</i>"
-            )
+            hint = f"<i>No structures match {' and '.join(reasons)}.</i>"
+            self._matched_filter_empty_label = QLabel(hint)
             self._matched_filter_empty_label.setWordWrap(True)
             self._matched_struct_layout.addWidget(self._matched_filter_empty_label)
+            self._sim_legend_filter_empty_label = QLabel(hint)
+            self._sim_legend_filter_empty_label.setWordWrap(True)
+            self._sim_legend_struct_layout.addWidget(
+                self._sim_legend_filter_empty_label
+            )
 
     def _on_matched_master_toggled(self, checked: bool) -> None:
         """Master toggles cascade to every per-structure row.
+
+        Connected to BOTH master checkboxes (Display dock and the
+        Expected-pattern twin legend); the first step mirrors the new
+        state to the other master without re-entering this slot.
 
         Unchecking the master now also unchecks every structure
         checkbox; checking it back rechecks them all. The viewer's
@@ -9440,11 +9898,27 @@ class MainWindow(QMainWindow):
         from re-emitting ``toggled`` so the structure-toggled slot
         doesn't interpret the cascade as a user-driven single-show.
         """
+        for master in (
+            self._matched_master_check, self._sim_legend_master_check,
+        ):
+            with QSignalBlocker(master):
+                master.setChecked(checked)
         self.viewer.set_matched_master_visible(checked)
-        for uid, chk in self._matched_struct_checkboxes.items():
-            with QSignalBlocker(chk):
-                chk.setChecked(checked)
+        for uid in list(self._matched_struct_checkboxes):
+            self._set_matched_checkbox_twins(uid, checked)
             self.viewer.set_matched_structure_visible(uid, checked)
+
+    def _set_matched_checkbox_twins(self, uid: str, checked: bool) -> None:
+        """Set the ``uid`` structure checkbox in BOTH legends without
+        re-emitting ``toggled`` (the caller updates the viewer state)."""
+        for checks in (
+            self._matched_struct_checkboxes,
+            self._sim_legend_struct_checkboxes,
+        ):
+            chk = checks.get(uid)
+            if chk is not None:
+                with QSignalBlocker(chk):
+                    chk.setChecked(checked)
 
     def _on_matched_style_changed(self, _index: int) -> None:
         """Switch the matched overlay between boxes and q-map markers."""
@@ -9453,11 +9927,14 @@ class MainWindow(QMainWindow):
         )
 
     def _on_matched_structure_toggled(self, uid: str, checked: bool) -> None:
-        """Per-structure toggle. Promotes a ``check while master is off``
-        click into a "show only this one" view: every other structure is
-        unchecked, the master is auto-ticked (without re-cascading), and
-        only the freshly-checked structure ends up visible.
+        """Per-structure toggle (from either legend). Mirrors the state
+        to the twin checkbox first, then promotes a ``check while master
+        is off`` click into a "show only this one" view: every other
+        structure is unchecked, the master is auto-ticked (without
+        re-cascading), and only the freshly-checked structure ends up
+        visible.
         """
+        self._set_matched_checkbox_twins(uid, checked)
         self.viewer.set_matched_structure_visible(uid, checked)
         if not checked:
             return
@@ -9467,17 +9944,1317 @@ class MainWindow(QMainWindow):
         # Force the others off (both UI + viewer state) before flipping
         # the master ON, since the master toggle would otherwise
         # cascade and re-show every structure.
-        for other_uid, chk in self._matched_struct_checkboxes.items():
+        for other_uid in list(self._matched_struct_checkboxes):
             if other_uid == uid:
                 continue
-            with QSignalBlocker(chk):
-                chk.setChecked(False)
+            self._set_matched_checkbox_twins(other_uid, False)
             self.viewer.set_matched_structure_visible(other_uid, False)
-        with QSignalBlocker(self._matched_master_check):
-            self._matched_master_check.setChecked(True)
+        for master in (
+            self._matched_master_check, self._sim_legend_master_check,
+        ):
+            with QSignalBlocker(master):
+                master.setChecked(True)
         # blockSignals suppressed _on_matched_master_toggled, so call
         # the viewer's master flag directly.
         self.viewer.set_matched_master_visible(True)
+
+    # -- "Expected pattern" simulation overlay (Display-dock section) --
+
+    def _on_cif_cache_changed(self, _obj: object) -> None:
+        """The Pipeline panel's parsed-CIF cache changed (parse result,
+        input edit, session swap). Refresh the section and force a
+        pattern re-apply — even an unchanged (CIF, hkl) selection must
+        re-extract against the new cache object."""
+        self._sim_applied = None
+        self._update_sim_section_state()
+        self._populate_sim_combos()
+
+    def _update_sim_section_state(self) -> None:
+        """Enable the Expected-pattern section only when it can work:
+        matching backend installed, a CifPattern parsed, and a NeXus
+        session active."""
+        panel = getattr(self, "pipeline_panel", None)
+        if panel is None:
+            return
+        if not is_mlgidbase_available():
+            enabled = False
+            tip = "Matching backend (mlgidbase) is not installed."
+        elif panel.cached_cif_pattern() is None:
+            enabled = False
+            tip = "Parse CIFs in the Pipeline tab first."
+        elif self.session is None or self.session.kind == "raw":
+            enabled = False
+            tip = "Open a NeXus file first."
+        else:
+            enabled = True
+            tip = ""
+        self._sim_section_container.setEnabled(enabled)
+        self._sim_section_container.setToolTip(tip)
+
+    def _sim_matched_structures(self) -> list:
+        """Current frame's matched structures (empty when none)."""
+        try:
+            return list(
+                self.viewer.matched_structures(self.viewer.current_frame)
+                or []
+            )
+        except (AttributeError, KeyError):
+            return []
+
+    @staticmethod
+    def _combo_data_index(combo: QComboBox, value) -> int:
+        """Index of ``value`` among the combo's userData, or -1.
+
+        ``QComboBox.findData`` compares wrapped Python objects by
+        identity, so a freshly-built tuple never matches the stored
+        one — compare by equality instead.
+        """
+        if value is None:
+            return -1
+        for i in range(combo.count()):
+            if combo.itemData(i) == value:
+                return i
+        return -1
+
+    def _populate_sim_combos(self) -> None:
+        """Rebuild the CIF combo from the parse cache (preserving the
+        selection by userData), then the orientation combo."""
+        panel = getattr(self, "pipeline_panel", None)
+        cache = panel.cached_cif_pattern() if panel is not None else None
+        prev = self._sim_cif_combo.currentData()
+        matched_stems = {
+            simulation_pattern.cif_stem(s.cif)
+            for s in self._sim_matched_structures()
+        }
+        with QSignalBlocker(self._sim_cif_combo):
+            self._sim_cif_combo.clear()
+            if cache is not None:
+                for name in getattr(cache, "cifs", []) or []:
+                    stem = simulation_pattern.cif_stem(name)
+                    label = stem + (
+                        " — matched" if stem in matched_stems else ""
+                    )
+                    self._sim_cif_combo.addItem(label, userData=stem)
+                idx = self._combo_data_index(self._sim_cif_combo, prev)
+                if idx >= 0:
+                    self._sim_cif_combo.setCurrentIndex(idx)
+        self._populate_sim_orientations()
+
+    def _populate_sim_orientations(self) -> None:
+        """Rebuild the orientation combo for the selected CIF: the
+        current frame's matched (cif, hkl) combos first (labelled with
+        their probability), then 'Powder (rings)', then every
+        symmetry-distinct orientation. Ends by (re-)applying the
+        pattern — a no-op when the effective selection is unchanged."""
+        panel = getattr(self, "pipeline_panel", None)
+        cache = panel.cached_cif_pattern() if panel is not None else None
+        prev = self._sim_orient_combo.currentData()
+        with QSignalBlocker(self._sim_orient_combo):
+            self._sim_orient_combo.clear()
+            stem = self._sim_cif_combo.currentData()
+            if cache is not None and stem is not None:
+                seen: set[tuple] = set()
+                first_matched: int | None = None
+                for s in self._sim_matched_structures():
+                    if simulation_pattern.cif_stem(s.cif) != stem:
+                        continue
+                    hkl = (int(s.h), int(s.k), int(s.l))
+                    if hkl in seen:
+                        continue
+                    seen.add(hkl)
+                    if hkl == simulation_pattern.POWDER_HKL:
+                        base = "Powder (rings)"
+                    else:
+                        base = f"({hkl[0]} {hkl[1]} {hkl[2]})"
+                    self._sim_orient_combo.addItem(
+                        f"{base} — matched p={float(s.probability):.2f}",
+                        userData=hkl,
+                    )
+                    if first_matched is None:
+                        first_matched = self._sim_orient_combo.count() - 1
+                if simulation_pattern.POWDER_HKL not in seen:
+                    self._sim_orient_combo.addItem(
+                        "Powder (rings)",
+                        userData=simulation_pattern.POWDER_HKL,
+                    )
+                ci = simulation_pattern.cif_index(cache, stem)
+                if ci is not None:
+                    try:
+                        orients = simulation_pattern.list_orientations(
+                            cache, ci
+                        )
+                    except (AttributeError, IndexError, TypeError):
+                        orients = []
+                    for hkl in orients:
+                        if hkl in seen:
+                            continue
+                        self._sim_orient_combo.addItem(
+                            f"({hkl[0]} {hkl[1]} {hkl[2]})", userData=hkl
+                        )
+                # Restore the previous choice; else default to the
+                # first matched entry, else powder.
+                idx = self._combo_data_index(self._sim_orient_combo, prev)
+                if idx < 0 and first_matched is not None:
+                    idx = first_matched
+                if idx < 0:
+                    idx = self._combo_data_index(
+                        self._sim_orient_combo,
+                        simulation_pattern.POWDER_HKL,
+                    )
+                if idx >= 0:
+                    self._sim_orient_combo.setCurrentIndex(idx)
+        self._apply_sim_pattern()
+
+    def _refresh_sim_matched_entries(self, _frame: int, _structures: list) -> None:
+        """The frame's matched set changed (frame change, re-match,
+        fresh load) — refresh the '— matched' labels and ordering.
+        Selection is preserved by userData and ``_apply_sim_pattern``
+        no-ops on an unchanged choice, so plain frame changes never
+        drop the overlay or its reflection selection."""
+        # Frame changes alter the Add button's dataset guard even when
+        # no CIF cache exists yet.
+        self._update_sim_add_button()
+        panel = getattr(self, "pipeline_panel", None)
+        if panel is None or panel.cached_cif_pattern() is None:
+            return
+        self._populate_sim_combos()
+
+    def _on_sim_master_toggled(self, checked: bool) -> None:
+        self.viewer.set_simulation_visible(checked)
+        # Extract lazily on first enable; drop the pattern when the
+        # section is unticked so nothing stale lingers invisibly.
+        self._apply_sim_pattern()
+
+    def _on_sim_cif_changed(self, _index: int) -> None:
+        self._populate_sim_orientations()
+
+    def _on_sim_orient_changed(self, _index: int) -> None:
+        self._apply_sim_pattern()
+
+    def _on_sim_int_spin_changed(self, value: float) -> None:
+        """Cutoff edited (typed or stepped): apply it as a fraction."""
+        self.viewer.set_simulation_min_intensity(float(value) / 100.0)
+
+    def _on_sim_selection_changed(self, indices: list) -> None:
+        self._sim_sel_count_label.setText(f"{len(indices)} selected")
+        self._update_sim_add_button()
+
+    def _update_sim_add_button(self) -> None:
+        """Enable state + tooltip of "Add selected peaks (fit + match)".
+
+        Cheap by construction: reads the viewer's already-loaded frame
+        tables instead of the file, so it can run on every selection /
+        frame change.
+        """
+        btn = getattr(self, "_sim_add_btn", None)
+        if btn is None:
+            return
+        selected = self.viewer.simulation_selected()
+        tables = (
+            self.viewer._frame_peaks.get(self.viewer.current_frame) or {}
+        )
+        has_datasets = (
+            tables.get("detected") is not None
+            and tables.get("fitted") is not None
+        )
+        busy = (
+            getattr(self, "_pipe_thread", None) is not None
+            or bool(getattr(self, "_pipeline_queue", None))
+        )
+        if not selected:
+            enabled = False
+            tip = (
+                "Select predicted reflections first — click markers on "
+                "the image or use Select missed."
+            )
+        elif not has_datasets:
+            enabled = False
+            tip = "Run detection + fitting on this frame first."
+        elif busy:
+            enabled = False
+            tip = "The pipeline is busy — wait for the current run."
+        else:
+            enabled = True
+            tip = (
+                "Inject a detected box at each selected predicted "
+                "position, 2D-fit it, then re-match this frame so the "
+                "new peaks join the matched solutions. Not undoable — "
+                "re-run Detection/Fitting/Matching to reset."
+            )
+        btn.setEnabled(enabled)
+        btn.setToolTip(tip)
+        # The all-frames sweep needs no selection and no per-frame
+        # datasets up front (it plans per frame itself) — only an idle
+        # pipeline.
+        sweep = getattr(self, "_sim_sweep_btn", None)
+        if sweep is not None:
+            sweep.setEnabled(not busy)
+            sweep.setToolTip(
+                "The pipeline is busy — wait for the current run."
+                if busy else
+                "Collect every matched structure/orientation found "
+                "anywhere in this entry, then try to find its expected "
+                "peaks on EVERY frame: missing ones are injected as "
+                "detected boxes, 2D-fitted and re-matched; injected "
+                "peaks the matcher does not attribute to one of those "
+                "structures are discarded again. Not undoable — re-run "
+                "Detection/Fitting/Matching to reset."
+            )
+
+    def _ask_predicted_add_options(
+        self, pattern, frame: int, n_frames: int,
+    ) -> dict | None:
+        """Options dialog for adding predicted peaks: re-match scope,
+        frame range and a reflection cap. Returns
+        ``{"scope": "restricted"|"full"|"custom",
+        "cifs": set[str] | None, "frames": (lo, hi), "cap": int}`` or
+        None (cancelled). ``cifs`` carries the chosen stems for the
+        custom scope — they double as the validation accept-set (a
+        peak kept only when matched by one of them); ``cap`` keeps at
+        most the N strongest selected reflections as the template."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Expected pattern")
+        v = QVBoxLayout(dlg)
+        intro = QLabel(
+            "The selected reflections are injected as detected boxes, "
+            "2D-fitted, then each affected frame is re-matched. Peaks "
+            "the matcher does not attribute to the target structure "
+            f"('{pattern.cif}' — or any chosen CIF below) are "
+            "discarded again afterwards; matched ones keep their "
+            "detected + fitted rows for review.\n\n"
+            "Positions already holding a fitted peak get no duplicate "
+            "box — the frame is only re-matched so that peak can be "
+            "claimed; positions already matched to the target "
+            "structure(s) are skipped. The written peaks are not "
+            "undoable — re-run Detection/Fitting/Matching to reset."
+        )
+        intro.setWordWrap(True)
+        v.addWidget(intro)
+
+        v.addWidget(QLabel("Re-match scope:"))
+        rb_restricted = QRadioButton(
+            f"Matched CIFs + '{pattern.cif}' (fast, keeps existing "
+            "solutions)"
+        )
+        rb_full = QRadioButton(
+            "Full CIF source (can discover new structures, slower)"
+        )
+        rb_custom = QRadioButton(
+            "Specific CIFs (match ONLY the checked structures; "
+            "existing identifications are kept):"
+        )
+        rb_restricted.setChecked(True)
+        v.addWidget(rb_restricted)
+        v.addWidget(rb_full)
+        v.addWidget(rb_custom)
+        cif_list = QListWidget(dlg)
+        cif_list.setMaximumHeight(140)
+        cache = self.pipeline_panel.cached_cif_pattern()
+        for name in getattr(cache, "cifs", []) or []:
+            stem = simulation_pattern.cif_stem(name)
+            item = QListWidgetItem(stem)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if stem == pattern.cif
+                else Qt.CheckState.Unchecked
+            )
+            cif_list.addItem(item)
+        cif_list.setEnabled(False)
+        rb_custom.toggled.connect(cif_list.setEnabled)
+        v.addWidget(cif_list)
+
+        frames_row = QHBoxLayout()
+        frames_row.addWidget(QLabel("Frames:"))
+        spin_from = QSpinBox(dlg)
+        spin_from.setRange(0, max(0, n_frames - 1))
+        spin_from.setValue(int(frame))
+        frames_row.addWidget(spin_from)
+        frames_row.addWidget(QLabel("to"))
+        spin_to = QSpinBox(dlg)
+        spin_to.setRange(0, max(0, n_frames - 1))
+        spin_to.setValue(int(frame))
+        frames_row.addWidget(spin_to)
+        btn_active = QPushButton("Active frame")
+        btn_active.setToolTip("Only the currently shown frame.")
+        frames_row.addWidget(btn_active)
+        btn_all = QPushButton("All")
+        btn_all.setToolTip("Every frame of the scan.")
+        frames_row.addWidget(btn_all)
+        frames_row.addStretch(1)
+        v.addLayout(frames_row)
+
+        def _set_range(lo: int, hi: int) -> None:
+            spin_from.setValue(lo)
+            spin_to.setValue(hi)
+
+        btn_active.clicked.connect(lambda: _set_range(frame, frame))
+        btn_all.clicked.connect(lambda: _set_range(0, max(0, n_frames - 1)))
+
+        # Scale limiter, same idea as the sweep dialog's per-structure
+        # caps: only the N strongest of the selected reflections are
+        # used as the template (each injected box costs a 2D fit per
+        # frame and every extra peak slows the re-match).
+        n_sel = len(self.viewer.simulation_selected())
+        cap_row = QHBoxLayout()
+        cap_row.addWidget(QLabel("Add at most"))
+        spin_cap = QSpinBox(dlg)
+        spin_cap.setRange(1, max(1, n_sel))
+        spin_cap.setValue(min(10, max(1, n_sel)))
+        cap_row.addWidget(spin_cap)
+        cap_row.addWidget(QLabel(
+            f"of the {n_sel} selected reflection(s), strongest first"
+        ))
+        cap_row.addStretch(1)
+        v.addLayout(cap_row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=dlg,
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        v.addWidget(buttons)
+
+        while True:
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return None
+            if not rb_custom.isChecked():
+                cifs = None
+                scope = "restricted" if rb_restricted.isChecked() else "full"
+                break
+            cifs = {
+                cif_list.item(i).text()
+                for i in range(cif_list.count())
+                if cif_list.item(i).checkState() == Qt.CheckState.Checked
+            }
+            if cifs:
+                scope = "custom"
+                break
+            QMessageBox.information(
+                dlg, "Expected pattern",
+                "Check at least one CIF for the specific-CIFs scope.",
+            )
+        lo, hi = sorted((int(spin_from.value()), int(spin_to.value())))
+        return {
+            "scope": scope,
+            "cifs": cifs,
+            "frames": (lo, hi),
+            "cap": int(spin_cap.value()),
+        }
+
+    def _plan_predicted_fills(
+        self, entry: str, pattern, reflections, f_lo: int, f_hi: int,
+        accept_stems: set,
+    ) -> tuple[dict, dict, dict, list]:
+        """Per-frame injection specs for the template ``reflections``.
+
+        For every frame in ``[f_lo, f_hi]`` each reflection is judged
+        twice (matched boxes are always a SUBSET of fitted boxes, so
+        explained implies covered):
+
+        - not covered by ANY fitted box → inject a detected box there
+          (this is the only duplicate-avoidance gate);
+        - covered but not explained by a matched box of an
+          ``accept_stems`` structure → no new box, but the frame gets
+          a re-match pass so the unclaimed fitted peak sitting at the
+          predicted position can be attributed.
+
+        Frames without detected/fitted datasets are skipped whole. Box
+        sizes seed from each frame's own median fitted box. Returns
+        ``(plan, match_need, frame_cifs, skipped_frames)`` where
+        ``match_need`` maps each frame needing a re-match to the peaks
+        types involved ("segments"/"rings") and ``frame_cifs`` maps
+        those frames to the CIF stems already matched there (the
+        restricted re-match set must carry them — matching rewrites
+        the frame's solutions wholesale).
+        """
+        import h5py
+
+        accept = {simulation_pattern.cif_stem(c) for c in accept_stems}
+        plan: dict[int, list] = {}
+        match_need: dict[int, set] = {}
+        frame_cifs: dict[int, set] = {}
+        skipped: list[int] = []
+        with h5py.File(self.session.temp_path, "r") as f:
+            for fr in range(int(f_lo), int(f_hi) + 1):
+                tables = file_model.read_peaks(f, entry, fr)
+                fitted = tables.get("fitted")
+                if tables.get("detected") is None or fitted is None:
+                    skipped.append(fr)
+                    continue
+                structures = file_model.read_matched_peaks(
+                    f, entry, fr, fitted
+                )
+                matched_boxes = simulation_pattern.merge_boxes([
+                    s.peaks for s in structures
+                    if simulation_pattern.cif_stem(s.cif) in accept
+                ])
+                # The seed size doubles as the coverage-recognition
+                # floor: a peak inside the box we WOULD inject means
+                # the reflection is already accounted for there.
+                rw, aw = simulation_pattern.default_box_size(fitted)
+                explained = simulation_pattern.classify_explained(
+                    reflections, matched_boxes,
+                    seed_radius_width=rw, seed_angle_width=aw,
+                )
+                covered = simulation_pattern.classify_explained(
+                    reflections, fitted,
+                    seed_radius_width=rw, seed_angle_width=aw,
+                )
+                todo = []
+                need: set[str] = set()
+                for r, e, c in zip(reflections, explained, covered):
+                    if e:
+                        continue
+                    if not c:
+                        todo.append(r)
+                    need.add("rings" if r.is_ring else "segments")
+                if todo:
+                    plan[fr] = simulation_pattern.build_injection_specs(
+                        pattern, [r.index for r in todo], rw, aw
+                    )
+                if need:
+                    match_need[fr] = need
+                    frame_cifs[fr] = {
+                        simulation_pattern.cif_stem(s.cif)
+                        for s in structures
+                    }
+        return plan, match_need, frame_cifs, skipped
+
+    def _build_predicted_match_commands(
+        self, match_need: dict, frame_cifs: dict, entry: str,
+        match_kwargs: dict, pattern, scope: str,
+        custom_cifs: set | None = None,
+    ) -> list:
+        """Re-match command(s) chained after ``inject_fitted_peaks``.
+
+        ``match_need`` maps frame → peaks types to re-match there
+        (segments and rings run separately — mlgidmatch matches one
+        ``peaks_type`` per run); it covers both freshly injected
+        boxes and predicted positions already holding an unclaimed
+        fitted peak. ``scope == "restricted"`` subsets the raw CIF
+        source per frame to its already-matched CIFs plus the
+        overlay's CIF; ``scope == "custom"`` subsets it to EXACTLY
+        the user-chosen ``custom_cifs`` — no frame CIFs ride along
+        (``pattern`` may be None then — the all-frames sweep has no
+        single overlay structure). Matching still rewrites the
+        frame's ``matched_<type>_*`` wholesale, but identifications
+        a narrow source cannot reproduce are restored by the
+        finalize snapshot merge-back, so a custom scope never loses
+        them. Frames sharing the same (type, CIF-set) collapse into
+        one command with a ``frame_num`` list. Unlike the
+        interpolate chain — which SKIPS unsubsettable sources — an
+        unsubsettable source falls back to the FULL source with a
+        log note: the user explicitly asked for these peaks, so a
+        match must always run.
+        """
+        raw_source = self.pipeline_panel.cif_source_text()
+        if not raw_source and isinstance(match_kwargs.get("cif_prepr"), str):
+            raw_source = match_kwargs["cif_prepr"]
+
+        groups: dict = {}  # (peaks_type, frozenset | None) -> [frames]
+        for fr, types in match_need.items():
+            for peaks_type in types:
+                key = None
+                if scope == "restricted":
+                    key = frozenset(
+                        {pattern.cif} | frame_cifs.get(int(fr), set())
+                    )
+                elif scope == "custom":
+                    key = frozenset(custom_cifs or {pattern.cif})
+                groups.setdefault((peaks_type, key), []).append(int(fr))
+
+        cmds: list = []
+        fell_back = False
+        for (peaks_type, key), frames in sorted(
+            groups.items(), key=lambda kv: (kv[0][0], min(kv[1]))
+        ):
+            restricted_value = None
+            if key is not None:
+                restricted_value = self._restrict_cif_source(
+                    raw_source, set(key)
+                )
+                if restricted_value is None:
+                    fell_back = True
+            kw = {
+                **match_kwargs,
+                "entry": entry,
+                "frame_num": sorted(set(frames)),
+                "peaks_type": peaks_type,
+            }
+            if restricted_value is not None:
+                kw["cif_prepr"] = restricted_value
+            cmds.append(PipelineCommand("run_matching", kw))
+        if fell_back:
+            self.pipeline_panel.append_log(
+                "Expected pattern: the CIF source cannot be subset "
+                "(pickle / pre-parsed object / missing .cif files) "
+                "— re-matching with the FULL source instead."
+            )
+        return cmds
+
+    def _on_add_predicted_peaks(self) -> None:
+        """Turn the selected predicted reflections into real peaks.
+
+        The selection acts as a TEMPLATE over the frame range chosen
+        in the options dialog: per frame, only the reflections not
+        already covered by a fitted peak there are injected; positions
+        holding an unclaimed fitted peak get a re-match pass instead
+        of a duplicate box (``_plan_predicted_fills``). Enqueues one
+        ``inject_fitted_peaks`` command (inject detected box, 2D-fit,
+        persist fitted row — per box) when anything needs injecting,
+        followed by ``run_matching`` command(s) grouped per
+        (peaks type, CIF set). When the chain completes,
+        ``_finalize_predicted_fill`` keeps only the injected peaks the
+        matcher attributed to the target structure — the rest lose
+        their fitted AND detected rows again.
+        """
+        if (
+            self.session is None
+            or self._pipe_thread is not None
+            or self._pipeline_queue
+            or self._view_worker_blocks_pipeline()
+        ):
+            return
+        entry = self.entry_combo.currentText()
+        pattern = self.viewer.simulation_pattern()
+        selected = self.viewer.simulation_selected()
+        if not entry or pattern is None or not selected:
+            return
+        frame = int(self.viewer.current_frame)
+        if file_model.read_geometry_for_entry(
+            self.session.temp_path, entry, frame
+        ) is None:
+            QMessageBox.warning(
+                self, "Expected pattern",
+                "This entry has no instrument geometry (wavelength / "
+                "incidence angle) — the 2D fit cannot run.",
+            )
+            return
+        match_kwargs = self.pipeline_panel.matching_kwargs()
+        if match_kwargs is None:
+            QMessageBox.warning(
+                self, "Expected pattern",
+                "Adding predicted peaks ends with a re-match of the "
+                "affected frames, but no CIF source is configured. Set "
+                "the CIF file/folder (or pickle) in the Pipeline "
+                "panel's Matching section first.",
+            )
+            return
+        options = self._ask_predicted_add_options(
+            pattern, frame, self.viewer.n_frames
+        )
+        if options is None:
+            return
+        f_lo, f_hi = options["frames"]
+        reflections = [
+            pattern.reflections[i] for i in selected
+            if 0 <= i < len(pattern.reflections)
+        ]
+        # The dialog's cap: keep the N strongest selected reflections
+        # (stubbed dialogs may omit it — then everything selected runs).
+        cap = options.get("cap")
+        if cap is not None and len(reflections) > int(cap):
+            reflections = sorted(
+                reflections, key=lambda r: r.rel_intensity, reverse=True,
+            )[: int(cap)]
+        # "accept" is the set of CIF stems whose solutions validate an
+        # injected peak (and whose matched boxes count as "explained"
+        # during planning): the overlay's structure, or the user's
+        # picks for the specific-CIFs scope.
+        accept = (
+            set(options["cifs"]) if options.get("cifs")
+            else {pattern.cif}
+        )
+        plan, match_need, frame_cifs, skipped = self._plan_predicted_fills(
+            entry, pattern, reflections, f_lo, f_hi, accept
+        )
+        if skipped:
+            self.pipeline_panel.append_log(
+                "Expected pattern: skipping frame(s) without "
+                f"detected/fitted datasets: {skipped} — run Detection "
+                "and Fitting there first."
+            )
+        if not match_need:
+            self.statusBar().showMessage(
+                "Expected pattern: nothing to do — every selected "
+                "reflection is already matched to the target "
+                "structure(s) on the chosen frames (or the frames "
+                "lack detection/fitting).", 8000,
+            )
+            return
+        commands = []
+        ticks = {}
+        if plan:
+            inject_cmd = PipelineCommand("inject_fitted_peaks", {
+                "entry": entry,
+                "plan": plan,
+                "fit_params": self._panel_fit_params(),
+            })
+            commands.append(inject_cmd)
+            ticks[id(inject_cmd)] = len(plan)
+        match_cmds = self._build_predicted_match_commands(
+            match_need, frame_cifs, entry, match_kwargs, pattern,
+            options["scope"], options.get("cifs"),
+        )
+        self._interp_fill_result = None
+        # Validation stash consumed by _finalize_predicted_fill on
+        # chain completion; "records" lands when the inject command
+        # finishes (stays None on a re-match-only run — pre-existing
+        # peaks are never rolled back), "match_ok" drops on any
+        # re-match error (then the rollback is skipped — better
+        # unvalidated peaks than peaks discarded for a crash that
+        # wasn't theirs). "snapshot" holds each affected frame's
+        # matched solutions as they are NOW: the re-match rewrites
+        # them from scratch and may fail to reproduce an existing
+        # identification — those are merged back at finalize.
+        self._predicted_fill = {
+            "entry": entry,
+            "cif": pattern.cif,
+            "accept": accept,
+            "records": None,
+            "match_ok": True,
+            "snapshot": self._matched_snapshot(entry, match_need),
+        }
+        self._entry_queue_total = 1
+        self._entry_queue_pos = 0
+        commands += match_cmds
+        for cmd in match_cmds:
+            ticks[id(cmd)] = len(cmd.kwargs.get("frame_num") or []) or 1
+        self._interp_chain = {
+            "commands": commands,
+            "ticks": ticks,
+            "total": max(1, sum(ticks.values())),
+            "base": 0,
+            "label": "Expected pattern",
+        }
+        n_boxes = sum(len(v) for v in plan.values())
+        rematch_only = sorted(set(match_need) - set(plan))
+        self.pipeline_panel.append_log(
+            f"Expected pattern: adding {n_boxes} predicted box(es) of "
+            f"{pattern.cif} across {len(plan)} frame(s) "
+            f"[{f_lo}–{f_hi}] of {entry}…"
+        )
+        if rematch_only:
+            self.pipeline_panel.append_log(
+                "Expected pattern: re-match only on frame(s) "
+                f"{rematch_only} — the predicted positions already "
+                "hold fitted peaks not yet attributed to the target "
+                "structure(s); no duplicate boxes injected."
+            )
+        self._show_tracking_progress(
+            "Expected pattern: fitting injected boxes…", manual=True,
+        )
+        for cmd in commands:
+            self._enqueue_pipeline(self.session.temp_path, cmd)
+        self._update_sim_add_button()
+
+    def _matched_snapshot(self, entry: str, frames) -> dict:
+        """Raw matched datasets of ``frames``, captured before their
+        re-match (merged back at finalize — see
+        ``_finalize_predicted_fill``). Never raises: a snapshot
+        failure must not block the add itself."""
+        try:
+            return file_model.read_matched_raw(
+                self.session.temp_path, entry, sorted(frames)
+            )
+        except Exception:
+            logger.debug(
+                "suppressed exception snapshotting matched data",
+                exc_info=True,
+            )
+            return {}
+
+    def _collect_matched_combos(
+        self, entry: str,
+    ) -> tuple[list, list, int]:
+        """Every matched (CIF, orientation) combo anywhere in ``entry``,
+        resolved against the parsed CIF cache.
+
+        Returns ``(targets, uncomputable, n_ready)``: each target is a
+        dict with ``stem`` / ``hkl`` / ``label`` / ``pattern`` /
+        ``reflections`` (the expected pattern cut to the section's
+        min-intensity threshold and the data's q-range, sorted by
+        relative intensity descending — the confirmation dialog's
+        per-structure caps truncate it); combos whose CIF is missing
+        from the cache or whose orientation was not precomputed land in
+        ``uncomputable`` as human-readable strings; ``n_ready`` counts
+        the frames with detected+fitted datasets (the ones the sweep
+        can plan on — used for the dialog's workload estimate).
+        """
+        import h5py
+
+        cache = self.pipeline_panel.cached_cif_pattern()
+        combos: dict[tuple, None] = {}  # insertion-ordered dedupe
+        n_ready = 0
+        with h5py.File(self.session.temp_path, "r") as f:
+            for fr in range(int(self.viewer.n_frames)):
+                tables = file_model.read_peaks(f, entry, fr)
+                fitted = tables.get("fitted")
+                if fitted is None:
+                    continue
+                if tables.get("detected") is not None:
+                    n_ready += 1
+                for s in file_model.read_matched_peaks(f, entry, fr, fitted):
+                    stem = simulation_pattern.cif_stem(s.cif)
+                    hkl = (int(s.h), int(s.k), int(s.l))
+                    combos.setdefault((stem, hkl))
+        targets: list[dict] = []
+        uncomputable: list[str] = []
+        cutoff = float(self._sim_int_spin.value()) / 100.0
+        q_max = self.viewer._sim_q_max()
+        for stem, hkl in combos:
+            label = f"{stem} " + (
+                "powder" if hkl == simulation_pattern.POWDER_HKL
+                else "({} {} {})".format(*hkl)
+            )
+            idx = simulation_pattern.cif_index(cache, stem)
+            if idx is None:
+                uncomputable.append(
+                    f"{label} — not in the parsed CIF cache"
+                )
+                continue
+            try:
+                pattern = simulation_pattern.extract_pattern(
+                    cache, idx,
+                    None if hkl == simulation_pattern.POWDER_HKL else hkl,
+                )
+            except ValueError as exc:
+                uncomputable.append(f"{label} — {exc}")
+                continue
+            reflections = [
+                r for r in pattern.reflections
+                if r.rel_intensity >= cutoff
+                and not (
+                    r.is_ring and q_max is not None and r.radius > q_max
+                )
+            ]
+            if not reflections:
+                uncomputable.append(
+                    f"{label} — no reflections above the intensity cutoff"
+                )
+                continue
+            # Strongest first, so a per-structure cap is a simple
+            # truncation (chosen in the sweep's confirmation dialog).
+            reflections = sorted(
+                reflections, key=lambda r: r.rel_intensity, reverse=True,
+            )
+            targets.append({
+                "stem": stem, "hkl": hkl, "label": label,
+                "pattern": pattern, "reflections": reflections,
+            })
+        return targets, uncomputable, n_ready
+
+    def _confirm_matched_sweep(
+        self, targets: list, uncomputable: list, n_frames: int,
+        n_ready: int,
+    ) -> list[int] | None:
+        """Configuration/confirmation dialog for the all-frames sweep.
+
+        One spinbox per found structure chooses how many of ITS
+        strongest predicted reflections (candidate count shown, the
+        spinbox upper bound) to look for on every frame, with a live
+        upper-bound estimate of the injected-box workload. Returns the
+        caps aligned with ``targets``, or None (cancelled). Separate
+        method so tests can stub the answer.
+        """
+        cutoff = float(self._sim_int_spin.value())
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Expected pattern")
+        v = QVBoxLayout(dlg)
+        intro = QLabel(
+            "Try to find the expected peaks of every matched structure "
+            f"on all {n_frames} frames of this entry. Per structure, "
+            "choose how many of its strongest predicted reflections "
+            f"(above {cutoff:g} % relative intensity) to look for; "
+            "each missing one is injected as a detected box and "
+            "2D-fitted, then every affected frame is re-matched. "
+            "Injected peaks the matcher does not attribute to one of "
+            "these structures are discarded again afterwards, and "
+            "structures already matched are kept even when the "
+            "re-match fails to reproduce them. The written peaks are "
+            "not undoable — re-run Detection/Fitting/Matching to "
+            "reset."
+        )
+        intro.setWordWrap(True)
+        v.addWidget(intro)
+
+        spins: list[QSpinBox] = []
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 6, 0, 6)
+        grid.setHorizontalSpacing(8)
+        for row, t in enumerate(targets):
+            n_cand = len(t["reflections"])
+            grid.addWidget(
+                QLabel(f"{t['label']} — {n_cand} candidate(s)"), row, 0,
+            )
+            spin = QSpinBox(dlg)
+            spin.setRange(1, n_cand)
+            spin.setValue(min(10, n_cand))
+            spin.setSuffix(" refl")
+            spins.append(spin)
+            grid.addWidget(spin, row, 1)
+        grid.setColumnStretch(0, 1)
+        v.addLayout(grid)
+
+        estimate = QLabel()
+        estimate.setWordWrap(True)
+
+        def _update_estimate() -> None:
+            total = sum(s.value() for s in spins) * max(1, n_ready)
+            estimate.setText(
+                f"Workload upper bound: {total} injected box(es) — one "
+                f"2D fit each — across {n_ready} frame(s) with "
+                "detection + fitting, plus their re-match. Positions "
+                "already fitted are skipped, so the real count is "
+                "usually lower; matching can still take a while on "
+                "large scans."
+            )
+
+        for s in spins:
+            s.valueChanged.connect(_update_estimate)
+        _update_estimate()
+        v.addWidget(estimate)
+
+        if uncomputable:
+            note = QLabel(
+                "Skipped (cannot simulate):\n- " + "\n- ".join(uncomputable)
+            )
+            note.setWordWrap(True)
+            v.addWidget(note)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dlg,
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        v.addWidget(buttons)
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        return [int(s.value()) for s in spins]
+
+    def _plan_matched_sweep(
+        self, entry: str, targets: list,
+    ) -> tuple[dict, dict, dict, list]:
+        """Sweep planner: apply every target combo to every frame.
+
+        Same per-reflection rules as ``_plan_predicted_fills`` — inject
+        when no fitted box covers the position, re-match when a fitted
+        box covers it but no matched box of the combo's OWN CIF does —
+        except that each combo is judged against its own phase and
+        boxes already queued for the frame by earlier combos count as
+        coverage (two structures predicting the same position must not
+        produce two boxes). Returns
+        ``(plan, match_need, frame_cifs, skipped_frames)``.
+        """
+        import h5py
+
+        plan: dict[int, list] = {}
+        match_need: dict[int, set] = {}
+        frame_cifs: dict[int, set] = {}
+        skipped: list[int] = []
+        with h5py.File(self.session.temp_path, "r") as f:
+            for fr in range(int(self.viewer.n_frames)):
+                tables = file_model.read_peaks(f, entry, fr)
+                fitted = tables.get("fitted")
+                if tables.get("detected") is None or fitted is None:
+                    skipped.append(fr)
+                    continue
+                structures = file_model.read_matched_peaks(
+                    f, entry, fr, fitted
+                )
+                rw, aw = simulation_pattern.default_box_size(fitted)
+                specs: list[dict] = []
+                need: set[str] = set()
+                for t in targets:
+                    matched_boxes = simulation_pattern.merge_boxes([
+                        s.peaks for s in structures
+                        if simulation_pattern.cif_stem(s.cif) == t["stem"]
+                    ])
+                    explained = simulation_pattern.classify_explained(
+                        t["reflections"], matched_boxes,
+                        seed_radius_width=rw, seed_angle_width=aw,
+                    )
+                    covered = simulation_pattern.classify_explained(
+                        t["reflections"], fitted,
+                        seed_radius_width=rw, seed_angle_width=aw,
+                    ) | simulation_pattern.classify_explained(
+                        t["reflections"],
+                        simulation_pattern.specs_to_boxes(specs),
+                        seed_radius_width=rw, seed_angle_width=aw,
+                    )
+                    todo = []
+                    for r, e, c in zip(t["reflections"], explained, covered):
+                        if e:
+                            continue
+                        if not c:
+                            todo.append(r)
+                        need.add("rings" if r.is_ring else "segments")
+                    if todo:
+                        specs.extend(
+                            simulation_pattern.build_injection_specs(
+                                t["pattern"], [r.index for r in todo],
+                                rw, aw,
+                            )
+                        )
+                if specs:
+                    plan[fr] = specs
+                if need:
+                    match_need[fr] = need
+                    frame_cifs[fr] = {
+                        simulation_pattern.cif_stem(s.cif)
+                        for s in structures
+                    }
+        return plan, match_need, frame_cifs, skipped
+
+    def _on_fill_all_matched(self) -> None:
+        """All-frames structure sweep: collect every matched
+        (CIF, orientation) combo in the entry and try to find its
+        expected peaks on EVERY frame — inject the missing ones as
+        detected boxes, 2D-fit, re-match. The standard validation
+        applies at chain completion: injected peaks not matched to one
+        of the swept structures lose their fitted and detected rows
+        again; matched ones keep both for review.
+        """
+        if (
+            self.session is None
+            or self._pipe_thread is not None
+            or self._pipeline_queue
+            or self._view_worker_blocks_pipeline()
+        ):
+            return
+        entry = self.entry_combo.currentText()
+        panel = self.pipeline_panel
+        if not entry or panel.cached_cif_pattern() is None:
+            return
+        if file_model.read_geometry_for_entry(
+            self.session.temp_path, entry, int(self.viewer.current_frame)
+        ) is None:
+            QMessageBox.warning(
+                self, "Expected pattern",
+                "This entry has no instrument geometry (wavelength / "
+                "incidence angle) — the 2D fit cannot run.",
+            )
+            return
+        match_kwargs = panel.matching_kwargs()
+        if match_kwargs is None:
+            QMessageBox.warning(
+                self, "Expected pattern",
+                "The structure sweep ends with a re-match of the "
+                "affected frames, but no CIF source is configured. Set "
+                "the CIF file/folder (or pickle) in the Pipeline "
+                "panel's Matching section first.",
+            )
+            return
+        targets, uncomputable, n_ready = self._collect_matched_combos(entry)
+        if uncomputable:
+            panel.append_log(
+                "Expected pattern: cannot simulate matched "
+                "structure(s): " + "; ".join(uncomputable)
+            )
+        if not targets:
+            self.statusBar().showMessage(
+                "Expected pattern: no matched structures found in this "
+                "entry (or none can be simulated from the parsed CIF "
+                "cache).", 8000,
+            )
+            return
+        n_frames = int(self.viewer.n_frames)
+        caps = self._confirm_matched_sweep(
+            targets, uncomputable, n_frames, n_ready
+        )
+        if caps is None:
+            return
+        # Per-structure caps: candidates are pre-sorted strongest-first.
+        for t, cap in zip(targets, caps):
+            t["reflections"] = t["reflections"][: max(1, int(cap))]
+        plan, match_need, frame_cifs, skipped = self._plan_matched_sweep(
+            entry, targets
+        )
+        if skipped:
+            panel.append_log(
+                "Expected pattern: skipping frame(s) without "
+                f"detected/fitted datasets: {skipped} — run Detection "
+                "and Fitting there first."
+            )
+        if not match_need:
+            self.statusBar().showMessage(
+                "Expected pattern: nothing to do — every expected peak "
+                "of the matched structures is already matched on its "
+                "frame.", 8000,
+            )
+            return
+        n_boxes = sum(len(v) for v in plan.values())
+        rematch_only = sorted(set(match_need) - set(plan))
+        accept = {t["stem"] for t in targets}
+        commands: list = []
+        ticks: dict = {}
+        if plan:
+            inject_cmd = PipelineCommand("inject_fitted_peaks", {
+                "entry": entry,
+                "plan": plan,
+                "fit_params": self._panel_fit_params(),
+            })
+            commands.append(inject_cmd)
+            ticks[id(inject_cmd)] = len(plan)
+        match_cmds = self._build_predicted_match_commands(
+            match_need, frame_cifs, entry, match_kwargs,
+            None, "custom", accept,
+        )
+        self._interp_fill_result = None
+        self._predicted_fill = {
+            "entry": entry,
+            "cif": "/".join(sorted(accept)),
+            "accept": accept,
+            "records": None,
+            "match_ok": True,
+            "snapshot": self._matched_snapshot(entry, match_need),
+        }
+        self._entry_queue_total = 1
+        self._entry_queue_pos = 0
+        commands += match_cmds
+        for cmd in match_cmds:
+            ticks[id(cmd)] = len(cmd.kwargs.get("frame_num") or []) or 1
+        self._interp_chain = {
+            "commands": commands,
+            "ticks": ticks,
+            "total": max(1, sum(ticks.values())),
+            "base": 0,
+            "label": "Expected pattern",
+        }
+        panel.append_log(
+            f"Expected pattern: sweeping {len(targets)} matched "
+            f"structure(s) ({', '.join(t['label'] for t in targets)}) "
+            f"over {n_frames} frame(s) of {entry} — adding {n_boxes} "
+            f"predicted box(es) on {len(plan)} frame(s)…"
+        )
+        if rematch_only:
+            panel.append_log(
+                "Expected pattern: re-match only on frame(s) "
+                f"{rematch_only} — the predicted positions already "
+                "hold fitted peaks not yet attributed to the swept "
+                "structure(s); no duplicate boxes injected."
+            )
+        self._show_tracking_progress(
+            "Expected pattern: fitting injected boxes…", manual=True,
+        )
+        for cmd in commands:
+            self._enqueue_pipeline(self.session.temp_path, cmd)
+        self._update_sim_add_button()
+
+    def _finalize_predicted_fill(self) -> None:
+        """Post-match validation of injected predicted peaks.
+
+        A peak earns its keep by appearing in a matched solution of
+        an ACCEPTED structure on its frame (same CIF, any orientation
+        — the matcher may attribute the peak to a different texture
+        of the same phase). The accept-set is the overlay's target
+        CIF, the user's picks under the specific-CIFs scope, or every
+        swept structure for the all-frames sweep. Everything else is
+        rolled back: fitted row deleted, ``matched_*`` peak_list
+        positions remapped (they index fitted rows positionally),
+        detected row deleted. Afterwards the pre-run matched snapshot
+        is union-merged back so identifications the re-match failed to
+        reproduce are never lost. Runs at chain completion, before the
+        queue-drain reload — silx is still detached, so the r+ writes
+        are safe.
+        """
+        stash = getattr(self, "_predicted_fill", None)
+        self._predicted_fill = None
+        if stash is None or self.session is None:
+            return
+        entry = stash["entry"]
+        path = self.session.temp_path
+        records = stash.get("records") or []
+        if records and not stash.get("match_ok", True):
+            self.pipeline_panel.append_log(
+                "Expected pattern: a re-match failed — keeping all "
+                f"{len(records)} injected peak(s) UNVALIDATED; review "
+                "or re-run matching manually."
+            )
+            records = []
+        if records:
+            self._rollback_unvalidated_fills(stash, records)
+        # Merge-back pass, regardless of records: the re-match rewrote
+        # each frame's solutions from scratch, and the (temporarily)
+        # larger peak set can push a previously identified structure
+        # below the matcher's threshold — the user's existing results
+        # must survive an Add/sweep. Snapshot rows keep valid
+        # positional peak_lists: injected rows are appended and only
+        # appended rows are rolled back.
+        snapshot = stash.get("snapshot") or {}
+        restored = 0
+        for fr, snap in sorted(snapshot.items()):
+            if not snap:
+                continue
+            try:
+                restored += file_model.merge_matched_rows(
+                    path, entry, int(fr), snap
+                )
+            except Exception:
+                logger.debug(
+                    "suppressed exception merging matched snapshot on "
+                    "frame %s", fr, exc_info=True,
+                )
+        if restored:
+            self.pipeline_panel.append_log(
+                f"Expected pattern: restored {restored} previously "
+                "matched structure(s) the re-match had dropped (peak "
+                "lists merged)."
+            )
+
+    def _rollback_unvalidated_fills(self, stash: dict, records: list) -> None:
+        """Drop injected peaks the matcher did not attribute to an
+        accepted structure (see ``_finalize_predicted_fill``)."""
+        entry = stash["entry"]
+        accept = {
+            str(c) for c in stash.get("accept") or {stash["cif"]}
+        }
+        path = self.session.temp_path
+        by_frame: dict[int, list] = {}
+        for rec in records:
+            by_frame.setdefault(int(rec["frame"]), []).append(rec)
+        kept = 0
+        discarded = 0
+        for fr, recs in sorted(by_frame.items()):
+            try:
+                tables = file_model.load_peaks(path, entry, fr)
+                structures = file_model.load_matched_peaks(
+                    path, entry, fr, tables.get("fitted")
+                )
+            except Exception:
+                logger.debug(
+                    "suppressed exception validating predicted fills "
+                    "on frame %d", fr, exc_info=True,
+                )
+                kept += len(recs)
+                continue
+            validated: set[int] = set()
+            for s in structures:
+                if simulation_pattern.cif_stem(s.cif) not in accept:
+                    continue
+                validated.update(
+                    int(i) for i in np.asarray(s.peaks.ids, dtype=int)
+                )
+            drop = [
+                r for r in recs if int(r["fitted_id"]) not in validated
+            ]
+            kept += len(recs) - len(drop)
+            if not drop:
+                continue
+            # Positions BEFORE deleting — peak_list entries are
+            # positional indices into the pre-delete fitted table.
+            positions = file_model.fitted_positions_for_ids(
+                path, entry, fr, [int(r["fitted_id"]) for r in drop]
+            )
+            for r in drop:
+                file_model.delete_peak_row(
+                    path, entry, fr, "fitted", int(r["fitted_id"])
+                )
+                file_model.delete_peak_row(
+                    path, entry, fr, "detected", int(r["detected_id"])
+                )
+            file_model.remap_matched_peak_lists(path, entry, fr, positions)
+            discarded += len(drop)
+        msg = (
+            f"Expected pattern: kept {kept} peak(s) matched by "
+            f"{'/'.join(sorted(accept))}, discarded {discarded} "
+            "(fitted but not matched by the target structure(s))."
+        )
+        self.pipeline_panel.append_log(msg)
+        self.statusBar().showMessage(msg, 8000)
+
+    def _apply_sim_pattern(self) -> None:
+        """Install the selected (CIF, orientation) pattern in the
+        viewer, or clear the overlay when the selection is incomplete
+        or the section is off. No-ops when the effective selection is
+        unchanged — a re-install would drop the reflection selection."""
+        panel = getattr(self, "pipeline_panel", None)
+        cache = panel.cached_cif_pattern() if panel is not None else None
+        desired: tuple | None = None
+        if (
+            cache is not None
+            and self._sim_master_check.isChecked()
+            and self.session is not None
+            and self.session.kind != "raw"
+        ):
+            stem = self._sim_cif_combo.currentData()
+            hkl = self._sim_orient_combo.currentData()
+            if stem is not None and hkl is not None:
+                desired = (stem, tuple(int(v) for v in hkl))
+        # No-op on an unchanged choice — but only while the viewer's
+        # actual state agrees with the bookkeeping (viewer.clear() on a
+        # session reload drops the pattern behind our back, and
+        # _on_cif_cache_changed resets _sim_applied before the combos
+        # repopulate).
+        viewer_has = self.viewer.simulation_pattern() is not None
+        if desired == self._sim_applied and viewer_has == (desired is not None):
+            return
+        if desired is None:
+            self._sim_applied = None
+            self.viewer.clear_simulation_pattern()
+            return
+        ci = simulation_pattern.cif_index(cache, desired[0])
+        if ci is None:
+            self._sim_applied = None
+            self.viewer.clear_simulation_pattern()
+            self.statusBar().showMessage(
+                f"Expected pattern: CIF '{desired[0]}' is not in the "
+                "parsed cache — re-parse the CIFs.", 6000,
+            )
+            return
+        try:
+            pattern = simulation_pattern.extract_pattern(
+                cache, ci, desired[1]
+            )
+        except (ValueError, IndexError, TypeError) as exc:
+            self._sim_applied = None
+            self.viewer.clear_simulation_pattern()
+            self.statusBar().showMessage(f"Expected pattern: {exc}", 6000)
+            return
+        self._sim_applied = desired
+        self.viewer.set_simulation_pattern(pattern)
+
+    def _sim_entry_mismatch_hint(self, entry: str) -> None:
+        """Status-bar warning when the cached CifPattern was parsed
+        against a different energy / incidence angle than ``entry``.
+
+        Mirrors ``pipeline._warn_if_cif_params_mismatch`` thresholds
+        (0.5% relative on energy; ~5% relative on incidence angle, or
+        1e-3 absolute near zero) but derives the entry's values
+        backend-free from the file geometry: en[eV] = 12398 /
+        wavelength[Å], the same conversion ExpParameters uses.
+        """
+        panel = getattr(self, "pipeline_panel", None)
+        if panel is None or self.session is None:
+            return
+        params = getattr(panel.cached_cif_pattern(), "params", None)
+        cached_en = getattr(params, "en", None)
+        cached_ai = getattr(params, "ai", None)
+        if cached_en is None or cached_ai is None:
+            return
+        geom = file_model.read_geometry_for_entry(
+            self.session.temp_path, entry
+        )
+        if geom is None:
+            return
+        wl = float(geom.get("wavelength_angstrom") or 0.0)
+        if wl <= 0:
+            return
+        file_en = 12398.0 / wl
+        file_ai = float(geom.get("ai_deg") or 0.0)
+        en_off = abs(file_en - float(cached_en)) > 0.005 * abs(file_en)
+        ai_scale = max(abs(file_ai), abs(float(cached_ai)))
+        ai_off = abs(file_ai - float(cached_ai)) > (
+            0.05 * ai_scale if ai_scale > 1e-3 else 1e-3
+        )
+        if en_off or ai_off:
+            self.statusBar().showMessage(
+                "Expected pattern: the parsed CIF cache was built for "
+                "a different energy / incidence angle than this entry "
+                "— re-parse CIFs for accurate positions.", 8000,
+            )
 
     def _update_title(self) -> None:
         if self.session is None:
@@ -9682,14 +11459,15 @@ class MainWindow(QMainWindow):
         ):
             ticks = chain["ticks"][id(cmd)]
             overall = chain["base"] + min(int(done), ticks)
-            if op_name == "interpolate_tracks":
+            label = chain.get("label", "Interpolate track")
+            if op_name in ("interpolate_tracks", "inject_fitted_peaks"):
                 dlg.setLabelText(
-                    "Interpolate track: fitting injected boxes… "
+                    f"{label}: fitting injected boxes… "
                     f"({min(int(done), ticks)}/{ticks} frames)"
                 )
             elif op_name == "run_matching":
                 dlg.setLabelText(
-                    "Interpolate track: matching "
+                    f"{label}: matching "
                     f"{cmd.kwargs.get('peaks_type', 'segments')}… "
                     f"({min(int(done), ticks)}/{ticks} frames)"
                 )

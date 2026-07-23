@@ -11,7 +11,6 @@ surviving track), so id-based selection against the real file works.
 from __future__ import annotations
 
 import os
-import time
 
 import numpy as np
 import pytest
@@ -793,6 +792,70 @@ def test_rings_tracked_gui_side_and_untracked_hidden(
     # Frame 2 whitelist: tracked spot (0) + tracked persistent ring (9);
     # the untracked blip (1) and the one-off ring (10) are hidden.
     assert v._fitted_visible_only[2] == {0, 9}
+
+
+def test_native_ring_components_not_double_counted(
+    main_window, synthetic_fitted_scan,
+):
+    """mlgidbase 0.1.5 clamps ring angle_width inf->45 inside
+    track_peaks, so rings stored with a FINITE angle (the GUI's
+    injected rings persist angle=45) can arrive as NATIVE components.
+    The handler must drop those before appending its own radial-IoU
+    ring tracks — the same physical ring must yield exactly one
+    track."""
+    import h5py
+
+    from mlgidlab.pipeline import PipelineCommand
+
+    with h5py.File(synthetic_fitted_scan, "r+") as f:
+        for frame in range(6):
+            g = f[f"{ENTRY}/data/analysis/frame{frame:05d}"]
+            arr = g["fitted_peaks"][()]
+            dt = arr.dtype
+            ring = np.zeros(1, dtype=dt)
+            ring["id"] = [9]; ring["radius"] = [1.8]
+            ring["radius_width"] = [0.2]; ring["angle"] = [45.0]
+            ring["angle_width"] = [np.inf]; ring["is_ring"] = [True]
+            ring["amplitude"] = [30.0]
+            del g["fitted_peaks"]
+            g.create_dataset(
+                "fitted_peaks", data=np.concatenate([arr, ring])
+            )
+    _open(main_window, synthetic_fitted_scan)
+
+    member_frames, pids, mq_xy, mq_z, mamp = [], [], [], [], []
+    for frame in range(6):
+        t = file_model.load_peaks(
+            main_window.session.temp_path, ENTRY, frame
+        )["fitted"]
+        for j in range(len(t)):
+            member_frames.append(frame)
+            pids.append(int(t.ids[j]))
+            mq_xy.append(float(t.q_xy[j]))
+            mq_z.append(float(t.q_z[j]))
+            mamp.append(float(t.amplitude[j]))
+    spot_members = [i for i, p in enumerate(pids) if p == 0]
+    ring_members = [i for i, p in enumerate(pids) if p == 9]
+    # The ring arrives ALSO as a native component (what 0.1.5 emits for
+    # finite-angle rings) alongside the spot track.
+    payload = TrackingPayload(
+        entry=ENTRY, threshold=0.5, length=3,
+        q_xy=np.array(mq_xy), q_z=np.array(mq_z),
+        frame_num=np.array(member_frames), amplitude=np.array(mamp),
+        components=[spot_members, ring_members],
+    )
+    main_window._on_phase_track_result(
+        payload, PipelineCommand("track_peaks", {"entry": ENTRY}),
+    )
+
+    # Exactly one spot track + one ring track — the native ring
+    # component was dropped, the GUI-side ring track appended.
+    assert payload.n_tracks == 2
+    assert main_window.scan_tracking_panel._model.rowCount() == 2
+    ring_tracks = main_window._scan_ring_tracks
+    assert len(ring_tracks) == 1
+    (ring_idx,) = ring_tracks
+    assert sorted(payload.components[ring_idx]) == sorted(ring_members)
 
 
 def test_pipeline_and_view_workers_mutually_gated(

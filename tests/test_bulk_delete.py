@@ -380,7 +380,7 @@ def test_paste_then_delete_both_undoable(
     _yes(monkeypatch)
 
     # Copy the 3 detected, paste them back onto the same frame -> 6.
-    sels = _select_detected(main_window, 0, 3)
+    _select_detected(main_window, 0, 3)
     main_window._on_copy_peaks()
     main_window._on_paste_peaks()
     assert _n_detected(path, "entry_0000", 0) == 6

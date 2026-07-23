@@ -25,7 +25,6 @@ Click-sync is bidirectional:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 
 import numpy as np
 from PySide6.QtCore import (
@@ -69,18 +68,6 @@ _ROLE_STRUCTURE_UID = Qt.ItemDataRole.UserRole + 3
 # numerically without us implementing a custom less-than. Display
 # text is set separately via setData(role=DisplayRole).
 _ROLE_NUMERIC = Qt.ItemDataRole.UserRole + 4
-
-
-@dataclass
-class _MatchedRowRef:
-    """One row in the Matched tab. Carries the structure context so
-    a row click can rebuild a ``SelectedPeak`` with the right
-    structure_uid / label / color the host needs to highlight the
-    matched overlay properly."""
-
-    structure_uid: str
-    structure_label: str
-    fitted_peak_id: int
 
 
 class _NumericItem(QStandardItem):
@@ -517,11 +504,9 @@ class PeaksTablePanel(QWidget):
         # Matched stores a list under _ROLE_PEAK_ID; pass it through
         # untouched. Detected / Fitted store an int.
         if kind == "matched":
-            sel = self._build_selection(kind, 0, id_item, source_idx.row())
+            sel = self._build_selection(kind, 0, id_item)
         else:
-            sel = self._build_selection(
-                kind, int(peak_id_payload), id_item, source_idx.row(),
-            )
+            sel = self._build_selection(kind, int(peak_id_payload), id_item)
         if sel is None:
             return
         self.peakSelectedFromTable.emit(sel)
@@ -531,7 +516,6 @@ class PeaksTablePanel(QWidget):
         kind: str,
         peak_id: int,
         id_item: QStandardItem,
-        source_row: int,
     ) -> SelectedPeak | None:
         """Reconstruct a SelectedPeak from the live source table.
 

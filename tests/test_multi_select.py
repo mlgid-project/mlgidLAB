@@ -100,7 +100,7 @@ def test_ctrl_click_prefers_fitted_when_no_primary(
     detected+fitted point picks fitted (same priority as a bare
     click). Fitted is the post-Run-Fitting refinement, so it's the
     sensible default."""
-    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtCore import QPointF
     _open(main_window, synthetic_nexus_with_peaks)
     v = main_window.viewer
     fr, fa = _inject_detected_at_fitted0(v)
@@ -118,7 +118,7 @@ def test_ctrl_click_prefers_current_kind(
     overlapping detected+fitted point extends the *detected*
     selection — the gesture keeps building one kind even where a
     fitted box covers the detected peak."""
-    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtCore import QPointF
     _open(main_window, synthetic_nexus_with_peaks)
     v = main_window.viewer
     fr, fa = _inject_detected_at_fitted0(v)
@@ -137,7 +137,7 @@ def test_ctrl_click_selects_lone_fitted(
     """Ctrl+click on a fitted peak with no detected underneath selects
     it (the reported bug: Ctrl+click on fitted did nothing because the
     hit-test was detected-only)."""
-    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtCore import QPointF
     _open(main_window, synthetic_nexus_with_peaks)
     v = main_window.viewer
     fit = (v._frame_peaks.get(0) or {})["fitted"]
@@ -157,7 +157,7 @@ def test_ctrl_click_on_empty_space_is_noop(
     """Ctrl+click that doesn't hit any detected peak leaves the
     existing multi-selection alone — a near-miss must not wipe
     the user's painstakingly assembled multi-selection."""
-    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtCore import QPointF
     _open(main_window, synthetic_nexus_with_peaks)
     v = main_window.viewer
     v._set_selected(_detected_sel(main_window, 0, 0))
@@ -207,7 +207,7 @@ def test_ctrl_a_selects_all_detected_on_frame(
     grab all 3 as the multi-selection."""
     _open(main_window, synthetic_nexus_with_peaks)
     v = main_window.viewer
-    v._select_all_detected_on_frame()
+    v._select_all_of_kind_on_frame("detected")
     sels = v.selected_peaks()
     assert len(sels) == 3
     assert all(s.kind == "detected" for s in sels)
@@ -239,7 +239,7 @@ def test_multi_selection_renders_n_highlight_rows(
     """
     _open(main_window, synthetic_nexus_with_peaks)
     v = main_window.viewer
-    v._select_all_detected_on_frame()
+    v._select_all_of_kind_on_frame("detected")
     # Selection state mirrors the overlay; len(selected_peaks()) == 3
     # is the source-of-truth check. The overlay path itself is built
     # by ``_PeakShapeItem.set_polar`` and rendering tests are out of

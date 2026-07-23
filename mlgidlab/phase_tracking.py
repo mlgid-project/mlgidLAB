@@ -1,25 +1,24 @@
 """Adapter around mlgidBASE's official peak tracking (``track_peaks``).
 
-Upstream (mlgidBASE commit 561edfa, "First implementation of the peak
-tracking function") tracks FITTED peaks across a scan's frames: boxes
-``(angle ± angle_width/2, radius ± radius_width/2)`` for every fitted
-peak of every frame are IoU-compared all-against-all
+Upstream (mlgidbase, pinned >= 0.1.5) tracks FITTED peaks across a
+scan's frames: boxes ``(angle ± angle_width/2, radius ± radius_width/2)``
+for every fitted peak of every frame are IoU-compared all-against-all
 (``peak_operations.calculate_iou_matrix``), thresholded into a graph,
 and NetworkX connected components become the tracks; components with
 more than ``length`` members survive.
 
-The current upstream implementation RETURNS NOTHING — its only output
-is two matplotlib figures drawn by
+Upstream's return value carries per-track (axis, amplitude, frame)
+arrays but NO member coordinates or peak ids, and the full member-level
+data only flows into two matplotlib figures drawn by
 ``mlgidbase.peak_operations._plot_tracked_peaks`` (module-level import
 in ``peak_operations``). ``capture_tracking`` therefore swaps that
 symbol for a recorder for the duration of one ``track_peaks`` call and
 rebuilds the data (``TrackingPayload``) from the recorder's arguments;
 no matplotlib executes. Run upstream with
 ``plot_params={'plot_result': True, 'save_fig': False}`` (the hook only
-fires when one of the two is truthy) and ``axis='amplitude'`` (q_xy /
-q_z / frame numbers are always passed; radius, |q| and angle are
-derivable, so requesting the amplitude axis makes ONE call sufficient
-for every view).
+fires when one of the two is truthy) and ``axis='radius'``; per-member
+amplitudes are recovered from the return value
+(``amplitudes_from_track_result``).
 
 Everything else here is pure numpy/scipy helpers for the views: derived
 axes (convention pinned to ``mlgidlab.polar.polar_to_qxyz``: angle in
@@ -33,15 +32,11 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 import numpy as np
 from scipy.ndimage import median_filter
 
 logger = logging.getLogger(__name__)
-
-if TYPE_CHECKING:  # pragma: no cover - typing only
-    from .file_model import PeakTable
 
 # Axis names offered to the user. "radius" follows upstream's meaning:
 # the fitted ``radius`` column IS the q magnitude, so radius == |q|.
@@ -149,11 +144,11 @@ class TrackingPayload:
 class UpstreamContractError(RuntimeError):
     """Upstream ``track_peaks`` changed shape under us.
 
-    The GUI reads tracking data through a capture hook on
+    The GUI reads member-level tracking data through a capture hook on
     ``mlgidbase.peak_operations._plot_tracked_peaks`` because upstream's
-    first implementation returns None. If this error fires, the
-    installed mlgidbase no longer matches the contract verified at
-    commit 561edfa — see mlgidLAB/docs/backend_compatibility.md.
+    return value carries no member coordinates or ids. If this error
+    fires, the installed mlgidbase no longer matches the contract
+    verified at 0.1.5 — see mlgidLAB/docs/backend_compatibility.md.
     """
 
 
@@ -165,7 +160,7 @@ def capture_tracking():
 
         with capture_tracking() as rec:
             analysis.track_peaks(entry=..., threshold=..., length=...,
-                                 axis="amplitude",
+                                 axis="radius",
                                  plot_params={"plot_result": True,
                                               "save_fig": False})
         payload = build_payload(rec, entry, threshold, length)
@@ -179,7 +174,7 @@ def capture_tracking():
         raise UpstreamContractError(
             "mlgidbase.peak_operations has no _plot_tracked_peaks — "
             "the installed mlgidbase predates or diverged from the "
-            "peak-tracking implementation (need main @ 561edfa+)."
+            "peak-tracking implementation (need mlgidbase >= 0.1.5)."
         )
 
     rec: dict = {}
@@ -195,7 +190,7 @@ def capture_tracking():
                 "_plot_tracked_peaks was called with an unexpected "
                 f"signature ({len(args)} positional args, "
                 f"{sorted(kwargs)} kwargs); the capture contract is "
-                "pinned to mlgidBASE 561edfa."
+                "pinned to mlgidbase 0.1.5."
             )
         rec["q_xy"] = np.asarray(args[1], dtype=float)
         rec["q_z"] = np.asarray(args[2], dtype=float)
@@ -212,13 +207,17 @@ def capture_tracking():
 
 
 def build_payload(
-    rec: dict, entry: str, threshold: float, length: int
+    rec: dict, entry: str, threshold: float, length: int,
+    amplitudes: "np.ndarray | None" = None,
 ) -> TrackingPayload:
     """Build a ``TrackingPayload`` from a ``capture_tracking`` record.
 
-    The capture must have run with ``axis='amplitude'`` so the recorded
-    ``axis_arr`` is the member amplitudes (every other view axis is
-    derivable from q_xy/q_z).
+    ``amplitudes`` is the per-member amplitude array — in production it
+    comes from ``amplitudes_from_track_result`` (upstream's tracking
+    axis table has no ``'amplitude'`` entry, so amplitudes are not
+    obtainable through the capture). When ``amplitudes`` is None the
+    recorded ``axis_arr`` is used instead — only meaningful in tests
+    that exercise the capture contract on its own.
     """
     if "q_xy" not in rec:
         raise UpstreamContractError(
@@ -233,9 +232,64 @@ def build_payload(
         q_xy=rec["q_xy"],
         q_z=rec["q_z"],
         frame_num=rec["frame_num"],
-        amplitude=rec["axis_arr"],
+        amplitude=(
+            rec["axis_arr"] if amplitudes is None
+            else np.asarray(amplitudes, dtype=float)
+        ),
         components=rec["components"],
     )
+
+
+def amplitudes_from_track_result(ret, rec: dict) -> np.ndarray:
+    """Per-member amplitude array aligned with a ``capture_tracking``
+    record, recovered from ``track_peaks``' return value.
+
+    mlgidbase (pinned >= 0.1.5) returns ``(axis_list, amplitude_list,
+    frame_num_list)`` — per-component arrays sorted by frame. Each
+    component's rows are matched back to the capture's members by
+    exact ``(frame, axis value)`` equality (the values come from the
+    same flat arrays, so they are bit-identical). Members that share
+    both frame AND axis value are exact duplicates; they are matched
+    in order, mirroring ``member_ids``' ambiguity policy.
+
+    Members outside every component get NaN — no view consumes them
+    (amplitude plots iterate component members only). Raises
+    ``UpstreamContractError`` when the return does not match the
+    per-component shape.
+    """
+    frames = np.asarray(rec["frame_num"])
+    axis_vals = np.asarray(rec["axis_arr"], dtype=float)
+    components = rec["components"]
+    n = len(frames)
+
+    if not (isinstance(ret, tuple) and len(ret) == 3):
+        raise UpstreamContractError(
+            "track_peaks returned an unexpected value "
+            f"({type(ret).__name__}); the GUI expects the "
+            "per-component (axis, amplitude, frame) lists of "
+            "mlgidbase >= 0.1.5 — see docs/backend_compatibility.md."
+        )
+
+    axis_l, amp_l, frame_l = ret
+    if not (len(axis_l) == len(amp_l) == len(frame_l) == len(components)):
+        raise UpstreamContractError(
+            "track_peaks returned per-component lists whose length "
+            f"({len(amp_l)}) does not match the captured component "
+            f"count ({len(components)})."
+        )
+    amp = np.full(n, np.nan)
+    for comp, a_arr, amp_arr, f_arr in zip(components, axis_l, amp_l, frame_l):
+        a_arr = np.asarray(a_arr, dtype=float)
+        amp_arr = np.asarray(amp_arr, dtype=float)
+        f_arr = np.asarray(f_arr)
+        remaining = list(range(len(f_arr)))
+        for m in comp:
+            for pos in remaining:
+                if f_arr[pos] == frames[m] and a_arr[pos] == axis_vals[m]:
+                    amp[m] = amp_arr[pos]
+                    remaining.remove(pos)
+                    break
+    return amp
 
 
 def smooth_normalize_amplitude(
@@ -480,12 +534,16 @@ def member_ids(
     """Best-effort ``(frame, fitted_peak_id)`` per payload member.
 
     Upstream's plot hook carries no peak ids, so they are reconstructed
-    by matching each member's ``(q_xy, q_z, amplitude)`` against the
-    frame's fitted ``PeakTable`` (``fitted_tables`` maps frame ->
-    PeakTable or None). Both sides read the same HDF5 columns, so exact
-    float equality is expected; ``np.isclose`` is the fallback. A
-    member with no match or an ambiguous match yields ``None`` (the
-    caller degrades to jump-to-frame-only).
+    by matching each member's ``(q_xy, q_z)`` — plus its amplitude as a
+    duplicate-breaker — against the frame's fitted ``PeakTable``
+    (``fitted_tables`` maps frame -> PeakTable or None). Both sides
+    read the same HDF5 columns, so exact float equality is expected;
+    ``np.isclose`` is the fallback. The amplitude participates only
+    when it is finite: since the 0.1.4 upstream rework amplitudes come
+    from ``track_peaks``' per-component return value, so members
+    outside every track carry NaN and must resolve by coordinates
+    alone. A member with no match or an ambiguous match yields
+    ``None`` (the caller degrades to jump-to-frame-only).
     """
     out: list = []
     for i in range(payload.n_members):
@@ -494,21 +552,24 @@ def member_ids(
         if table is None or len(table) == 0:
             out.append(None)
             continue
+        amp = payload.amplitude[i]
+        use_amp = bool(np.isfinite(amp))
         exact = (
             (np.asarray(table.q_xy) == payload.q_xy[i])
             & (np.asarray(table.q_z) == payload.q_z[i])
-            & (np.asarray(table.amplitude) == payload.amplitude[i])
         )
+        if use_amp:
+            exact &= np.asarray(table.amplitude) == amp
         hits = np.flatnonzero(exact)
         if hits.size != 1:
             close = (
                 np.isclose(table.q_xy, payload.q_xy[i], rtol=1e-9, atol=1e-12)
                 & np.isclose(table.q_z, payload.q_z[i], rtol=1e-9, atol=1e-12)
-                & np.isclose(
-                    table.amplitude, payload.amplitude[i],
-                    rtol=1e-9, atol=1e-12,
-                )
             )
+            if use_amp:
+                close &= np.isclose(
+                    table.amplitude, amp, rtol=1e-9, atol=1e-12,
+                )
             hits = np.flatnonzero(close)
         if hits.size == 1:
             out.append((frame, int(table.ids[hits[0]])))

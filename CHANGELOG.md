@@ -4,6 +4,71 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## 0.1.0a12 — twelfth alpha (2026-07-23)
+
+Feature alpha on `0.1.0a11`: the Expected-pattern workflow and the move
+to the released mlgid backend stack. No on-disk schema changes.
+
+### Added
+
+- **Expected pattern workflow.** A new right-side "Expected pattern"
+  dock overlays the forward-simulated reflections of a parsed CIF on
+  the image (diamonds for spots, dashed arcs for rings, marker size
+  encodes simulated intensity; CIF + orientation combos are fed from
+  the Pipeline panel's parsed-CIF cache). Reflections are colour-coded:
+  green = explained by a peak matched to the selected phase, orange =
+  missed. Click markers (or **Select missed**) to select reflections,
+  then **Add selected peaks (fit + match)**: each selected position is
+  injected as a detected box, 2D-fitted and re-matched; injected peaks
+  the matcher does not claim are rolled back. **Find all matched
+  structures (all frames)** applies every matched (CIF, orientation)
+  combo across the whole scan with per-structure reflection caps.
+  Safety rails: matched-solution snapshots are union-merged back after
+  every re-match, and duplicate matched structures are consolidated at
+  write and read, so existing identifications never disappear. The dock
+  also carries a matched-structures legend mirroring the Display legend
+  both ways.
+- **Editable frame index.** A spinbox next to the frame slider seeks to
+  a typed frame number; slider, spinbox and the "/ max" label stay in
+  sync with the active stack.
+
+### Changed
+
+- **Backend stack: released PyPI pins.** The `[pipeline]` extra moves
+  to `mlgidbase==0.1.5` / `pygid==0.2.13`; `mlgiddetect 0.2.8` arrives
+  transitively and carries per-Python CUDA 12 `onnxruntime-gpu` pins,
+  so the GUI's own onnxruntime pin is dropped (`networkx` is now
+  declared here — mlgidbase needs it but does not declare it).
+  Detection defaults to the new 2-class DINO model of mlgiddetect
+  0.2.6+ — detections differ from the previous single-class model; the
+  legacy model stays reachable via a detection config with
+  `ONNX_BASE: dino_old`. GPU selection is native to mlgiddetect now
+  (ORT provider + driver probe, CPU fallback); the GUI's torch-based
+  workarounds are removed.
+- **Peak tracking targets the mlgidbase 0.1.5 contract.** Per-member
+  amplitudes come from `track_peaks`' per-component return value; a
+  too-old mlgidbase fails with a named "needs mlgidbase >= 0.1.5"
+  error instead of a raw AttributeError.
+- **Min-intensity cutoff is a single spinbox** with adaptive-decimal
+  stepping (arrow/wheel steps scale with the current value's
+  magnitude), replacing the linear slider that was useless for the
+  decades-spanning simulated intensities.
+
+### Fixed
+
+- **Ring tracks no longer appear twice.** mlgidbase 0.1.5 can natively
+  track rings stored with a finite angle (for example rings injected by
+  the GUI), which would have duplicated the GUI's own radial ring
+  tracking; native ring components are dropped so every physical ring
+  yields exactly one track.
+
+### Removed
+
+- Dead code retired in a sweep: the legacy 2D-preview override path in
+  the profile viewer, the unused 1D-Gaussian helpers in `fit.py`, and
+  stale helpers in the polar/clipboard/conversion modules. No behavior
+  change; the corresponding test module went with it.
+
 ## 0.1.0a11 — eleventh alpha (2026-07-10)
 
 Feature alpha on `0.1.0a10`: cross-frame peak tracking with interactive

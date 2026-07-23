@@ -79,8 +79,3 @@ def clear() -> None:
 def has_items() -> bool:
     """Whether the clipboard currently holds a snapshot (any entry)."""
     return bool(_items)
-
-
-def source_entry() -> str | None:
-    """The entry the snapshot was copied from, or None if empty."""
-    return _source_entry

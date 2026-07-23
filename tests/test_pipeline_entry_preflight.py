@@ -58,7 +58,6 @@ def test_execute_skips_validation_when_no_entry(synthetic_nexus, monkeypatch):
     mlgidbase import) and run unconditionally."""
     mlgidbase = pytest.importorskip("mlgidbase")
     construct_calls = []
-    original = mlgidbase.mlgidBASE
 
     class _StubAnalysis:
         def __init__(self, filename):

@@ -13,7 +13,6 @@ user can still pick "All entries" explicitly when they want a sweep.
 """
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import Qt, Signal
@@ -113,22 +112,6 @@ class _CollapsibleSection(QWidget):
         self._body.setVisible(expanded)
         outer.addWidget(self._body)
 
-    def is_expanded(self) -> bool:
-        return self._toggle.isChecked()
-
-    def set_expanded(self, expanded: bool) -> None:
-        """Open or close without re-emitting (used by accordion peers)."""
-        if self._toggle.isChecked() == expanded:
-            return
-        # blockSignals avoids a re-entrant accordion update — the coordinator
-        # already knows it caused this state change.
-        self._toggle.blockSignals(True)
-        try:
-            self._toggle.setChecked(expanded)
-        finally:
-            self._toggle.blockSignals(False)
-        self._apply_state(expanded)
-
     def _on_toggled(self, checked: bool) -> None:
         self._apply_state(checked)
         self.expandedChanged.emit(checked)
@@ -152,6 +135,11 @@ class PipelinePanel(QWidget):
     # thread to do the actual parsing (slow for raw CIFs) and posts the
     # result back via ``set_cif_pattern``.
     parseCifsRequested = Signal(str)
+    # Emitted whenever the CIF cache changes: with the new CifPattern
+    # after a successful parse, with None on invalidation (input edit,
+    # parse failure, session swap). The Display dock's "Expected
+    # pattern" section listens to enable/refresh itself.
+    cifCacheChanged = Signal(object)
     # Log routing: panels emit messages and the host forwards them to a
     # shared Logs dock. Keeping ``append_log`` / ``clear_log`` as the
     # public surface so existing call sites don't change.
@@ -924,6 +912,7 @@ class PipelinePanel(QWidget):
             self.cif_cache_label.setStyleSheet(
                 "color: #ff6b6b; font-style: italic;"
             )
+            self.cifCacheChanged.emit(None)
         elif self._cached_cif_input is None:
             self.cif_cache_label.setText("Not parsed")
             self.cif_cache_label.setStyleSheet(
@@ -944,40 +933,65 @@ class PipelinePanel(QWidget):
             return
         self._cached_cif_obj = None
         self._cached_cif_input = None
-        self.cif_cache_label.setText("Not parsed (active file changed)")
-        self.cif_cache_label.setStyleSheet("color: #aaa; font-style: italic;")
-        self.btn_parse_cifs.setText("Parse CIFs")
-        self.btn_parse_cifs.setEnabled(bool(self.cif_path.text().strip()))
+        # Widget updates only when the matching UI was built (backend
+        # present) — the cache fields themselves exist either way.
+        if self._available:
+            self.cif_cache_label.setText("Not parsed (active file changed)")
+            self.cif_cache_label.setStyleSheet(
+                "color: #aaa; font-style: italic;"
+            )
+            self.btn_parse_cifs.setText("Parse CIFs")
+            self.btn_parse_cifs.setEnabled(bool(self.cif_path.text().strip()))
+        self.cifCacheChanged.emit(None)
 
     def set_cif_pattern(self, obj: object | None, error: Exception | None) -> None:
         """Host posts the parse result here. None+exception → error state.
 
         On success, ``obj`` is cached against the current input text and
         every subsequent Run Matching reuses it.
+
+        Widget updates are gated on ``self._available`` (the matching
+        widgets are never built backend-less) so tests can seed a fake
+        cache through this public API in any environment.
         """
-        self.btn_parse_cifs.setText("Parse CIFs")
-        self.btn_parse_cifs.setEnabled(True)
-        self.cif_parse_bar.hide()
+        if self._available:
+            self.btn_parse_cifs.setText("Parse CIFs")
+            self.btn_parse_cifs.setEnabled(True)
+            self.cif_parse_bar.hide()
         if error is not None or obj is None:
             self._cached_cif_obj = None
             self._cached_cif_input = None
             msg = str(error) if error is not None else "(empty result)"
             # Keep the user's input alone so they can retry from the same
             # text; just flag the cache as failed.
-            self.cif_cache_label.setText(f"Parse failed — {msg[:60]}")
-            self.cif_cache_label.setStyleSheet(
-                "color: #ff6b6b; font-style: italic;"
-            )
+            if self._available:
+                self.cif_cache_label.setText(f"Parse failed — {msg[:60]}")
+                self.cif_cache_label.setStyleSheet(
+                    "color: #ff6b6b; font-style: italic;"
+                )
+            self.cifCacheChanged.emit(None)
             return
-        self._cached_cif_input = self.cif_path.text().strip()
+        self._cached_cif_input = (
+            self.cif_path.text().strip() if self._available else ""
+        )
         self._cached_cif_obj = obj
         # Surface the CIF count + the kind of input so the user can see
         # what's been cached (CifPattern exposes ``cifs``).
-        n = len(getattr(obj, "cifs", []) or [])
-        self.cif_cache_label.setText(f"Parsed: {n} CIF(s) cached")
-        self.cif_cache_label.setStyleSheet(
-            "color: #4ade80; font-style: italic;"
-        )
+        if self._available:
+            n = len(getattr(obj, "cifs", []) or [])
+            self.cif_cache_label.setText(f"Parsed: {n} CIF(s) cached")
+            self.cif_cache_label.setStyleSheet(
+                "color: #4ade80; font-style: italic;"
+            )
+        self.cifCacheChanged.emit(obj)
+
+    def cached_cif_pattern(self) -> object | None:
+        """The parsed CifPattern cache (None when nothing is parsed).
+
+        Read-only accessor for the Display dock's "Expected pattern"
+        section; touches no widgets, so it is backend-less-safe.
+        """
+        return self._cached_cif_obj
 
     # -- Internals --
 

@@ -150,9 +150,8 @@ def test_preview_2d_mode_paints_from_fit_params(main_window, monkeypatch):
     """``_update_fitted_preview`` paints at ``(centre, 2σ)`` for
     whatever fit params the host supplies — regardless of mode.
 
-    In real use, 2D mode receives pygidfit's projected 1D Gaussians
-    (pushed via ``profile_viewer.set_2d_preview`` from
-    ``_refresh_2d_preview``), so the box on screen equals what
+    In real use, 2D mode paints from the pygidfit results cached by
+    ``_refresh_2d_preview``, so the box on screen equals what
     Add-to-fitted (2D) will save. The painter itself is
     mode-agnostic; the orchestration that picks which fits to feed
     in lives in ``_refresh_2d_preview`` and isn't exercised here."""

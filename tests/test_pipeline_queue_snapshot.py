@@ -15,7 +15,6 @@ from pathlib import Path
 
 import h5py
 import numpy as np
-import pytest
 
 from mlgidlab.pipeline import PipelineCommand
 from mlgidlab.session import NexusSession

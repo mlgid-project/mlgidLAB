@@ -194,25 +194,6 @@ class ProfileViewer(QWidget):
         # fitted_peaks dataset. Cleared whenever the curves are cleared.
         self._last_radial_fit: GaussianFit | None = None
         self._last_angular_fit: GaussianFit | None = None
-        # Cache of the most recent profile traces so the host
-        # (MainWindow._refresh_2d_preview) can reconstruct the local
-        # baseline for the projected 2D Gaussian without re-running
-        # the polar slice + nanmean.
-        self._last_radial_profile: np.ndarray | None = None
-        self._last_angular_profile: np.ndarray | None = None
-        # 2D-preview override. When active, MainWindow has pushed
-        # pygidfit's refined box + the projected 1D Gaussians on
-        # each axis so the grey integrated trace and the pink fit
-        # curve both reference the SAME region. Without this, the
-        # grey trace would still average over the user's drawn box
-        # while the pink curve sat at pygidfit's (possibly shifted)
-        # centre — visually incoherent. See ``set_2d_preview``.
-        self._external_integration_box: (
-            tuple[float, float, float, float] | None
-        ) = None
-        self._external_radial_fit: GaussianFit | None = None
-        self._external_angular_fit: GaussianFit | None = None
-        self._external_fit_active: bool = False
 
     # -- Public API --
 
@@ -265,59 +246,6 @@ class ProfileViewer(QWidget):
                     ax.setTextPen(pen)
                 except Exception:
                     pass
-
-    def set_2d_preview(
-        self,
-        box: tuple[float, float, float, float] | None,
-        rfit: GaussianFit | None,
-        afit: GaussianFit | None,
-    ) -> None:
-        """Install pygidfit's refined 2D-preview state on the viewer.
-
-        Three pieces of state move as one because they describe a
-        single coherent view of the active peak:
-
-        * ``box`` — ``(radius, radius_width, angle, angle_width)`` of
-          the fitted region. When non-None, ``_recompute_curves``
-          slices the polar image over this box for both the radial
-          and angular integrated traces. So the grey profile data
-          and the pink Gaussian curve reference the same window.
-        * ``rfit`` / ``afit`` — projected 1D Gaussian curves
-          (centre + 2σ from pygidfit's 2D fit) for the radial and
-          angular axes. Rendered as the pink overlay; routed
-          through ``fitParamsChanged`` so the parameter panel and
-          the cyan image-side preview box also see pygidfit's
-          values.
-
-        Pass ``(None, None, None)`` to clear the override. The
-        viewer then reverts to user-box integration + scipy 1D fits
-        + draggable edit regions (the 1D-mode behaviour).
-
-        Side effect: when ``box`` is set, the profile-side edit
-        regions are hidden — they'd encode a draggable integration
-        window that pygidfit would clobber on every refit. The
-        image-side ROI remains the single editing surface.
-        """
-        active = (
-            box is not None or rfit is not None or afit is not None
-        )
-        no_op = (
-            self._external_fit_active == active
-            and self._external_integration_box == box
-            and self._external_radial_fit is rfit
-            and self._external_angular_fit is afit
-        )
-        self._external_integration_box = box
-        self._external_radial_fit = rfit
-        self._external_angular_fit = afit
-        self._external_fit_active = active
-        if no_op:
-            return
-        # Region visibility depends on the override, so re-sync them
-        # before redrawing the curves.
-        if self._selected is not None:
-            self.sync_regions_from_peak(self._selected)
-        self._recompute_curves()
 
     def set_skip_angular_fit(self, skip: bool) -> None:
         """Tell the viewer not to compute or render the angular Gaussian.
@@ -382,68 +310,6 @@ class ProfileViewer(QWidget):
         """Polar angle axis the viewer is currently plotting on."""
         return self._angle
 
-    def last_radial_profile(self) -> np.ndarray | None:
-        """Most recent integrated radial trace (mean over the box's
-        angular range when a peak is selected, otherwise full-image
-        mean). Used by the 2D-preview path to reconstruct a local
-        baseline for the projected pygidfit Gaussian."""
-        return self._last_radial_profile
-
-    def last_angular_profile(self) -> np.ndarray | None:
-        """Most recent integrated angular trace. See
-        ``last_radial_profile``."""
-        return self._last_angular_profile
-
-    def integrate_over_box(
-        self, box: tuple[float, float, float, float],
-    ) -> tuple[np.ndarray | None, np.ndarray | None]:
-        """Compute ``(radial_mean, angular_mean)`` over the given polar
-        box on the current frame, without mutating viewer state.
-
-        Used by ``MainWindow._refresh_2d_preview`` so the pink curve
-        in 2D mode can be fit against the *same* grey trace that
-        ``set_2d_preview`` is about to display — i.e., the integration
-        over pygidfit's refined box rather than the previously-cached
-        trace integrated over the user's ROI. Without this getter the
-        pink fit would lag a frame behind the integration switch.
-
-        Returns ``(None, None)`` when the polar stack isn't loaded /
-        the frame index is out of range / the FrameSource is mid
-        silx-detach. Caller falls back to skipping the pink curve.
-        """
-        if (
-            self._polar_stack is None
-            or self._radius is None
-            or self._angle is None
-        ):
-            return None, None
-        if not 0 <= self._current_frame < self._polar_stack.shape[0]:
-            return None, None
-        try:
-            img = self._polar_stack[self._current_frame]
-        except (RuntimeError, ValueError, OSError, KeyError):
-            return None, None
-        r, dr, a, da = box
-        a_slice = _bounds_to_slice(self._angle, a - da / 2.0, a + da / 2.0)
-        r_slice = _bounds_to_slice(self._radius, r - dr / 2.0, r + dr / 2.0)
-        radial_src = (
-            img[:, a_slice] if a_slice.stop > a_slice.start else img
-        )
-        angular_src = (
-            img[r_slice, :] if r_slice.stop > r_slice.start else img
-        )
-        radial = np.nanmean(radial_src, axis=1)
-        angular = np.nanmean(angular_src, axis=0)
-        return radial, angular
-
-    def fit_range_for(
-        self, peak: SelectedPeak,
-    ) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
-        """Radial / angular fit windows for ``peak``. Reuses the
-        same private helpers ``_update_fit_curves`` uses so the 2D
-        external override renders over the identical window."""
-        return _radial_fit_range(peak), _angular_fit_range(peak)
-
     # -- Selected-peak edge handles --
 
     def set_selected_peak(self, peak: SelectedPeak | None) -> None:
@@ -461,8 +327,6 @@ class ProfileViewer(QWidget):
         would just clutter the view; the live Gaussian curve still renders.
         """
         self._selected = peak
-        visible = peak is not None
-        is_manual = peak is not None and peak.kind == "manual"
         # Only manual + detected are user-shaped — show the region marker
         # only for those. Fitted / matched still get the Gaussian curve
         # (handled in _update_fit_curves) but no region overlay.
@@ -482,16 +346,9 @@ class ProfileViewer(QWidget):
         # existing ``peakRowWriteRequested`` flow on drag-end. See
         # ``_on_radial_finished`` / ``_on_angular_finished``.
         is_draggable = peak is not None and peak.kind in ("manual", "detected")
-        # In 2D fit-mode the host has pushed pygidfit's refined box;
-        # the regions would encode a window the user can't drag
-        # without pygidfit clobbering it on the next refit, so we
-        # hide them entirely (decision logged in the plan).
-        override_active = self._external_integration_box is not None
-        self._radial_region.setVisible(show_regions and not override_active)
+        self._radial_region.setVisible(show_regions)
         self._radial_region.setMovable(is_draggable)
-        self._angular_region.setVisible(
-            show_regions and not is_ring_box and not override_active
-        )
+        self._angular_region.setVisible(show_regions and not is_ring_box)
         self._angular_region.setMovable(is_draggable)
 
         if peak is not None:
@@ -533,11 +390,8 @@ class ProfileViewer(QWidget):
         # which doesn't change here.
         is_ring_box = sel.is_ring or not np.isfinite(sel.angle_width)
         show_regions = sel.kind in ("manual", "detected")
-        override_active = self._external_integration_box is not None
-        self._radial_region.setVisible(show_regions and not override_active)
-        self._angular_region.setVisible(
-            show_regions and not is_ring_box and not override_active
-        )
+        self._radial_region.setVisible(show_regions)
+        self._angular_region.setVisible(show_regions and not is_ring_box)
 
         self._radial_region.blockSignals(True)
         try:
@@ -574,13 +428,10 @@ class ProfileViewer(QWidget):
         """Re-render both profile curves and any fit overlays.
 
         Selected: radial profile averages columns within the angular
-        slice of the integration box; angular profile averages rows
-        within the radial slice. The integration box is normally the
-        user-drawn ROI (``self._selected.{radius, angle, *_width}``),
-        but in 2D fit-mode it's pygidfit's refined box pushed by
-        ``set_2d_preview`` — that's what keeps the grey integrated
-        trace and the pink projected-Gaussian referenced to the same
-        region. Unselected: full-image averages, fit curves cleared.
+        slice of the integration box (the user-drawn ROI,
+        ``self._selected.{radius, angle, *_width}``); angular profile
+        averages rows within the radial slice. Unselected: full-image
+        averages, fit curves cleared.
         """
         if (
             self._polar_stack is None
@@ -602,15 +453,8 @@ class ProfileViewer(QWidget):
 
         if self._selected is not None:
             peak = self._selected
-            # In 2D fit-mode the host has pushed pygidfit's refined
-            # box via ``set_2d_preview``; integrate over that instead
-            # of the user-drawn ROI so the grey trace lines up with
-            # the pink projected Gaussian.
-            if self._external_integration_box is not None:
-                box_r, box_dr, box_a, box_da = self._external_integration_box
-            else:
-                box_r, box_dr = peak.radius, peak.radius_width
-                box_a, box_da = peak.angle, peak.angle_width
+            box_r, box_dr = peak.radius, peak.radius_width
+            box_a, box_da = peak.angle, peak.angle_width
             a_slice = _bounds_to_slice(
                 self._angle,
                 box_a - box_da / 2.0,
@@ -631,8 +475,6 @@ class ProfileViewer(QWidget):
 
         self._radial_curve.setData(self._radius, radial)
         self._angular_curve.setData(self._angle, angular)
-        self._last_radial_profile = radial
-        self._last_angular_profile = angular
 
         if self._selected is not None:
             self._update_fit_curves(self._selected, radial, angular)
@@ -644,27 +486,6 @@ class ProfileViewer(QWidget):
     def _update_fit_curves(
         self, peak: SelectedPeak, radial: np.ndarray, angular: np.ndarray
     ) -> None:
-        # External fit override (set by MainWindow in 2D fit-mode to
-        # surface pygidfit's 2D-Gaussian projection on each profile).
-        # When active, skip scipy entirely and route the supplied
-        # curves through the cache + signal so the parameter panel
-        # and fitted-preview box see the override values.
-        if self._external_fit_active:
-            rfit = self._external_radial_fit
-            afit = self._external_angular_fit
-            if rfit is not None:
-                self._radial_fit_curve.setData(rfit.x, rfit.y)
-            else:
-                self._radial_fit_curve.setData([], [])
-            if afit is not None and not self._skip_angular_fit:
-                self._angular_fit_curve.setData(afit.x, afit.y)
-            else:
-                self._angular_fit_curve.setData([], [])
-            self._set_fit_cache(
-                rfit, None if self._skip_angular_fit else afit,
-            )
-            return
-
         # All peak kinds drive a live 1D scipy fit on the integrated
         # profile data; only the *interval* we fit over changes:
         #   manual / detected  → box bounds (the user-controlled region)

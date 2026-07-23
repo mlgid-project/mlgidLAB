@@ -13,34 +13,37 @@ shipping a release, and as part of the alpha pre-flight.
 
 ## Verified-good baseline
 
-All 186 tests pass with this set installed (the backend-dependent
+The full suite passes with this set installed (the backend-dependent
 tests un-skip and run, not just the pure-h5py ones):
 
 | Package | Baseline version | Reached how |
 |-|-|-|
-| `mlgidbase` | 0.1.3 | declared in `[pipeline]` |
-| `pygid` | 0.2.10 | declared in `[pipeline]` |
+| `mlgidbase` | 0.1.5 | declared in `[pipeline]` |
+| `pygid` | 0.2.13 | declared in `[pipeline]` |
 | `pygidfit` | 0.1.3 | declared in `[pipeline]` (GUI imports it directly) |
 | `mlgidmatch` | 0.1.3 | declared in `[pipeline]` (GUI imports it directly) |
 | `pygidsim` | 0.1.4 | declared in `[pipeline]` (GUI imports it directly) |
-| `mlgiddetect` | 0.2.3 | transitive via `mlgidbase` (GUI never imports it) |
+| `mlgiddetect` | 0.2.8 | transitive via `mlgidbase` (GUI never imports it) |
+| `networkx` | any | declared in `[pipeline]` (mlgidbase needs it, doesn't declare it) |
 
 **Pinning policy — exact `==`, not floors.** Each in-house backend
 release can shift the detection/fitting/matching numerics or the
 on-disk schema, so a bump must be a deliberate, test-rechecked change
 rather than something pip picks up silently. The `[pipeline]` extra
 therefore pins every directly-imported backend to an exact version
-(the baseline above). `mlgidbase 0.1.3` itself pins its own backends
-with `==` too (`pygid==0.2.10`, `mlgiddetect==0.2.3`, `pygidfit==0.1.3`,
+(the baseline above). `mlgidbase 0.1.5` itself pins its own backends
+with `==` too (`pygid==0.2.13`, `mlgiddetect==0.2.8`, `pygidfit==0.1.3`,
 `mlgidmatch==0.1.3`); `pygidsim==0.1.4` arrives via `mlgidmatch` and
 `pygid`. The GUI still declares `pygidfit`/`mlgidmatch`/`pygidsim`
 explicitly — rather than leaning on `mlgidbase`'s transitive closure —
 because it imports those three *directly*, so a future `mlgidbase`
 dropping one must surface as a clear resolver error, not a runtime
 `ImportError`. `mlgiddetect` is left transitive (the GUI never imports
-it). **To move the baseline up:** bump the pins here and in
-`pyproject.toml`, re-run the full suite + the end-to-end demo loop,
-then commit.
+it); its per-Python `onnxruntime-gpu` pins (CUDA 12 builds; 1.26.0 on
+Python 3.11+) carry the GPU runtime, so the GUI no longer pins
+onnxruntime itself. **To move the baseline up:** bump the pins here
+and in `pyproject.toml`, re-run the full suite + the end-to-end demo
+loop, then commit.
 
 **Runtime (non-pipeline) deps stay on `>=` floors on purpose.** The GUI
 stack — PySide6, pyqtgraph, silx, numpy, etc. — is *not* pinned exact,
@@ -210,3 +213,138 @@ pip install --force-reinstall --no-deps project_repos/mlgidBASE
     networkx items.
 - Rollback: `pip install mlgidbase==0.1.3` (phase tracking then
   reports the feature as unavailable; everything else unchanged).
+
+### 2026-07-21 — mlgidbase main @ `1b6514f` (unreleased, self-labelled 0.1.4)
+
+Moves the env past the 0.1.4 release (2026-07-07) onto current main,
+still `--no-deps` so the rest of the verified stack (pygid 0.2.10,
+mlgiddetect 0.2.3, onnxruntime-gpu 1.26.0) stays untouched — main
+pins `pygid==0.2.12` / `mlgiddetect==0.2.5`, neither vetted here:
+
+```bash
+pip install --no-deps --force-reinstall \
+    "git+https://github.com/mlgid-project/mlgidBASE@1b6514f"
+```
+
+- **Full suite green** against it after the GUI adaptations below.
+- What changed upstream since `561edfa` (0.1.4 tracking rework + the
+  fig/ax return commits):
+  - `track_peaks` **removed the `'amplitude'` axis** (ValueError:
+    invalid axis). The GUI now requests `axis='radius'` and recovers
+    amplitudes from the **return value**, which is no longer None:
+    pre-0.1.4 flat `(axis_arr, amplitude_all, G_comps_list)` and
+    0.1.4+ per-component frame-sorted `(axis_list, amplitude_list,
+    frame_num_list)` are both understood
+    (`phase_tracking.amplitudes_from_track_result`). Members outside
+    every component get NaN amplitude; `member_ids` therefore uses
+    amplitude only as a duplicate-breaker when finite.
+  - The `_plot_tracked_peaks` capture contract (positional 8-arg
+    call) is **unchanged** — verified at this sha.
+  - `plot_analysis_results` renamed `return_result` → `return_fig`;
+    the figure-export window now omits the kwarg entirely (default is
+    off under both names), so it works against every build.
+  - Upstream now clamps ring `angle_width = inf` to 45° inside
+    `_track_peaks` (in-memory only). Rings still form 1-member
+    components in practice; the GUI's own `track_rings` pass stays.
+  - The networkx packaging gap from the `561edfa` entry still holds.
+- Rollback: `pip install mlgidbase==0.1.3` or reinstall `561edfa`
+  (the GUI adaptations are backward-compatible with both).
+
+### 2026-07-21 — `onnxruntime-gpu==1.26.0` pinned in `[pipeline]`
+
+`mlgiddetect<=0.2.3` requires `onnxruntime-gpu` without a version.
+onnxruntime-gpu **1.27.0 (2026-06-18) hard-links `libcudart.so.13`
+at import time**; the CUDA 13 runtime arrives as pip `nvidia-*`
+wheels (via torch >= 2.12), but nothing puts them on the loader path,
+so in a fresh `[pipeline]` env `import mlgidbase` (→ mlgiddetect →
+onnxruntime) fails with *"libcudart.so.13: cannot open shared object
+file"* and the GUI misread it as "backend not installed". Two-part
+fix:
+
+- pin `onnxruntime-gpu==1.26.0` (the verified GPU-capable build that
+  imports lazily), and
+- `pipeline.is_mlgidbase_available` retries the import with `torch`
+  imported first (torch dlopens its bundled CUDA libraries, which
+  also satisfies onnxruntime 1.27+) and logs the real ImportError
+  instead of silently reporting "not installed".
+
+Trap for the next bump: **mlgiddetect >= 0.2.4 (2026-07-17) switched
+its dependency to CPU-only `onnxruntime`**, which ships the same
+Python module as `onnxruntime-gpu` — co-installing both clobbers
+files nondeterministically, and mlgidbase 0.1.4 additionally declares
+plain `onnxruntime` itself. When the extra moves to a stack with
+mlgiddetect >= 0.2.4, drop this pin and decide the GPU story
+explicitly (GPU detection needs `onnxruntime-gpu` present INSTEAD of
+the CPU package, and `pipeline.detection_on_gpu` handles provider
+selection + `preload_dlls`).
+
+### 2026-07-23 — mlgidbase 0.1.5 from PyPI, full released stack
+
+The first PyPI release containing the tracking rework: the env moves
+off git installs entirely — `pip install mlgidbase==0.1.5` WITH
+dependencies (pygid 0.2.13, mlgiddetect 0.2.8, pygidfit 0.1.3,
+mlgidmatch 0.1.3). Code-wise 0.1.5 is the `1b6514f` build the env
+already ran plus ensemble METADATA keys; the meaningful changes are
+dependency-level. Full suite green before and after the GUI
+adaptations below.
+
+- **Workarounds dropped** (fixed upstream):
+  - `is_mlgidbase_available`'s torch-first import retry — mlgiddetect
+    0.2.8 pins per-Python `onnxruntime-gpu` (CUDA 12, lazily
+    importing; 1.26.0 on py3.11+), so the libcudart.so.13 import trap
+    is gone; the `[pipeline]` `onnxruntime-gpu==1.26.0` pin is dropped
+    for the same reason.
+  - `detection_on_gpu`'s `torch.cuda.is_available` monkeypatch —
+    mlgiddetect >= 0.2.7 gates GPU on the ORT providers + a CUDA
+    driver probe (never torch) and falls back to CPU;
+    `MODEL_FORCE_CPU` forces CPU. The context manager now only
+    preloads onnxruntime's CUDA DLLs.
+  - `amplitudes_from_track_result`'s pre-0.1.4 flat-shape branch —
+    the pin guarantees the per-component return; the flat shape now
+    raises `UpstreamContractError`.
+  - `figure_export_window`'s omitted figure-return kwarg — passes
+    `return_fig=False` explicitly (the 0.1.4 rename is settled).
+- **Ring tracking, the fine print.** 0.1.5 clamps ring
+  `angle_width` inf -> 45 inside `_track_peaks`, but pygidfit
+  persists rings with `angle = NaN` (`pygidfit/box_utils.py`,
+  `make_box_attributes`), and NaN still poisons the (angle, radius)
+  IoU box — backend-fitted rings STILL end as discarded 1-member
+  components, so the GUI's `track_rings` pass stays. Rings stored
+  with a FINITE angle (mlgidLAB's injected rings persist
+  `angle = 45`) CAN now form native components; the result handler
+  (`_on_phase_track_result`) drops ring-member components from the
+  native payload before appending `track_rings` output, so every
+  physical ring yields exactly one track (regression:
+  `test_native_ring_components_not_double_counted`). Report upstream:
+  ring tracking wants radial IoU for `is_ring` rows, not an angle
+  clamp.
+- **Still true in 0.1.5 / still GUI-side** (checked at this bump):
+  `_plot_tracked_peaks` capture hook (the return value has per-track
+  arrays but no member coordinates or peak ids), `member_ids`
+  reconstruction, `_backfill_fitted_peaks_polar_to_cartesian`,
+  `_dedupe_matched_groups`, matched-row invalidation before refit,
+  `create_all=True` on CifPattern, the pygid pre-flight guards,
+  the energy-range guard, `normalize_for_pygid` (pygid 0.2.13's
+  `get_ai` still assumes 1-D `angle_of_incidence`), the manual
+  injection stack (`add_peak` upstream appends an unfitted detected
+  row only — no 2D fit, no plausibility gate, no rollback), GUI-side
+  peak delete (different cascade semantics), and the networkx
+  packaging gap (still undeclared by mlgidbase; now declared in the
+  GUI's `[pipeline]` extra).
+- **pygid 0.2.10 -> 0.2.13** (skimmed `v0.2.10..origin/main`):
+  fig/ax returns on visualization, `Conversion.get_result()`,
+  `NexusFile.set_beamtime_info()`, simulation range follows the image
+  range, and the module-level root-handler stripping in
+  `coordmaps`/`datasaver` is REMOVED (only a harmless plain
+  `basicConfig` remains in `conversion`). `det2*`, the datasaver
+  results dtype, and `get_ai` are unchanged — the GUI's row writers
+  and conversion path are unaffected.
+- **Detection results change on purpose:** mlgiddetect 0.2.6+
+  defaults to the 2-class `DINO_classAwareBaseline` (vs the
+  single-class dino that 0.2.3 shipped). Decision 2026-07-23: adopt
+  the new default; re-vet detection quality manually (legacy model
+  reachable via `ONNX_BASE: dino_old` + `CLASSAWARE_NMS: False`).
+- Rollback: reinstall the previous set
+  (`pip install --no-deps --force-reinstall "git+https://github.com/mlgid-project/mlgidBASE@1b6514f" pygid==0.2.10 mlgiddetect==0.2.3 onnxruntime-gpu==1.26.0`)
+  and revert the GUI commits of this bump (the dropped torch-gate
+  workaround matters on mlgiddetect <= 0.2.3).
