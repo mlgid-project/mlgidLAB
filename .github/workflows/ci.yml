@@ -62,7 +62,14 @@ jobs:
         # ``-v`` so each test name flushes to stdout *before* it runs;
         # without it a mid-test segfault dumps a C stack but the
         # Python-side test name never reaches the log, so we can't
-        # tell which test crashed. ``-rA`` also prints the per-test
-        # summary at the end (passed / skipped / failed names) for
-        # quick triage when one Python version diverges from another.
-        run: pytest -v -rA
+        # tell which test crashed (with xdist the worker id in each
+        # line still narrows it down). ``-rA`` also prints the
+        # per-test summary at the end (passed / skipped / failed
+        # names) for quick triage when one Python version diverges
+        # from another. ``-n auto --dist loadfile`` fans the suite out
+        # over the runner's cores (~4x wall-clock on the standard
+        # 4-vCPU runners); ``loadfile`` keeps every test file on one
+        # worker so per-file fixtures and ordering assumptions hold,
+        # and the conftest ``os._exit`` teardown guard is per-process,
+        # which the workers tolerate (validated on the full suite).
+        run: pytest -v -rA -n auto --dist loadfile
