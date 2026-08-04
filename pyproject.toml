@@ -53,9 +53,12 @@ dependencies = [
 [project.optional-dependencies]
 # pytest-qt drives the GUI smoke harness; tests run headless via
 # QT_QPA_PLATFORM=offscreen set in tests/conftest.py (no xvfb needed).
-# pytest-xdist parallelizes the suite across CPU cores (CI runs
-# ``-n auto --dist loadfile``; loadfile keeps each test file on one
-# worker, matching the suite's per-file fixture assumptions).
+# pytest-xdist parallelizes the suite across CPU cores for LOCAL runs
+# (``-n auto --dist loadfile``; loadfile keeps each test file on one
+# worker, matching the suite's per-file fixture assumptions). CI
+# deliberately does not use it — it hung on the hosted runners — and
+# fans out by sharding test files across matrix jobs instead (see
+# .github/workflows/ci.yml).
 dev = ["pytest>=8.0", "pytest-qt>=4.4", "pytest-xdist>=3.5"]
 # Pipeline backend (heavy: pulls torch + the mlgid analysis stack).
 # Install when you actually want to run detection/fitting/matching from
