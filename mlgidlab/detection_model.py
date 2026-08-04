@@ -185,12 +185,27 @@ def _model_type_from_yaml(config_path: str) -> str | None:
     neither of which is acceptable inside a GUI worker. The nesting
     mirrors ``Config.load_config``, which flattens ``{SECTION: {KEY:
     value}}`` into ``SECTION_KEY``.
+
+    PyYAML is used when present but is NOT a dependency of the GUI-only
+    install profile (it arrives with the pipeline extras), so a
+    minimal line parser covers its absence — precisely the profile
+    this pre-flight exists for.
     """
     try:
-        import yaml
-
         with open(config_path, encoding="utf-8") as handle:
-            data = yaml.safe_load(handle)
+            text = handle.read()
+    except OSError:
+        logger.debug(
+            "could not read MODEL_TYPE from %s; falling back to the "
+            "mlgidDETECT default", config_path, exc_info=True,
+        )
+        return None
+    try:
+        import yaml
+    except ImportError:
+        return _model_type_without_pyyaml(text)
+    try:
+        data = yaml.safe_load(text)
         section = (data or {}).get("MODEL")
         if isinstance(section, dict):
             value = section.get("TYPE")
@@ -201,6 +216,29 @@ def _model_type_from_yaml(config_path: str) -> str | None:
             "could not read MODEL_TYPE from %s; falling back to the "
             "mlgidDETECT default", config_path, exc_info=True,
         )
+    return None
+
+
+def _model_type_without_pyyaml(text: str) -> str | None:
+    """``MODEL:`` / ``TYPE:`` from the flat two-level block layout
+    mlgidDETECT configs use, without a YAML library. Deliberately
+    minimal: an exotic config (flow style, anchors) simply resolves to
+    None, which leaves the download decision to mlgidDETECT — the same
+    safe fallback as any other parse failure here."""
+    in_model = False
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if line[:1] not in (" ", "\t"):
+            in_model = line.strip() == "MODEL:"
+            continue
+        if not in_model:
+            continue
+        key, sep, value = line.strip().partition(":")
+        if sep and key.strip() == "TYPE":
+            value = value.strip().strip("'\"")
+            return value or None
     return None
 
 

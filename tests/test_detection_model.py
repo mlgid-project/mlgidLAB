@@ -149,6 +149,28 @@ def test_resolve_model_key_reads_a_yaml_config(tmp_path):
     assert detection_model.resolve_model_key("dino", str(config)) == "frcnn"
 
 
+def test_resolve_model_key_reads_yaml_without_pyyaml(tmp_path, monkeypatch):
+    """PyYAML is not part of the GUI-only install (it arrives with the
+    pipeline extras), and that profile is exactly who this pre-flight
+    serves — the config must still be honoured through the fallback
+    line parser. Regression: CI (no extras) resolved every config to
+    'dino'."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "yaml", None)  # import yaml -> ImportError
+    config = tmp_path / "detect.yaml"
+    config.write_text(
+        "# comment\nMODEL:\n  ONNX_BASE: dino_old\n  TYPE: 'faster_rcnn'\n"
+        "OTHER:\n  TYPE: not_this_one\n",
+        encoding="utf-8",
+    )
+    assert detection_model.resolve_model_key("dino", str(config)) == "frcnn"
+    # Still safe on a missing file / unknown type.
+    assert detection_model.resolve_model_key(
+        None, str(tmp_path / "gone.yaml")
+    ) == "dino"
+
+
 def test_resolve_model_key_survives_an_unreadable_config(tmp_path):
     """A missing config must not raise here — mlgidDETECT's own Config
     would ``sys.exit()`` on it, which is precisely why we parse the
