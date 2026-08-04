@@ -4,6 +4,49 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## 0.1.0a13 — thirteenth alpha (2026-08-04)
+
+Hotfix on `0.1.0a12`: detection was unusable on a fresh install that had
+never run mlgidDETECT from a terminal. No other changes, no on-disk
+schema changes.
+
+### Fixed
+
+- **Detection models now download on a GUI-only install.** mlgidDETECT
+  ships no `.onnx` weights; it fetches them on first use into a per-user
+  cache. That download crashed in any GUI process without a usable
+  console — notably on Windows, where the `gui-scripts` entry point runs
+  under `pythonw.exe` and `sys.stdout` is `None`, so mlgidDETECT's
+  progress bar died on its first `sys.stdout.write`. The failure was
+  then invisible twice over: the aborted transfer left a **zero-byte
+  `.onnx`** in the cache, which mlgidDETECT's existence-only check
+  accepts forever after (so no later run retried the download), and
+  every symptom surfaced as the same opaque *"Detection failed. Couldn't
+  load the model."* Anyone who had installed mlgidDETECT separately, and
+  so had a populated cache, was unaffected — which is why this survived
+  release testing.
+
+  The GUI now pre-flights the model before handing off to mlgidbase:
+  it guarantees writable `stdout`/`stderr` for the backend call,
+  downloads through a temp file that is only moved into place once the
+  byte count matches the server's `Content-Length`, reports progress and
+  errors through the Pipeline log panel, and names the cache directory
+  and source URL when a download fails so it can be completed by hand on
+  a proxied or air-gapped machine.
+
+  Existing broken installs self-heal: truncated and zero-byte cache
+  entries are removed and re-fetched on the next detection run. Complete
+  models are reused as before, verified once per session against the
+  server's size, and an unreachable server never invalidates a good
+  cached copy.
+
+### Changed
+
+- `mlgiddetect==0.2.8` is now declared explicitly in the `[pipeline]`
+  extra. It still resolves identically through mlgidbase; the GUI simply
+  imports it directly now (for the model cache directory and URL table),
+  and this repo declares what it imports.
+
 ## 0.1.0a12 — twelfth alpha (2026-07-23)
 
 Feature alpha on `0.1.0a11`: the Expected-pattern workflow and the move

@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from mlgidlab.detection_model import ensure_detection_model, safe_console
+
 import logging
 logger = logging.getLogger(__name__)
 
@@ -515,6 +517,22 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
                 Path(file_path).name, exc,
             )
 
+    # Pre-flight: make sure the detection weights are cached and intact
+    # *before* mlgidbase opens the file. mlgidDETECT ships no ``.onnx``
+    # and downloads on first use from inside ``Inference.__init__``,
+    # where every failure — no network, a GUI process without a usable
+    # ``sys.stdout``, a half-written file from a previous attempt —
+    # collapses into the same opaque "Detection failed. Couldn't load
+    # the model." Doing it here means progress and errors reach the log
+    # panel, and a failed download can never leave a corpse behind that
+    # poisons every later run. See ``mlgidlab.detection_model``.
+    if command.op_name == "run_detection":
+        with safe_console():
+            ensure_detection_model(
+                model_type=command.kwargs.get("model_type"),
+                config_detect=command.kwargs.get("config_detect"),
+            )
+
     # Import lazily — see the function docstring. Every pre-flight
     # above must be able to run on a CI box that lacks the private
     # ``mlgidbase`` backend.
@@ -568,7 +586,12 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
         )
     method = getattr(analysis, command.op_name)
     if command.op_name == "run_detection":
-        with detection_on_gpu():
+        # ``safe_console`` stays on for the call itself: the pre-flight
+        # above covers the model mlgidbase resolves, but any other
+        # ``sys.stdout.write`` deeper in mlgidDETECT (e.g. a download we
+        # did not anticipate) would otherwise still crash a GUI process
+        # that has no console.
+        with detection_on_gpu(), safe_console():
             result = method(**kwargs)
     elif command.op_name == "track_peaks":
         # The member-level tracking data is recovered through the
