@@ -630,16 +630,28 @@ class _UpdateInstallWorker(QObject):
 
     @Slot()
     def run(self) -> None:
+        # On Windows the running gui-scripts launcher (mlgidlab.exe) is
+        # locked and pip's uninstall of it fails with WinError 32; rename
+        # it aside first and put it back if the install fails. No-op
+        # elsewhere.
+        renames: list = []
         try:
+            renames = update_check.free_locked_launchers()
             proc = subprocess.run(
                 self._command,
                 capture_output=True,
                 text=True,
+                # Without this the pip child pops a transient console
+                # window under the console-less pythonw launch.
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
+            if proc.returncode != 0:
+                update_check.restore_launchers(renames)
             output = (proc.stdout or "") + (proc.stderr or "")
             self.finished.emit(proc.returncode, output)
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("update install worker failed", exc_info=True)
+            update_check.restore_launchers(renames)
             self.finished.emit(1, f"Failed to launch pip: {exc}")
 
 

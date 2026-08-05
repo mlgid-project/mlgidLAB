@@ -193,6 +193,128 @@ def test_pipeline_extra_installed(monkeypatch):
     assert uc.pipeline_extra_installed() is False
 
 
+# ----------------- Windows launcher rename (WinError 32) ----------------- #
+# A running gui-scripts launcher (Scripts\mlgidlab.exe) is locked on
+# Windows, so pip's uninstall of the old version dies with WinError 32.
+# free_locked_launchers renames it aside first; restore_launchers puts it
+# back if pip fails. The path logic is OS-independent, so these run
+# everywhere by forcing platform="nt" against a tmp scripts dir.
+def test_free_locked_launchers_noop_off_windows(tmp_path):
+    exe = tmp_path / "mlgidlab.exe"
+    exe.write_bytes(b"launcher")
+    assert uc.free_locked_launchers(
+        platform="posix", scripts_dir=tmp_path
+    ) == []
+    assert exe.exists()
+
+
+def test_free_locked_launchers_renames_exe_aside(tmp_path):
+    exe = tmp_path / "mlgidlab.exe"
+    exe.write_bytes(b"launcher")
+    renames = uc.free_locked_launchers(platform="nt", scripts_dir=tmp_path)
+    backup = tmp_path / "mlgidlab.exe.old"
+    assert renames == [(exe, backup)]
+    assert not exe.exists() and backup.read_bytes() == b"launcher"
+    # No launcher at all (e.g. console_scripts removed by hand) -> no-op.
+    assert uc.free_locked_launchers(
+        platform="nt", scripts_dir=tmp_path
+    ) == []
+
+
+def test_free_locked_launchers_sweeps_stale_backups(tmp_path):
+    exe = tmp_path / "mlgidlab.exe"
+    exe.write_bytes(b"new")
+    (tmp_path / "mlgidlab.exe.old").write_bytes(b"stale")
+    (tmp_path / "mlgidlab.exe.old2").write_bytes(b"staler")
+    renames = uc.free_locked_launchers(platform="nt", scripts_dir=tmp_path)
+    # Both leftovers deleted, so the rename lands on plain ".old" again.
+    assert renames == [(exe, tmp_path / "mlgidlab.exe.old")]
+    assert (tmp_path / "mlgidlab.exe.old").read_bytes() == b"new"
+    assert not (tmp_path / "mlgidlab.exe.old2").exists()
+
+
+def test_free_locked_launchers_skips_undeletable_backup(
+    tmp_path, monkeypatch
+):
+    # A backup from the PREVIOUS update whose process is still running
+    # can be neither deleted nor overwritten; the rename must land on
+    # the next free name instead.
+    from pathlib import Path
+
+    exe = tmp_path / "mlgidlab.exe"
+    exe.write_bytes(b"new")
+    locked = tmp_path / "mlgidlab.exe.old"
+    locked.write_bytes(b"still running")
+    monkeypatch.setattr(
+        Path, "unlink",
+        lambda self, *a, **k: (_ for _ in ()).throw(OSError("locked")),
+    )
+    renames = uc.free_locked_launchers(platform="nt", scripts_dir=tmp_path)
+    assert renames == [(exe, tmp_path / "mlgidlab.exe.old2")]
+    assert locked.read_bytes() == b"still running"
+    assert (tmp_path / "mlgidlab.exe.old2").read_bytes() == b"new"
+
+
+def test_restore_launchers(tmp_path):
+    exe = tmp_path / "mlgidlab.exe"
+    backup = tmp_path / "mlgidlab.exe.old"
+    # pip failed before installing a replacement -> backup renamed back.
+    backup.write_bytes(b"launcher")
+    uc.restore_launchers([(exe, backup)])
+    assert exe.read_bytes() == b"launcher" and not backup.exists()
+    # pip already wrote the new exe (or rolled back) -> keep it, drop
+    # the backup.
+    exe.write_bytes(b"fresh")
+    backup.write_bytes(b"old")
+    uc.restore_launchers([(exe, backup)])
+    assert exe.read_bytes() == b"fresh" and not backup.exists()
+
+
+def test_install_worker_frees_launchers_and_restores_on_failure(
+    qapp, monkeypatch
+):
+    import subprocess
+    import types
+    from mlgidlab.main_window import _UpdateInstallWorker
+
+    calls: list = []
+    renames = [("orig", "backup")]
+    monkeypatch.setattr(uc, "free_locked_launchers", lambda: renames)
+    monkeypatch.setattr(
+        uc, "restore_launchers", lambda r: calls.append(("restore", r))
+    )
+
+    ran: list = []
+
+    def _fake_run(cmd, **kwargs):
+        ran.append((cmd, kwargs))
+        return types.SimpleNamespace(
+            returncode=_fake_run.rc, stdout="out", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    results: list = []
+
+    # Success: launcher freed, restore NOT called.
+    _fake_run.rc = 0
+    worker = _UpdateInstallWorker(["pip", "install"])
+    worker.finished.connect(lambda rc, out: results.append(rc))
+    worker.run()
+    assert results == [0] and calls == []
+    # The pip child must not flash a console window under pythonw.
+    assert ran[0][1]["creationflags"] == getattr(
+        subprocess, "CREATE_NO_WINDOW", 0
+    )
+
+    # Failure: the renamed launcher is put back.
+    _fake_run.rc = 1
+    worker = _UpdateInstallWorker(["pip", "install"])
+    worker.finished.connect(lambda rc, out: results.append(rc))
+    worker.run()
+    assert results == [0, 1]
+    assert calls == [("restore", renames)]
+
+
 # --------------------------- MainWindow wiring --------------------------- #
 def test_banner_shown_only_when_outdated(main_window):
     from mlgidlab import __version__ as current

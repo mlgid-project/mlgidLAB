@@ -4,6 +4,20 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## Unreleased
+
+### Fixed
+
+- **In-GUI updates work on Windows.** "Update now" failed with
+  `[WinError 32]` when the app was started via the Start-menu /
+  `Scripts\mlgidlab.exe` launcher: pip's uninstall of the old version
+  has to remove that exe, but Windows locks the image file of a running
+  process. The updater now renames the launcher aside before running pip
+  (renaming a running exe is allowed) and restores it if the install
+  fails; stale backups are cleaned up on the next update. The pip child
+  also no longer flashes a transient console window under the windowed
+  launcher.
+
 ## 0.1.0a13 — thirteenth alpha (2026-08-04)
 
 Hotfix on `0.1.0a12`: detection was unusable on a fresh install that had

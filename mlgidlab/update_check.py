@@ -17,9 +17,12 @@ testable without a QApplication; the host (``main_window``) runs
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
 import sys
+import sysconfig
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -217,6 +220,82 @@ def build_upgrade_command(
     extra = "[pipeline]" if with_pipeline else ""
     spec = f"{DIST_NAME}{extra} @ git+{REPO_GIT_URL}@{tag}"
     return [executable, "-m", "pip", "install", "--upgrade", spec]
+
+
+# --------------------------------------------------------------------- #
+# Windows: free the running launcher exe before pip touches it
+# --------------------------------------------------------------------- #
+LAUNCHER_BACKUP_SUFFIX = ".old"
+
+
+def _scripts_dir() -> Path:
+    """The environment's console/GUI-scripts directory (``Scripts`` on
+    Windows, ``bin`` elsewhere)."""
+    return Path(sysconfig.get_path("scripts"))
+
+
+def free_locked_launchers(
+    *,
+    platform: str | None = None,
+    scripts_dir: Path | None = None,
+) -> list[tuple[Path, Path]]:
+    """On Windows, rename this dist's launcher exe out of pip's way.
+
+    When the GUI runs via the ``gui-scripts`` launcher
+    (``Scripts\\mlgidlab.exe``), that exe is the image of a live process
+    and Windows refuses to delete or overwrite it — pip's uninstall of
+    the old version then dies with ``[WinError 32]``. Renaming a running
+    exe IS allowed, so the launcher is moved aside first; pip logs the
+    RECORD entry as already-missing and installs a fresh exe. The backup
+    stays locked until the app exits and is swept on a later call.
+
+    Returns the ``(original, backup)`` renames performed, for
+    :func:`restore_launchers` to undo if pip fails.
+    """
+    if platform is None:
+        platform = os.name
+    if platform != "nt":
+        return []
+    if scripts_dir is None:
+        scripts_dir = _scripts_dir()
+    exe = scripts_dir / f"{DIST_NAME}.exe"
+    # Sweep backups from earlier updates whose process has since exited.
+    for stale in scripts_dir.glob(f"{exe.name}{LAUNCHER_BACKUP_SUFFIX}*"):
+        with contextlib.suppress(OSError):
+            stale.unlink()
+    if not exe.exists():
+        return []
+    renames: list[tuple[Path, Path]] = []
+    for n in range(1, 10):
+        suffix = LAUNCHER_BACKUP_SUFFIX + (str(n) if n > 1 else "")
+        backup = exe.with_name(exe.name + suffix)
+        if backup.exists():
+            continue  # a still-locked backup survived the sweep
+        try:
+            exe.rename(backup)
+        except OSError:
+            # Leave things as they were; pip will fail exactly as it
+            # does today and the failure dialog shows the manual path.
+            break
+        renames.append((exe, backup))
+        break
+    return renames
+
+
+def restore_launchers(renames: list[tuple[Path, Path]]) -> None:
+    """Undo :func:`free_locked_launchers` after a failed install.
+
+    If pip never wrote a replacement, the backup is renamed back so the
+    launcher is not lost. If the original exists again (pip rolled back
+    the uninstall or got far enough to install the new exe), the backup
+    is just dropped, best-effort.
+    """
+    for original, backup in renames:
+        with contextlib.suppress(OSError):
+            if original.exists():
+                backup.unlink()
+            else:
+                backup.rename(original)
 
 
 # --------------------------------------------------------------------- #

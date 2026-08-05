@@ -52,6 +52,23 @@ import pytest  # noqa: E402
 # short-lived process. No test depends on gc (verified by grep).
 gc.disable()
 
+# --- QSettings hermeticity, all platforms ----------------------------
+# The XDG_CONFIG_HOME redirect above only reaches QSettings' INI backend,
+# i.e. Linux. On Windows the default backend is the REGISTRY: tests would
+# touch real machine state, and with no organization name set (only
+# mlgidlab.main() sets one, tests never call it) registry writes don't
+# round-trip at all — setValue() followed by value() returned None on the
+# windows-latest runner. Forcing the INI format into the per-run config
+# root gives every platform the exact hermetic behaviour Linux already
+# had. Importing QtCore here is fine: the environment lockdown above has
+# already run, and pytest-qt (imported just below) pulls in Qt anyway.
+from PySide6.QtCore import QSettings  # noqa: E402
+
+QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+QSettings.setPath(
+    QSettings.Format.IniFormat, QSettings.Scope.UserScope, _CONFIG_ROOT
+)
+
 import pytestqt.qtbot as _qtbot_mod  # noqa: E402
 _PIN=[]
 _oaw=_qtbot_mod._add_widget
@@ -101,6 +118,27 @@ def pytest_unconfigure(config):
         pass
     sys.stdout.flush()
     sys.stderr.flush()
+    if os.name == "nt":
+        # os._exit is NOT immediate on Windows: it reaches ExitProcess,
+        # which still runs every loaded DLL's process-detach handler --
+        # and the Qt/silx native teardown dies there with an access
+        # violation that clobbers the exit status (observed on
+        # windows-latest: "50 passed", then faulthandler's "Windows
+        # fatal exception: access violation" pointing at this hook, then
+        # exit code 1). TerminateProcess skips DLL detach entirely and
+        # preserves the real pytest status. The argtypes declaration is
+        # load-bearing: the current-process pseudo-handle is -1, and
+        # ctypes' default int conversion truncates it to a 32-bit
+        # 0xFFFFFFFF on x64, making the call fail silently and fall
+        # through to the crashy os._exit below.
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32")
+        kernel32.TerminateProcess.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+        kernel32.TerminateProcess.restype = ctypes.c_int
+        kernel32.TerminateProcess(
+            ctypes.c_void_p(-1), _PYTEST_EXIT_STATUS
+        )
     os._exit(_PYTEST_EXIT_STATUS)
 
 
