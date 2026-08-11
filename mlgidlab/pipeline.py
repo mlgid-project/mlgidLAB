@@ -517,6 +517,52 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
                 Path(file_path).name, exc,
             )
 
+    # Big scans: upstream track_peaks builds a dense all-against-all
+    # IoU matrix over the scan's total fitted-peak count N and needs
+    # ~64 * N**2 bytes — the kernel OOM-kills the whole app when that
+    # exceeds RAM (observed at 602 frames / 43645 peaks = ~122 GB on
+    # a 30 GB machine). When the estimate says the dense run would not
+    # fit comfortably, run the GUI's blocked equivalent instead:
+    # identical boxes, IoU rule and length cut, bounded memory (see
+    # phase_tracking.track_peaks_blocked). Placed BEFORE the mlgidbase
+    # import so it reads via h5py only and never competes with a pygid
+    # r+ handle on the same file.
+    if command.op_name == "track_peaks":
+        from mlgidlab.phase_tracking import (
+            TRACKING_DENSE_MEM_FRACTION,
+            available_memory_bytes,
+            estimate_tracking_memory,
+            track_peaks_blocked,
+        )
+
+        track_entry = str(command.kwargs.get("entry") or "")
+        n_peaks, needed = estimate_tracking_memory(file_path, track_entry)
+        mem_available = available_memory_bytes()
+        if (
+            needed and mem_available
+            and needed > mem_available * TRACKING_DENSE_MEM_FRACTION
+        ):
+            logging.getLogger("mlgidBASE").info(
+                "track_peaks: %s fitted peaks would need ~%.0f GB with "
+                "the upstream dense IoU (%.0f GB available) — running "
+                "the memory-safe blocked computation instead "
+                "(identical result).",
+                f"{n_peaks:,}", needed / 1e9, mem_available / 1e9,
+            )
+            try:
+                return track_peaks_blocked(
+                    file_path,
+                    track_entry,
+                    threshold=float(command.kwargs.get("threshold", 0.5)),
+                    length=int(command.kwargs.get("length", 10)),
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"track_peaks found no fitted peaks in entry "
+                    f"{command.kwargs.get('entry')!r} — run Fitting "
+                    f"(all frames) first. ({exc})"
+                ) from exc
+
     # Pre-flight: make sure the detection weights are cached and intact
     # *before* mlgidbase opens the file. mlgidDETECT ships no ``.onnx``
     # and downloads on first use from inside ``Inference.__init__``,

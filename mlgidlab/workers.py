@@ -8,6 +8,7 @@ import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 from mlgidlab.conversion import execute as conversion_execute
+from mlgidlab.conversion import import_converted_stack
 from mlgidlab.conversion_panel import ConversionConfig, RawScan
 from mlgidlab.pipeline import (
     PipelineCommand,
@@ -424,23 +425,60 @@ _FRAME_DONE_RE = re.compile(
     r"frame: (?P<frame>\d+)"
 )
 
+# Frames that produce no result finish WITHOUT a "Saved ..." line —
+# mlgidbase logs a skip line instead and returns early:
+#   matching, no solutions above threshold:
+#     "No solutions for (<file>, entry: <e>, frame: <n>) was found. ..."
+#     (mlgidbase/mlgidmatch_functions.py:~231; the from-memory variant
+#     "No solutions was found. ..." has no "for (" and stays ignored)
+#   detection, model found nothing:
+#     "No peaks detected for file: <file>, entry: <e>, frame: <n>"
+#     (mlgidbase/mlgiddetect_functions.py:~178)
+#   detection, preprocessing/inference failed for the frame:
+#     "Detection failed. <reason>"  (mlgiddetect_functions.py:~300-324,
+#     exactly one warning per skipped frame, no entry/frame in the text)
+# Each such line marks exactly one finished frame. They must count as
+# progress ticks: a run with skipped frames otherwise undercounts and
+# the bar visibly lags the log, then jumps to 100% at the end.
+_FRAME_SKIP_PREFIXES = (
+    "No solutions for (",
+    "No peaks detected for file: ",
+    "Detection failed.",
+)
+_FRAME_SKIP_RES = (
+    re.compile(
+        r"No solutions for \(.*, entry: (?P<entry>[^,]+), "
+        r"frame: (?P<frame>\d+)\)"
+    ),
+    re.compile(
+        r"No peaks detected for file: .*, entry: (?P<entry>[^,]+), "
+        r"frame: (?P<frame>\d+)"
+    ),
+    re.compile(r"Detection failed\."),
+)
+
 
 class _FrameProgressHandler(logging.Handler):
     """Counts mlgidbase per-frame completion log lines and emits a Qt
     signal so the GUI can size a progress bar.
 
+    A frame is "done" when mlgidbase logs either its "Saved … peaks"
+    save line or one of the ``_FRAME_SKIP_PREFIXES`` skip lines
+    (no-solution / no-peaks / failed frames end without a save).
+    Counting both keeps the bar in lock-step with the log output.
+
     Composed alongside ``_SignalLogHandler`` rather than folded into
     it: the string handler still forwards every record to the log
-    panel verbatim; this one classifies the subset that match
-    ``_FRAME_DONE_RE`` and turns them into structured progress events.
+    panel verbatim; this one classifies the subset that mark frame
+    completion and turns them into structured progress events.
     Decoupling the two means a future tweak to the visible log format
     can't accidentally break progress tracking and vice versa.
 
-    Performance: the raw-msg prefix check (``startswith``) is the only
-    work paid by the overwhelming majority of records (clustering /
-    fitting INFO lines, etc.). Only the per-frame "Saved … peaks"
-    records pay ``getMessage`` + regex match + Qt signal emit, and
-    those are emitted at most once per frame by mlgidbase.
+    Performance: the raw-msg prefix checks (``startswith``) are the
+    only work paid by the overwhelming majority of records (clustering
+    / fitting INFO lines, etc.). Only the per-frame completion records
+    pay ``getMessage`` + regex match + Qt signal emit, and those are
+    emitted at most once per frame by mlgidbase.
     """
 
     def __init__(self, sink: Signal, total: int, op_name: str) -> None:
@@ -449,21 +487,38 @@ class _FrameProgressHandler(logging.Handler):
         self._total = int(total)
         self._op = str(op_name)
         self._done = 0
+        # Last entry name parsed from a completion line — reused for
+        # skip lines that carry no entry ("Detection failed. …") so
+        # the panel label stays stable mid-run. Display-only.
+        self._entry = ""
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             # Fast-path: bail before computing the formatted message
             # on records whose raw format string can't be a frame-
-            # completion line. mlgidbase uses f-strings for these
-            # lines so ``record.msg`` is the literal final text
-            # including the ``Saved `` prefix.
+            # completion line. mlgidbase uses f-strings/str.format for
+            # these lines so ``record.msg`` is the literal final text
+            # including the prefix.
             raw = record.msg
-            if not isinstance(raw, str) or not raw.startswith(_FRAME_DONE_PREFIX):
+            if not isinstance(raw, str):
                 return
-            # Anchored match — the line is fully described by the
+            # Anchored matches — each line is fully described by its
             # regex from char 0 so re.match avoids a full-string scan.
-            m = _FRAME_DONE_RE.match(record.getMessage())
-            if not m:
+            if raw.startswith(_FRAME_DONE_PREFIX):
+                m = _FRAME_DONE_RE.match(record.getMessage())
+                if not m:
+                    return
+                self._entry = m.group("entry")
+            elif raw.startswith(_FRAME_SKIP_PREFIXES):
+                msg = record.getMessage()
+                for rx in _FRAME_SKIP_RES:
+                    m = rx.match(msg)
+                    if m:
+                        break
+                else:
+                    return
+                self._entry = m.groupdict().get("entry") or self._entry
+            else:
                 return
             self._done += 1
             # Don't clamp _done > _total: if mlgidbase emits more
@@ -477,7 +532,7 @@ class _FrameProgressHandler(logging.Handler):
                 done_capped,
                 self._total,
                 self._op,
-                m.group("entry"),
+                self._entry,
             )
         except Exception:
             logger.debug("suppressed exception in _FrameProgressHandler.emit", exc_info=True)
@@ -545,6 +600,58 @@ class ConversionWorker(QObject):
         finally:
             root.removeHandler(handler)
             root.setLevel(prev_level)
+
+
+class ImportWorker(QObject):
+    """Writes pre-converted images into one N-frame entry, off-thread.
+
+    Thin wrapper around ``conversion.import_converted_stack``: per-frame
+    ``progress(done, total)`` ticks for the host's progress dialog and
+    ``finished(Path | None, Exception | None)`` on completion. No pygid
+    involved — the images are copied verbatim, not converted.
+    """
+
+    finished = Signal(object, object)  # (Path | None, Exception | None)
+    progress = Signal(int, int)        # (done, total)
+
+    def __init__(
+        self,
+        paths: list[Path],
+        out_path: Path,
+        entry_name: str,
+        qxy_range: tuple[float, float] | None,
+        qz_range: tuple[float, float] | None,
+        ai: float,
+        flip_vertical: bool,
+        wavelength_A: float | None = None,
+    ) -> None:
+        super().__init__()
+        self._paths = list(paths)
+        self._out_path = out_path
+        self._entry_name = entry_name
+        self._qxy_range = qxy_range
+        self._qz_range = qz_range
+        self._ai = ai
+        self._flip_vertical = flip_vertical
+        self._wavelength_A = wavelength_A
+
+    def run(self) -> None:
+        try:
+            out = import_converted_stack(
+                self._paths,
+                self._out_path,
+                entry_name=self._entry_name,
+                qxy_range=self._qxy_range,
+                qz_range=self._qz_range,
+                ai=self._ai,
+                flip_vertical=self._flip_vertical,
+                wavelength_A=self._wavelength_A,
+                progress=lambda i, n: self.progress.emit(i, n),
+            )
+            self.finished.emit(out, None)
+        except Exception as exc:
+            logger.debug("suppressed exception in ImportWorker.run", exc_info=True)
+            self.finished.emit(None, exc)
 
 
 class PipelineWorker(QObject):
@@ -793,6 +900,117 @@ class ScanProfileWorker(QObject):
         except Exception as exc:
             logger.debug(
                 "suppressed exception in ScanProfileWorker.run",
+                exc_info=True,
+            )
+            self.finished.emit(None, exc)
+
+
+class RoiTraceWorker(QObject):
+    """Computes per-track background-subtracted ROI-intensity traces
+    for the amplitude-evolution view's "integrated intensity (ROI)"
+    metric (see ``mlgidlab.roi_intensity`` for the method).
+
+    Read-only through its own h5py handle, one frame at a time: each
+    frame is read ONCE and every track's ROI is evaluated on it, so
+    memory stays O(one frame) and the scan is traversed once no matter
+    how many tracks there are.
+
+    ``positions`` maps track index -> ``(q_xy, q_z)`` per-frame center
+    arrays (``roi_intensity.track_frame_positions`` output). Result::
+
+        {"kind": "roi_traces", "frames": (n,) int, "traces":
+         {track: (n,) float}, "params": (half_q_xy, half_q_z,
+         gap_px, strip_px), "entry": str}
+
+    Emits ``progress(done, total)`` per frame and
+    ``finished(result_dict | None, Exception | None)``.
+    """
+
+    finished = Signal(object, object)
+    progress = Signal(int, int)
+
+    def __init__(
+        self,
+        file_path: Path,
+        entry: str,
+        positions: dict,
+        half_q_xy: float,
+        half_q_z: float,
+        gap_px: int,
+        strip_px: int,
+    ) -> None:
+        super().__init__()
+        self._file_path = file_path
+        self._entry = entry
+        self._positions = {
+            int(k): (
+                np.asarray(px, dtype=float), np.asarray(pz, dtype=float)
+            )
+            for k, (px, pz) in positions.items()
+        }
+        self._half_q_xy = float(half_q_xy)
+        self._half_q_z = float(half_q_z)
+        self._gap_px = int(gap_px)
+        self._strip_px = int(strip_px)
+
+    def run(self) -> None:
+        try:
+            import h5py
+
+            from mlgidlab.roi_intensity import integrate_roi
+
+            with h5py.File(self._file_path, "r") as f:
+                data = f[self._entry]["data"]
+                signal = data.attrs.get("signal")
+                if isinstance(signal, bytes):
+                    signal = signal.decode("utf-8", errors="replace")
+                ds = data[signal or "img_gid_q"]
+                q_xy = np.asarray(data["q_xy"], dtype=float)
+                q_z = np.asarray(data["q_z"], dtype=float)
+                # integrate_roi needs increasing axes; flip once here
+                # (and mirror each frame to match) if a file ever
+                # stores them descending.
+                flip_x = q_xy.size > 1 and q_xy[0] > q_xy[-1]
+                flip_z = q_z.size > 1 and q_z[0] > q_z[-1]
+                if flip_x:
+                    q_xy = q_xy[::-1]
+                if flip_z:
+                    q_z = q_z[::-1]
+                n = int(ds.shape[0])
+                traces = {
+                    k: np.full(n, np.nan) for k in self._positions
+                }
+                for i in range(n):
+                    frame = np.asarray(ds[i], dtype=np.float64)
+                    if flip_z:
+                        frame = frame[::-1, :]
+                    if flip_x:
+                        frame = frame[:, ::-1]
+                    for k, (px, pz) in self._positions.items():
+                        j = min(i, px.size - 1)
+                        traces[k][i] = integrate_roi(
+                            frame, q_xy, q_z,
+                            float(px[j]), float(pz[j]),
+                            half_q_xy=self._half_q_xy,
+                            half_q_z=self._half_q_z,
+                            gap_px=self._gap_px,
+                            strip_px=self._strip_px,
+                        )
+                    self.progress.emit(i + 1, n)
+            result = {
+                "kind": "roi_traces",
+                "frames": np.arange(n),
+                "traces": traces,
+                "params": (
+                    self._half_q_xy, self._half_q_z,
+                    self._gap_px, self._strip_px,
+                ),
+                "entry": self._entry,
+            }
+            self.finished.emit(result, None)
+        except Exception as exc:
+            logger.debug(
+                "suppressed exception in RoiTraceWorker.run",
                 exc_info=True,
             )
             self.finished.emit(None, exc)

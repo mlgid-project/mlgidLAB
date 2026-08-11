@@ -111,6 +111,65 @@ def list_orientations(cif_pattern, cif_idx: int) -> list[tuple[int, int, int]]:
     return out
 
 
+def parse_hkl(text: str) -> tuple[int, int, int]:
+    """Parse a user-typed orientation like ``"0 0 1"`` / ``"-1,1,0"``.
+
+    Accepts three integers separated by spaces, commas or semicolons
+    (signs allowed). Raises ``ValueError`` with a user-readable message
+    on anything else — including the direction-less ``0 0 0``, which is
+    what the random/powder mode is for.
+    """
+    import re
+
+    parts = [p for p in re.split(r"[,;\s]+", str(text).strip()) if p]
+    if len(parts) != 3:
+        raise ValueError(
+            f"{str(text).strip()!r} — type three integers, e.g. 0 0 1"
+        )
+    try:
+        h, k, l = (int(p) for p in parts)
+    except ValueError:
+        raise ValueError(
+            f"{str(text).strip()!r} — Miller indices must be integers"
+        ) from None
+    if (h, k, l) == POWDER_HKL:
+        raise ValueError(
+            "(0 0 0) has no direction — use the random (powder) mode "
+            "for the ring pattern"
+        )
+    return h, k, l
+
+
+def resolve_orientation(cif_pattern, cif_idx: int, hkl) -> tuple | None:
+    """Match a typed ``hkl`` against the CIF's precomputed orientations.
+
+    Two spellings describe the same texture direction when they differ
+    only by a common integer factor or an overall sign, so both sides
+    compare gcd-reduced (with the sign flip tried too): ``0 0 1``,
+    ``0 0 -1`` and ``0 0 2`` all resolve to whichever spelling the
+    precomputed set stores. Returns the stored orientation tuple (so
+    ``extract_pattern`` will find it), or None when the direction is
+    not simulated.
+    """
+    from math import gcd
+
+    def reduced(triple) -> tuple[int, int, int]:
+        h, k, l = (int(v) for v in triple)
+        g = gcd(gcd(abs(h), abs(k)), abs(l))
+        return (h // g, k // g, l // g) if g > 1 else (h, k, l)
+
+    want = reduced(hkl)
+    want_neg = tuple(-v for v in want)
+    try:
+        orients = list_orientations(cif_pattern, cif_idx)
+    except (AttributeError, IndexError, TypeError):
+        return None
+    for stored in orients:
+        if reduced(stored) in (want, want_neg):
+            return stored
+    return None
+
+
 def orientation_index(cif_pattern, cif_idx: int, hkl) -> int | None:
     """Row index of ``hkl`` in the CIF's orientation list, or None.
 

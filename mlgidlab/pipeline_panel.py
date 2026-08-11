@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QRadioButton,
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mlgidlab.frame_range import parse_frame_range
 from mlgidlab.pipeline import PipelineCommand, is_mlgidbase_available
 
 
@@ -49,6 +51,7 @@ ENTRY_ALL = "All entries"
 
 FRAME_ACTIVE = "Active frame"
 FRAME_ALL = "All frames"
+FRAME_RANGE = "Frame range…"
 
 # Human-readable titles for the mlgidBASE method names emitted via
 # ``PipelineWorker.frameProgress`` — used by the progress label and
@@ -154,6 +157,7 @@ class PipelinePanel(QWidget):
         # back to mlgidBASE's own None-default (all entries / all frames).
         self._get_active_entry: Callable[[], str | None] | None = None
         self._get_active_frame: Callable[[], int | None] | None = None
+        self._get_frame_count: Callable[[], int | None] | None = None
         # CIF cache: ``_cached_cif_input`` is the raw text the user
         # parsed against; ``_cached_cif_obj`` is the resulting CifPattern
         # (or other pre-loaded object). Run Matching forwards the cache
@@ -173,6 +177,13 @@ class PipelinePanel(QWidget):
         self, fn: Callable[[], int | None]
     ) -> None:
         self._get_active_frame = fn
+
+    def set_frame_count_resolver(
+        self, fn: Callable[[], int | None]
+    ) -> None:
+        """Resolver for the active entry's frame count — validates the
+        "Frame range…" scope at click time."""
+        self._get_frame_count = fn
 
     def append_log(self, msg: str) -> None:
         """Forward ``msg`` to the shared Logs dock via ``logMessage``."""
@@ -433,7 +444,10 @@ class PipelinePanel(QWidget):
 
         self.det_frame_scope = QComboBox()
         self.det_frame_scope.addItems([FRAME_ALL, FRAME_ACTIVE])
-        form.addRow("Frames:", self.det_frame_scope)
+        self.det_frame_range, det_frames_row = self._frame_scope_widgets(
+            self.det_frame_scope
+        )
+        form.addRow("Frames:", det_frames_row)
 
         # YAML config picker — passed straight through to mlgidBASE's
         # ``config_detect`` argument when non-empty.
@@ -483,7 +497,10 @@ class PipelinePanel(QWidget):
 
         self.fit_frame_scope = QComboBox()
         self.fit_frame_scope.addItems([FRAME_ALL, FRAME_ACTIVE])
-        form.addRow("Frames:", self.fit_frame_scope)
+        self.fit_frame_range, fit_frames_row = self._frame_scope_widgets(
+            self.fit_frame_scope
+        )
+        form.addRow("Frames:", fit_frames_row)
 
         # Match mlgidbase defaults exactly so an unedited form yields the
         # same behaviour as a bare ``analysis.run_fitting()`` call.
@@ -561,7 +578,10 @@ class PipelinePanel(QWidget):
 
         self.match_frame_scope = QComboBox()
         self.match_frame_scope.addItems([FRAME_ALL, FRAME_ACTIVE])
-        form.addRow("Frames:", self.match_frame_scope)
+        self.match_frame_range, match_frames_row = self._frame_scope_widgets(
+            self.match_frame_scope
+        )
+        form.addRow("Frames:", match_frames_row)
 
         # Mutually-exclusive radio buttons in a single QButtonGroup —
         # one sits at the start of each input row, so the user picks
@@ -776,7 +796,10 @@ class PipelinePanel(QWidget):
     def _on_run_detection(self) -> None:
         kwargs: dict = {}
         self._inject_entry_scope(self.det_entry_scope, kwargs)
-        self._inject_frame_scope(self.det_frame_scope, kwargs)
+        if not self._inject_frame_scope(
+            self.det_frame_scope, self.det_frame_range, kwargs
+        ):
+            return
         cfg = self.det_config_path.text().strip()
         if cfg:
             kwargs["config_detect"] = cfg
@@ -788,7 +811,10 @@ class PipelinePanel(QWidget):
     def _on_run_fitting(self) -> None:
         kwargs: dict = {}
         self._inject_entry_scope(self.fit_entry_scope, kwargs)
-        self._inject_frame_scope(self.fit_frame_scope, kwargs)
+        if not self._inject_frame_scope(
+            self.fit_frame_scope, self.fit_frame_range, kwargs
+        ):
+            return
         kwargs["crit_angle"] = float(self.fit_crit_angle.value())
         kwargs["clustering_distance_peaks"] = float(self.fit_dist_peaks.value())
         kwargs["clustering_distance_rings"] = float(self.fit_dist_rings.value())
@@ -882,7 +908,10 @@ class PipelinePanel(QWidget):
         if kwargs is None:
             return
         self._inject_entry_scope(self.match_entry_scope, kwargs)
-        self._inject_frame_scope(self.match_frame_scope, kwargs)
+        if not self._inject_frame_scope(
+            self.match_frame_scope, self.match_frame_range, kwargs
+        ):
+            return
         self.runRequested.emit(PipelineCommand("run_matching", kwargs))
 
     def _on_parse_cifs(self) -> None:
@@ -1047,14 +1076,80 @@ class PipelinePanel(QWidget):
             finally:
                 combo.blockSignals(False)
 
-    def _inject_frame_scope(self, combo: QComboBox, kwargs: dict) -> None:
-        if combo.currentText() != FRAME_ACTIVE:
-            return
-        if self._get_active_frame is None:
-            return
-        active = self._get_active_frame()
-        if active is not None:
-            kwargs["frame_num"] = int(active)
+    def _frame_scope_widgets(
+        self, combo: QComboBox
+    ) -> tuple[QLineEdit, QWidget]:
+        """Extend a Frames scope combo with the "Frame range…" option
+        and its expression field (shown only while that scope is
+        selected). Returns ``(edit, row_widget)``; the row replaces the
+        bare combo in the form so the layout keeps its shape."""
+        combo.addItem(FRAME_RANGE)
+        edit = QLineEdit()
+        edit.setPlaceholderText("e.g. 0-34,40")
+        edit.setToolTip(
+            "Frames to process: comma-separated 0-based indices and "
+            "inclusive A-B ranges (like 0-34,40). Checked against the "
+            "active entry's frame count when you press Run."
+        )
+        edit.setVisible(False)
+        combo.currentTextChanged.connect(
+            lambda text, e=edit: e.setVisible(text == FRAME_RANGE)
+        )
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        lay.addWidget(combo)
+        lay.addWidget(edit, 1)
+        return edit, row
+
+    def _inject_frame_scope(
+        self, combo: QComboBox, edit: QLineEdit, kwargs: dict
+    ) -> bool:
+        """Resolve the Frames scope into ``kwargs["frame_num"]``.
+
+        Returns False when the run must not start — a malformed
+        "Frame range…" expression or one with no frame inside the
+        scan (the user is told via a warning box). mlgidBASE accepts
+        ``frame_num`` as None / int / list, so the range simply rides
+        the existing kwarg."""
+        scope = combo.currentText()
+        if scope == FRAME_ACTIVE:
+            if self._get_active_frame is None:
+                return True
+            active = self._get_active_frame()
+            if active is not None:
+                kwargs["frame_num"] = int(active)
+            return True
+        if scope != FRAME_RANGE:
+            return True
+        n_frames = (
+            self._get_frame_count() if self._get_frame_count else None
+        ) or 0
+        try:
+            valid, dropped = parse_frame_range(
+                edit.text(), n_frames=int(n_frames)
+            )
+        except ValueError as exc:
+            QMessageBox.warning(
+                self, "Frame range",
+                f"Cannot run: invalid frame range — {exc}",
+            )
+            return False
+        if not valid:
+            QMessageBox.warning(
+                self, "Frame range",
+                "Cannot run: no frame in the range lies inside the "
+                f"scan (frames 0..{max(int(n_frames) - 1, 0)}).",
+            )
+            return False
+        if dropped:
+            self.append_log(
+                f"Frame range: ignoring {len(dropped)} frame(s) outside "
+                f"0..{int(n_frames) - 1}."
+            )
+        kwargs["frame_num"] = valid
+        return True
 
     def _browse_detect_config(self) -> None:
         path, _ = QFileDialog.getOpenFileName(

@@ -199,3 +199,149 @@ def test_validate_append_target(tmp_path):
     cfg.append_entry = "entry_9999"
     with pytest.raises(ValueError, match="not found"):
         conversion._validate_append_target(cfg, {Path("raw.h5"): out})
+
+
+# -- engine: single-entry output mode ------------------------------------
+
+
+class _RecordingPygid:
+    """Minimal pygid stand-in recording each conversion call's routing
+    kwargs — lets the single-entry group/overwrite logic run in CI
+    without the pipeline extra installed."""
+
+    calls: list[dict]
+
+    class ExpParams:
+        def __init__(self, **kw):
+            pass
+
+    class CoordMaps:
+        def __init__(self, params, **kw):
+            pass
+
+    class SampleMetadata:
+        def __init__(self, **kw):
+            pass
+
+    class ExpMetadata:
+        def __init__(self, **kw):
+            pass
+
+    def __init__(self):
+        _RecordingPygid.calls = []
+        outer = self
+
+        class Conversion:
+            def __init__(self, matrix=None, path=None, dataset=None,
+                         frame_num=None):
+                self._path = path
+
+            def det2q_gid(self, **kwargs):
+                outer.calls.append({"path": self._path, **kwargs})
+
+        self.Conversion = Conversion
+
+
+def test_single_entry_mode_routes_all_scans_into_one_group(
+    tmp_path, monkeypatch
+):
+    """Every scan targets the SAME fresh entry; only the first call may
+    overwrite (a later overwrite would truncate the growing stack)."""
+    import sys
+
+    from mlgidlab.conversion_panel import OUTPUT_SINGLE_ENTRY, RawScan
+
+    fake = _RecordingPygid()
+    monkeypatch.setitem(sys.modules, "pygid", fake)
+    poni = _write_poni(tmp_path)
+    scans = [
+        RawScan(file_path=tmp_path / f"i{i}.tif", entry="", frame_num=None)
+        for i in range(3)
+    ]
+    cfg = ConversionConfig(
+        poni_path=poni,
+        ai=0.1,
+        output_mode=OUTPUT_SINGLE_ENTRY,
+        output_dir=tmp_path,
+        overwrite_file=True,
+        overwrite_dataset=True,
+    )
+    written = conversion.execute(scans, cfg)
+
+    assert written == [tmp_path / "converted.h5"]
+    calls = _RecordingPygid.calls
+    assert len(calls) == 3
+    assert {c["h5_group"] for c in calls} == {"entry_0000"}
+    assert [c["overwrite_file"] for c in calls] == [True, False, False]
+    assert [c["overwrite_group"] for c in calls] == [True, False, False]
+
+    # Append + single-entry are mutually exclusive.
+    cfg.append_frames = True
+    cfg.append_entry = "entry_0000"
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        conversion.execute(scans, cfg)
+
+
+def test_single_entry_mode_end_to_end_with_pygid(tmp_path):
+    """Real pygid run: 3 TIFFs land as one 3-frame entry with per-frame
+    frame_ind / angle_of_incidence / analysis groups, and an overwrite
+    re-run replaces the stack instead of growing it."""
+    pytest.importorskip("pygid")
+    import fabio.tifimage
+    import numpy as np
+
+    from mlgidlab.conversion_panel import (
+        CONV_DET2Q_GID,
+        OUTPUT_SINGLE_ENTRY,
+        RawScan,
+    )
+
+    rng = np.random.default_rng(0)
+    tifs = []
+    for i in range(3):
+        p = tmp_path / f"img_{i}.tif"
+        fabio.tifimage.TifImage(
+            data=(rng.random((220, 180)) * 1000).astype(np.uint32)
+        ).write(str(p))
+        tifs.append(p)
+    poni = tmp_path / "small.poni"
+    poni.write_text(PONI_V2.format(
+        dist=0.2871, poni1=0.0084, poni2=0.00675, rot1=0.0, rot2=0.0,
+        wl=9.6e-11,
+    ).replace("[1679, 1475]", "[220, 180]"))
+
+    cfg = ConversionConfig(
+        conv_type=CONV_DET2Q_GID,
+        poni_path=poni,
+        ai=0.12,
+        output_mode=OUTPUT_SINGLE_ENTRY,
+        output_dir=tmp_path,
+        output_filename="single.h5",
+        overwrite_file=True,
+        # The fixture poni carries the generic "Detector" name, which
+        # pygid cannot map to a pixel size — forward it explicitly via
+        # the same override channel the panel uses.
+        expmeta_overrides={"px_size": 7.5e-05},
+    )
+    scans = [RawScan(file_path=p, entry="", frame_num=None) for p in tifs]
+    written = conversion.execute(scans, cfg)
+
+    assert written == [tmp_path / "single.h5"]
+    with h5py.File(written[0], "r") as f:
+        entries = [k for k in f.keys() if k.startswith("entry")]
+        assert entries == ["entry_0000"]
+        g = f["entry_0000"]
+        assert g["data/img_gid_q"].shape[0] == 3
+        assert list(g["data/frame_ind"][()]) == [0.0, 1.0, 2.0]
+        assert list(g["instrument/angle_of_incidence"][()]) == [0.12] * 3
+        assert sorted(g["data/analysis"].keys()) == [
+            "frame00000", "frame00001", "frame00002"
+        ]
+
+    # Overwrite re-run replaces (no growth to 6 frames).
+    conversion.execute(scans, cfg)
+    with h5py.File(written[0], "r") as f:
+        assert f["entry_0000/data/img_gid_q"].shape[0] == 3
+        assert [k for k in f.keys() if k.startswith("entry")] == [
+            "entry_0000"
+        ]

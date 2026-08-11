@@ -33,6 +33,7 @@ import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
+import h5py
 import numpy as np
 from scipy.ndimage import median_filter
 
@@ -49,6 +50,241 @@ AXIS_LABELS = {
     "q_xy": "q_xy (Å⁻¹)",
     "q_z": "q_z (Å⁻¹)",
 }
+
+# Peak memory of one upstream track_peaks run, measured against
+# mlgidbase 0.1.5: ``calculate_iou_matrix(box_all, box_all)`` keeps
+# eight (N, N) float64 arrays alive at once (the four corner grids
+# are still function locals while intersection, union, the broadcast
+# sum and the result quotient are built), so the run needs at least
+# 64 * N**2 bytes before the thresholding masks and the NetworkX
+# graph add their share. N is the scan's TOTAL fitted-peak count; a
+# 602-frame scan averaging 72 peaks/frame (N = 43645) needs ~122 GB
+# and gets the whole app OOM-killed on a 30 GB machine.
+TRACKING_BYTES_PER_PEAK_PAIR = 64
+
+
+def estimate_tracking_memory(file_path, entry: str) -> tuple[int, int]:
+    """Return ``(n_fitted_peaks, estimated_peak_bytes)`` for a run.
+
+    Counts fitted rows across the entry's analysis frame groups from
+    h5py shape metadata only (no dataset reads). Best-effort: an
+    unreadable file returns ``(0, 0)``, which callers treat as
+    "cannot estimate, do not block the run".
+    """
+    n = 0
+    try:
+        with h5py.File(file_path, "r") as f:
+            ana = f.get(f"{entry}/data/analysis")
+            if isinstance(ana, h5py.Group):
+                for name in ana:
+                    grp = ana[name]
+                    if not isinstance(grp, h5py.Group):
+                        continue
+                    ds = grp.get("fitted_peaks")
+                    if isinstance(ds, h5py.Dataset):
+                        n += int(ds.shape[0])
+    except Exception:
+        logger.debug("estimate_tracking_memory failed", exc_info=True)
+        return 0, 0
+    return n, TRACKING_BYTES_PER_PEAK_PAIR * n * n
+
+
+def available_memory_bytes() -> int:
+    """``MemAvailable`` from /proc/meminfo, or 0 when unknown.
+
+    0 disables the pre-flight guard rather than blocking every run on
+    platforms without /proc.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        logger.debug("reading /proc/meminfo failed", exc_info=True)
+    return 0
+
+
+# When upstream's dense IoU would claim more than this fraction of
+# MemAvailable, the pipeline routes track_peaks to the blocked
+# computation below instead. Well under 1.0 on purpose: the dense run
+# competing with the GUI + OS for the last bytes of RAM thrashes long
+# before it OOMs.
+TRACKING_DENSE_MEM_FRACTION = 0.5
+
+# Working-set target for one row block of the blocked IoU: the block
+# holds TRACKING_BYTES_PER_PEAK_PAIR bytes per (row, peak) cell, so
+# rows-per-block = target // (64 * N). ~1 GB keeps the app responsive
+# while the worker computes.
+_TRACKING_BLOCK_TARGET_BYTES = 1_000_000_000
+
+# Sanity bound on the surviving edge list (int32 pairs, ~0.8 GB at the
+# cap). Only reachable with a near-zero IoU threshold that would also
+# have made upstream's NetworkX graph explode.
+_TRACKING_EDGE_CAP = 100_000_000
+
+
+def _blocked_iou_edges(
+    boxes: np.ndarray, threshold: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Upper-triangle edge pairs ``(i, j)`` with ``IoU >= threshold``.
+
+    Streams upstream's ``calculate_iou_matrix(boxes, boxes)`` in row
+    blocks — identical arithmetic (float64, the +1e-6 union
+    regularizer, NaN treated as 0 before thresholding) — but never
+    materialises more than one ``block_rows x N`` slice, so peak
+    memory is ~``_TRACKING_BLOCK_TARGET_BYTES`` instead of 64 * N**2.
+    """
+    n = len(boxes)
+    block = int(max(16, min(
+        4096,
+        _TRACKING_BLOCK_TARGET_BYTES
+        // (TRACKING_BYTES_PER_PEAK_PAIR * max(n, 1)),
+    )))
+    n_blocks = (n + block - 1) // block
+    log_every = max(1, n_blocks // 10)
+    edges_i: list = []
+    edges_j: list = []
+    n_edges = 0
+    b = boxes[None, :, :]
+    for bi, start in enumerate(range(0, n, block)):
+        stop = min(start + block, n)
+        a = boxes[start:stop, None, :]
+        x_left = np.maximum(a[..., 0], b[..., 0])
+        y_top = np.maximum(a[..., 1], b[..., 1])
+        x_right = np.minimum(a[..., 2], b[..., 2])
+        y_bottom = np.minimum(a[..., 3], b[..., 3])
+        inter = (
+            np.maximum(0, x_right - x_left)
+            * np.maximum(0, y_bottom - y_top)
+        )
+        area_a = (a[..., 2] - a[..., 0]) * (a[..., 3] - a[..., 1])
+        area_b = (b[..., 2] - b[..., 0]) * (b[..., 3] - b[..., 1])
+        iou = inter / (area_a + area_b - inter + 1e-6)
+        # Upstream zeroes NaN before thresholding. ``>=`` on NaN is
+        # already False, but zeroing keeps the threshold == 0 corner
+        # identical too.
+        np.nan_to_num(iou, copy=False, nan=0.0)
+        ii, jj = np.nonzero(iou >= threshold)
+        keep = (ii + start) < jj
+        edges_i.append((ii[keep] + start).astype(np.int32))
+        edges_j.append(jj[keep].astype(np.int32))
+        n_edges += int(keep.sum())
+        if n_edges > _TRACKING_EDGE_CAP:
+            raise RuntimeError(
+                f"peak tracking aborted: more than "
+                f"{_TRACKING_EDGE_CAP:,} box overlaps at IoU threshold "
+                f"{threshold} — the threshold is too low for this scan."
+            )
+        if n_blocks >= 10 and bi % log_every == 0:
+            logger.info(
+                "blocked tracking IoU: %d%% (%s overlaps so far)",
+                round(100 * bi / n_blocks), f"{n_edges:,}",
+            )
+    return np.concatenate(edges_i), np.concatenate(edges_j)
+
+
+def track_peaks_blocked(
+    file_path, entry: str, threshold: float = 0.5, length: int = 10,
+) -> TrackingPayload:
+    """mlgidBASE ``track_peaks`` semantics in bounded memory.
+
+    Replicates upstream (mlgidbase 0.1.5
+    ``peak_operations._track_peaks``) exactly: same member order
+    (frames 0..n-1 numerically, rows verbatim, frames without a
+    ``fitted_peaks`` dataset skipped), same boxes (angle +-
+    angle_width/2 with inf angle_width clamped to 45, radius +-
+    radius_width/2), same IoU edge rule (``>= threshold``) and the
+    same strictly-greater ``length`` cut. The difference is purely
+    mechanical: the IoU streams in row blocks keeping only surviving
+    edges (see ``_blocked_iou_edges``) and components come from
+    scipy's sparse ``connected_components`` instead of a dense
+    NetworkX graph, so a 600-frame scan tracks in ~1 GB instead of
+    the 64 * N**2 bytes that got the app OOM-killed. Surviving tracks
+    are ordered by smallest member index — NetworkX's yield order
+    upstream, since it scans nodes 0..N-1.
+
+    Reads the file with h5py only — safe to call before any pygid r+
+    handle exists. Raises ``ValueError`` when the entry has no fitted
+    rows, mirroring upstream's ``np.vstack`` failure so callers wrap
+    both paths with the same remedy message.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    cols: dict[str, list] = {
+        "angle": [], "angle_width": [], "radius": [], "radius_width": [],
+        "amplitude": [], "q_xy": [], "q_z": [], "frame": [],
+    }
+    with h5py.File(file_path, "r") as f:
+        sig = f.get(f"{entry}/data/img_gid_q")
+        n_frames = int(sig.shape[0]) if isinstance(sig, h5py.Dataset) else 0
+        ana = f.get(f"{entry}/data/analysis")
+        for frame in range(n_frames):
+            grp = ana.get(f"frame{frame:05d}") if ana is not None else None
+            ds = grp.get("fitted_peaks") if grp is not None else None
+            if not isinstance(ds, h5py.Dataset):
+                continue
+            rows = ds[()]
+            for name in (
+                "angle", "angle_width", "radius", "radius_width",
+                "amplitude", "q_xy", "q_z",
+            ):
+                cols[name].append(np.asarray(rows[name], dtype=float))
+            cols["frame"].append(np.full(len(rows), frame, dtype=int))
+    if not cols["frame"]:
+        raise ValueError(
+            f"entry {entry!r} has no fitted_peaks datasets"
+        )
+    angle = np.concatenate(cols["angle"])
+    angle_width = np.concatenate(cols["angle_width"])
+    radius = np.concatenate(cols["radius"])
+    radius_width = np.concatenate(cols["radius_width"])
+    amplitude = np.concatenate(cols["amplitude"])
+    q_xy = np.concatenate(cols["q_xy"])
+    q_z = np.concatenate(cols["q_z"])
+    frame_num = np.concatenate(cols["frame"])
+    if angle.size == 0:
+        raise ValueError(f"entry {entry!r} has no fitted rows")
+
+    angle_width[np.isinf(angle_width)] = 45
+    boxes = np.column_stack((
+        angle - angle_width / 2,
+        radius - radius_width / 2,
+        angle + angle_width / 2,
+        radius + radius_width / 2,
+    )).astype(np.float64)
+
+    n = len(boxes)
+    logger.info(
+        "blocked tracking: %s fitted peaks across %d frames "
+        "(dense IoU would need ~%.0f GB)",
+        f"{n:,}", n_frames, TRACKING_BYTES_PER_PEAK_PAIR * n * n / 1e9,
+    )
+    edges_i, edges_j = _blocked_iou_edges(boxes, float(threshold))
+    adj = coo_matrix(
+        (np.ones(len(edges_i), dtype=np.int8), (edges_i, edges_j)),
+        shape=(n, n),
+    )
+    _, labels = connected_components(adj, directed=False)
+    order = np.argsort(labels, kind="stable")
+    boundaries = np.flatnonzero(np.diff(labels[order])) + 1
+    groups = [g for g in np.split(order, boundaries) if g.size > length]
+    groups.sort(key=lambda g: int(g[0]))
+    logger.info(
+        "blocked tracking: %s overlaps, %d surviving track(s)",
+        f"{len(edges_i):,}", len(groups),
+    )
+    return TrackingPayload(
+        entry=str(entry),
+        threshold=float(threshold),
+        length=int(length),
+        q_xy=q_xy,
+        q_z=q_z,
+        frame_num=frame_num,
+        amplitude=amplitude,
+        components=[g.tolist() for g in groups],
+    )
 
 
 @dataclass
@@ -578,6 +814,51 @@ def member_ids(
     return out
 
 
+def _matched_claim_index(matched_tables: dict) -> dict:
+    """Per-frame claim index over the matched structures:
+    ``{frame: {fitted_id: {cif, ...}}}`` — which CIFs claim which fitted
+    peak on which frame. Shared by the track-level and member-level
+    phase attributions below."""
+    per_frame: dict = {}
+    for frame, structures in matched_tables.items():
+        if not structures:
+            continue
+        claim: dict = {}
+        for s in structures:
+            cif = str(s.cif)
+            for pid in np.asarray(s.peaks.ids, dtype=int):
+                claim.setdefault(int(pid), set()).add(cif)
+        per_frame[int(frame)] = claim
+    return per_frame
+
+
+def member_matched_phases(
+    payload: TrackingPayload, ids: list, matched_tables: dict
+) -> dict:
+    """Per-MEMBER matched phases: ``{global member index: [cif, ...]}``.
+
+    The member-level companion of ``match_tracks_to_structures``: a
+    member appears only when at least one matched structure claims its
+    ``(frame, fitted_id)`` ON THAT FRAME, with the claiming CIFs sorted
+    by name. Members never claimed are absent, so the map doubles as
+    the per-frame matched/unmatched split of every track — a track
+    fitted on frames x..y but matched only from frame z carries entries
+    only for its z..y members. Pure; feeds the phase views' per-frame
+    phase attribution.
+    """
+    per_frame = _matched_claim_index(matched_tables)
+    out: dict = {}
+    for comp in payload.components:
+        for i in comp:
+            tagged = ids[int(i)]
+            if tagged is None:
+                continue
+            cifs = per_frame.get(int(tagged[0]), {}).get(int(tagged[1]))
+            if cifs:
+                out[int(i)] = sorted(cifs)
+    return out
+
+
 def match_tracks_to_structures(
     payload: TrackingPayload, ids: list, matched_tables: dict
 ) -> dict:
@@ -597,18 +878,7 @@ def match_tracks_to_structures(
     """
     from collections import Counter
 
-    # Per-frame index: fitted_id -> set of CIF names claiming it.
-    per_frame: dict = {}
-    for frame, structures in matched_tables.items():
-        if not structures:
-            continue
-        claim: dict = {}
-        for s in structures:
-            cif = str(s.cif)
-            for pid in np.asarray(s.peaks.ids, dtype=int):
-                claim.setdefault(int(pid), set()).add(cif)
-        per_frame[int(frame)] = claim
-
+    per_frame = _matched_claim_index(matched_tables)
     out: dict = {}
     for k, comp in enumerate(payload.components):
         counts: Counter = Counter()

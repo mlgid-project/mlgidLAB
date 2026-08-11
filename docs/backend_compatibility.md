@@ -131,6 +131,53 @@ these. Verbatim call sites are in the code; this is the contract.
   the writable `ExpMetadata.extend_fields` attribute (set inside a
   `try/except` — older pygid lacking it is tolerated).
 
+**Imported-scan geometry contract** (`conversion.import_converted_stack`)
+- Imported image scans carry a REAL `monochromator/wavelength` +
+  `angle_of_incidence` and ZERO placeholders for every other
+  `instrument/detector/*` dataset (attr `placeholder`). This is sound
+  because, as of mlgidbase 0.1.5 / pygidfit 0.1.3 / mlgidmatch 0.1.3:
+  detection consumes only image + q axes
+  (`mlgiddetect_functions._run_detection_single_frame`), fitting
+  additionally only `params.wavelength` + `params.ai`
+  (`pygidfit.process_scans.ProcessDataFromFile.run_frame` →
+  missing-wedge / critical-angle math), and matching only fitted peaks
+  + q maxima (`mlgidmatch_functions.run_mlgidmatch_from_file` — no
+  `load_params` at all). `pygid.load_params` still hard-reads every
+  detector dataset, which is why the placeholders must EXIST.
+  **On any pygidfit / mlgidmatch / mlgidbase bump: re-check that the
+  ops still ignore SDD / beam center / pixel size** — if one starts
+  consuming them, imported-scan results would silently use the zeros.
+  Regression tripwire: `test_imported_geometry_loads_through_pygid`
+  plus the empirical fitting run recorded 2026-07-30.
+
+**Tracking memory routing** (`phase_tracking.estimate_tracking_memory`
+/ `track_peaks_blocked`)
+- `mlgidbase.peak_operations._track_peaks` builds a DENSE
+  all-against-all IoU matrix over the scan's total fitted-peak count
+  N (`calculate_iou_matrix(box_all, box_all)`), and as of mlgidbase
+  0.1.5 that call keeps eight (N, N) float64 arrays alive at once —
+  measured 64 bytes per peak pair. When `64 * N**2` exceeds
+  `TRACKING_DENSE_MEM_FRACTION` of `MemAvailable`, `pipeline.execute`
+  routes track_peaks to `phase_tracking.track_peaks_blocked` — a
+  GUI-side reimplementation pinned to upstream's exact semantics
+  (member order = numeric frames with missing `fitted_peaks` skipped,
+  inf `angle_width` clamped to 45, the IoU formula's `+1e-6` union
+  regularizer, `>=` threshold edges, strictly-greater `length` cut,
+  components ordered by smallest member index) that streams the IoU
+  in row blocks and uses scipy sparse connected components. The
+  kernel OOM-killed the app on a 602-frame / 43645-peak scan that
+  priced at ~122 GB; the blocked path tracks it in ~80 s / ~1.3 GB.
+  **On any mlgidbase bump: re-verify the pinned semantics AND
+  re-measure the factor** (`TRACKING_BYTES_PER_PEAK_PAIR`) — the
+  equivalence tests in `tests/test_blocked_tracking.py` compare
+  edge-for-edge against `calculate_iou_matrix` and
+  payload-for-payload against a real `track_peaks` run, so a
+  semantic drift upstream fails loudly there. The official
+  figure-export path (`_on_save_official_figures`) still runs the
+  dense upstream code and refuses on oversized scans. Candidate for
+  an upstream contribution: the same blocked+sparse approach inside
+  `mlgidbase.peak_operations` would fix every consumer.
+
 **`pygidsim.experiment.ExpParameters`** (`pipeline.py`)
 - `ExpParameters(q_xy_max=..., q_z_max=..., ai=..., en=...)` — `en` in
   eV; the energy guard expects `1e3 <= en <= 2e5`.

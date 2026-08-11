@@ -18,6 +18,7 @@ from mlgidlab.phase_tracking import (
     build_payload,
     match_tracks_to_structures,
     member_ids,
+    member_matched_phases,
     smooth_normalize_amplitude,
 )
 from mlgidlab.polar import polar_to_qxyz
@@ -460,6 +461,27 @@ def test_match_tracks_to_structures_omits_unmatched_and_empty():
     assert match_tracks_to_structures(
         payload, [None] * 5, matched
     ) == {}
+
+
+def test_member_matched_phases_per_frame_claims():
+    """The member-level companion map lists ONLY members whose
+    (frame, fitted_id) a structure claimed on that frame — the basis
+    for splitting a track's rendering at the matching start."""
+    payload, ids = _two_track_payload()
+    # A claims track 0's id 0 on frames 1 and 2 (NOT frame 0); B claims
+    # id 0 on frame 2 too, and track 1's id 5 on frame 0 only.
+    matched = {
+        1: [_matched("A", [0])],
+        2: [_matched("A", [0]), _matched("B", [0])],
+        0: [_matched("B", [5])],
+    }
+    out = member_matched_phases(payload, ids, matched)
+    # Members: 0=(f0,id0) unclaimed, 1=(f1,id0)->A, 2=(f2,id0)->A+B
+    # (name-sorted), 3=(f0,id5)->B, 4=(f1,id5) unclaimed.
+    assert out == {1: ["A"], 2: ["A", "B"], 3: ["B"]}
+    # No matched data / id-less members -> empty map.
+    assert member_matched_phases(payload, ids, {}) == {}
+    assert member_matched_phases(payload, [None] * 5, matched) == {}
 
 
 # --- amplitudes_from_track_result (pure) ---

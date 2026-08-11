@@ -32,7 +32,7 @@ import os
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import QSignalBlocker, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -48,19 +48,23 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSlider,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from mlgidlab import roi_intensity
 from mlgidlab.phase_tracking import (
     AXIS_LABELS,
     AXIS_NAMES,
     TrackingPayload,
     smooth_normalize_amplitude,
 )
-from mlgidlab.workers import ScanProfileWorker
+from mlgidlab.workers import RoiTraceWorker, ScanProfileWorker
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +225,367 @@ class _ExportDialog(QDialog):
         }
 
 
+class _TrackSelectDialog(QDialog):
+    """Per-structure track picker for the amplitude evolution.
+
+    Modeless: one sortable table per structure (tabs), a checkbox per
+    track, applied to the host window LIVE on every toggle so the bands
+    and medians update next to the dialog. Rebuilt fresh on every open;
+    the host closes it when the payload shape changes.
+
+    When the host knows its scan (``set_context`` ran), a non-interactive
+    preview panel sits next to the tables: the scan frame under a frame
+    slider, with the SELECTED row's track ringed on the current frame and
+    its full trajectory drawn faintly. Clicking a row jumps the slider to
+    that track's first frame, so judging faint/spurious tracks is a
+    matter of looking, not of reading numbers.
+    """
+
+    _COLUMNS = (
+        "Use", "Track", "Frames", "First", "Last",
+        "Mean |q|", "Mean amplitude",
+    )
+
+    def __init__(self, host: "PhaseViewsWindow") -> None:
+        super().__init__(host)
+        self._host = host
+        self.setWindowTitle("Amplitude evolution: select tracks")
+        outer = QHBoxLayout(self)
+        left = QVBoxLayout()
+        outer.addLayout(left, 1)
+        note = QLabel(
+            "Untick tracks to drop them from their structure's grouped "
+            "band and median (amplitude display + CSV export only). "
+            "Click a column header to sort.", self,
+        )
+        note.setWordWrap(True)
+        left.addWidget(note)
+        self._tabs = QTabWidget(self)
+        left.addWidget(self._tabs, 1)
+        self._tables: dict = {}
+        self._tab_keys: list = []
+        # Preview state. ``_preview`` stays None on a context-less host
+        # (bare test windows) and every preview code path guards on it.
+        self._preview = None
+        self._preview_axes = None
+        self._selected_track: int | None = None
+        self._selected_key = None
+        for key in host._structure_keys():
+            self._add_structure_tab(key)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.close)
+        left.addWidget(buttons)
+        if host._n_frames > 0:
+            self._build_preview(outer)
+            self.resize(1000, 460)
+            self._tabs.currentChanged.connect(self._on_tab_changed)
+            # Never open onto an empty preview: pre-select the first
+            # row of the first tab (jumps the slider to its track).
+            if self._tab_keys:
+                table = self._tables[self._tab_keys[0]]
+                if table.rowCount():
+                    table.selectRow(0)
+        else:
+            self.resize(560, 420)
+
+    # ---------------------- preview panel ---------------------- #
+    def _build_preview(self, outer: QHBoxLayout) -> None:
+        host = self._host
+        panel = QVBoxLayout()
+        outer.addLayout(panel, 1)
+        cap = QLabel("Selected track on the scan:", self)
+        panel.addWidget(cap)
+        plot = pg.PlotWidget(self)
+        plot.setLabel("bottom", "q_xy")
+        plot.setLabel("left", "q_z")
+        pi = plot.getPlotItem()
+        vb = pi.getViewBox()
+        vb.setAspectLocked(True)
+        # Display-only: no pan/zoom/menu — the slider is the only input.
+        vb.setMouseEnabled(False, False)
+        pi.setMenuEnabled(False)
+        pi.hideButtons()
+        self._preview_plot = plot
+        img = pg.ImageItem()
+        img.setZValue(-10)
+        host._apply_image_cmap(img)
+        plot.addItem(img)
+        self._preview_image = img
+        missing = pg.TextItem(
+            "(no image)", color=(128, 128, 128), anchor=(0.5, 0.5)
+        )
+        missing.setVisible(False)
+        plot.addItem(missing)
+        self._preview_missing = missing
+        # Trajectory under the markers: the whole track as a faint line
+        # so the path stays visible while scrubbing frames.
+        self._preview_traj = plot.plot([], [])
+        self._preview_marker = plot.plot([], [])
+        panel.addWidget(plot, 1)
+        row = QHBoxLayout()
+        self.preview_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.preview_slider.setRange(0, max(0, host._n_frames - 1))
+        self.preview_slider.valueChanged.connect(
+            self._on_preview_frame_changed
+        )
+        row.addWidget(self.preview_slider, 1)
+        self._preview_frame_label = QLabel("", self)
+        row.addWidget(self._preview_frame_label)
+        panel.addLayout(row)
+        # Debounce the actual file read: scrubbing updates the label and
+        # the overlay immediately, the frame image follows 150 ms after
+        # the slider settles.
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(150)
+        timer.timeout.connect(self._do_load_preview_frame)
+        self._preview_timer = timer
+        self._preview = panel
+        self._update_preview_frame_label()
+        timer.start()  # initial frame 0 load
+
+    def _update_preview_frame_label(self) -> None:
+        self._preview_frame_label.setText(
+            f"Frame {self.preview_slider.value()} / "
+            f"{max(0, self._host._n_frames - 1)}"
+        )
+
+    def _on_preview_frame_changed(self, _value: int) -> None:
+        self._update_preview_frame_label()
+        self._update_preview_overlay()
+        self._preview_timer.start()
+
+    def _do_load_preview_frame(self) -> None:
+        """Read the slider's frame from the host's file and show it.
+
+        Any failure (missing file, pipeline holding the file, bad
+        entry) degrades to a "(no image)" placeholder — the overlay and
+        the tables keep working without the backdrop.
+        """
+        if self._preview is None:
+            return
+        host = self._host
+        if host._busy_probe is not None:
+            try:
+                if host._busy_probe():
+                    return  # pipeline writing; keep the last image
+            except Exception:
+                pass
+        i = int(self.preview_slider.value())
+        try:
+            import h5py
+
+            with h5py.File(host._file_path, "r") as f:
+                data = f[host._entry]["data"]
+                signal = data.attrs.get("signal")
+                if isinstance(signal, bytes):
+                    signal = signal.decode("utf-8", errors="replace")
+                frame = np.asarray(data[signal][i], dtype=np.float32)
+                if self._preview_axes is None:
+                    self._preview_axes = (
+                        np.asarray(data["q_xy"], dtype=float),
+                        np.asarray(data["q_z"], dtype=float),
+                    )
+        except Exception as exc:
+            self._preview_image.setVisible(False)
+            self._show_preview_placeholder(type(exc).__name__)
+            return
+        self._preview_missing.setVisible(False)
+        self._preview_image.setImage(_log_display(frame).T, autoLevels=True)
+        q_xy, q_z = self._preview_axes
+        x0, x1 = float(np.min(q_xy)), float(np.max(q_xy))
+        y0, y1 = float(np.min(q_z)), float(np.max(q_z))
+        self._preview_image.setRect(x0, y0, x1 - x0, y1 - y0)
+        self._preview_image.setVisible(True)
+
+    def _show_preview_placeholder(self, reason: str) -> None:
+        vb = self._preview_plot.getPlotItem().getViewBox()
+        (x0, x1), (y0, y1) = vb.viewRange()
+        self._preview_missing.setText(f"(no image: {reason})")
+        self._preview_missing.setPos((x0 + x1) / 2, (y0 + y1) / 2)
+        self._preview_missing.setVisible(True)
+
+    def _on_tab_changed(self, index: int) -> None:
+        if 0 <= index < len(self._tab_keys):
+            self._on_row_selected(self._tab_keys[index])
+
+    def _on_row_selected(self, key) -> None:
+        """Highlight the active tab's selected track and jump to its
+        first frame. Bound per-table; only the ACTIVE tab drives the
+        preview."""
+        if self._preview is None:
+            return
+        index = self._tabs.currentIndex()
+        if not (0 <= index < len(self._tab_keys)) or (
+            self._tab_keys[index] != key
+        ):
+            return
+        table = self._tables[key]
+        row = table.currentRow()
+        if row < 0 or table.item(row, 0) is None:
+            self._selected_track = None
+            self._selected_key = None
+            self._update_preview_overlay()
+            return
+        k = int(table.item(row, 0).data(Qt.ItemDataRole.UserRole))
+        self._selected_track = k
+        self._selected_key = key
+        # Jump to the first frame of the row's STRUCTURE SUBSET, not of
+        # the whole track: with per-frame phase attribution a track is
+        # often fitted frames before matching claims it, and the whole-
+        # track first frame would land where this tab's ring cannot show
+        # (and disagree with the row's "First" column).
+        mem = self._selected_members()
+        first = int(np.min(self._host._payload.frame_num[mem]))
+        # setValue triggers the overlay + debounced image load; when the
+        # slider is already there the explicit call below covers it.
+        self.preview_slider.setValue(first)
+        self._update_preview_overlay()
+
+    def _selected_members(self) -> np.ndarray:
+        """Member indices behind the selected row: the track's subset
+        for the active tab's structure, whole track as a fallback."""
+        payload = self._host._payload
+        mem = self._host._member_subsets(
+            self._selected_track, interval=False
+        ).get(self._selected_key)
+        if mem is None or not len(mem):
+            mem = payload.track_members(self._selected_track)
+        return np.asarray(mem)
+
+    def _update_preview_overlay(self) -> None:
+        if self._preview is None:
+            return
+        payload = self._host._payload
+        k = self._selected_track
+        if k is None or payload is None:
+            self._preview_traj.setData([], [])
+            self._preview_marker.setData([], [])
+            return
+        mem = self._selected_members()
+        color = self._host._structure_color(self._selected_key)
+        faint = pg.mkColor(color)
+        faint.setAlpha(110)
+        order = np.argsort(payload.frame_num[mem], kind="stable")
+        tr = mem[order]
+        self._preview_traj.setData(
+            payload.q_xy[tr], payload.q_z[tr],
+            pen=pg.mkPen(faint, width=1),
+        )
+        frame = int(self.preview_slider.value())
+        on_frame = mem[payload.frame_num[mem] == frame]
+        self._preview_marker.setData(
+            payload.q_xy[on_frame], payload.q_z[on_frame],
+            pen=None, symbol="o", symbolSize=14,
+            symbolPen=pg.mkPen(color, width=2), symbolBrush=None,
+        )
+
+    def _add_structure_tab(self, key) -> None:
+        host = self._host
+        payload = host._payload
+        radius = payload.axis_values("radius")
+        rows = []
+        for k in range(payload.n_tracks):
+            mem = host._member_subsets(k, interval=False).get(key)
+            if mem is None or not len(mem):
+                continue
+            frames = payload.frame_num[mem]
+            rows.append((
+                k, len(mem), int(frames.min()), int(frames.max()),
+                float(np.nanmean(radius[mem])),
+                float(np.nanmean(payload.amplitude[mem])),
+            ))
+        page = QWidget(self)
+        box = QVBoxLayout(page)
+        table = QTableWidget(len(rows), len(self._COLUMNS), page)
+        table.setHorizontalHeaderLabels(list(self._COLUMNS))
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        flags = (
+            Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        )
+        excluded = host._amp_excluded.get(key, set())
+        for r, (k, n, first, last, mean_q, mean_amp) in enumerate(rows):
+            use = QTableWidgetItem()
+            use.setFlags(flags | Qt.ItemFlag.ItemIsUserCheckable)
+            use.setCheckState(
+                Qt.CheckState.Unchecked if k in excluded
+                else Qt.CheckState.Checked
+            )
+            # The track index rides the item so sorting can never
+            # desync a checkbox from its track.
+            use.setData(Qt.ItemDataRole.UserRole, int(k))
+            table.setItem(r, 0, use)
+            numeric = (
+                int(k), int(n), int(first), int(last),
+                round(mean_q, 4), round(mean_amp, 4),
+            )
+            for c, value in enumerate(numeric, start=1):
+                item = QTableWidgetItem()
+                # EditRole data -> numeric (not lexicographic) sorting.
+                item.setData(Qt.ItemDataRole.EditRole, value)
+                item.setFlags(flags)
+                table.setItem(r, c, item)
+        table.setSortingEnabled(True)
+        table.sortItems(1)
+        table.resizeColumnsToContents()
+        table.itemChanged.connect(
+            lambda item, key=key: self._on_item_changed(key, item)
+        )
+        table.itemSelectionChanged.connect(
+            lambda key=key: self._on_row_selected(key)
+        )
+        box.addWidget(table)
+        btns = QHBoxLayout()
+        all_btn = QPushButton("All", page)
+        all_btn.clicked.connect(
+            lambda _=False, key=key: self._set_all(key, True)
+        )
+        btns.addWidget(all_btn)
+        none_btn = QPushButton("None", page)
+        none_btn.clicked.connect(
+            lambda _=False, key=key: self._set_all(key, False)
+        )
+        btns.addWidget(none_btn)
+        btns.addStretch(1)
+        box.addLayout(btns)
+        label = "unmatched" if key == _UNMATCHED else str(key)
+        self._tabs.addTab(page, f"{label} ({len(rows)})")
+        self._tables[key] = table
+        self._tab_keys.append(key)
+
+    def _on_item_changed(self, key, item) -> None:
+        if item.column() != 0:
+            return
+        track = item.data(Qt.ItemDataRole.UserRole)
+        if track is None:
+            return
+        excluded = self._host._amp_excluded.setdefault(key, set())
+        if item.checkState() == Qt.CheckState.Checked:
+            excluded.discard(int(track))
+        else:
+            excluded.add(int(track))
+        self._host._refresh_amplitude()
+        self._host._update_amp_tracks_button()
+
+    def _set_all(self, key, checked: bool) -> None:
+        table = self._tables[key]
+        # Batch: one refresh at the end, not one per row.
+        table.blockSignals(True)
+        state = (
+            Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        )
+        excluded = self._host._amp_excluded.setdefault(key, set())
+        for r in range(table.rowCount()):
+            item = table.item(r, 0)
+            item.setCheckState(state)
+            track = int(item.data(Qt.ItemDataRole.UserRole))
+            (excluded.discard if checked else excluded.add)(track)
+        table.blockSignals(False)
+        self._host._refresh_amplitude()
+        self._host._update_amp_tracks_button()
+
+
 class PhaseViewsWindow(QMainWindow):
     """Four interactive views over one tracking payload."""
 
@@ -258,9 +623,38 @@ class PhaseViewsWindow(QMainWindow):
         # (CIF or _UNMATCHED) to its show/hide checkbox; ``_amp_labels``
         # holds the grouped-view TextItems for teardown.
         self._track_phases: dict = {}
+        # {member index: [cif, ...]} — which members a matched structure
+        # actually claimed ON THEIR FRAME. Non-empty, it switches the
+        # member-based plots to per-frame phase attribution (a track
+        # matched only from frame z renders its earlier members as
+        # unmatched); empty, attribution stays track-level (dominant
+        # phase paints the whole track).
+        self._member_phases: dict = {}
         self._phase_colors: dict = {}
+        # Custom per-CIF colours pushed by the host (picked in the
+        # matched-peaks legend); layered over the automatic hue wheel
+        # in ``_rebuild_phase_colors`` so both windows agree.
+        self._phase_color_overrides: dict = {}
         self._struct_checks: dict = {}
+        # {structure key: set of track indices} the user UNTICKED in the
+        # Select-tracks dialog — exclusions, so new tracks default to
+        # included. Feeds _amp_groups (amplitude tab + its CSV only);
+        # reset on every set_payload since track indices shift on
+        # deletion and a new run invalidates the choice.
+        self._amp_excluded: dict = {}
+        self._amp_track_dialog: QDialog | None = None
+        # (id(payload), n_tracks) of the last payload push — the reset
+        # trigger for the selection (see set_payload).
+        self._amp_payload_fp: tuple | None = None
         self._amp_labels: list = []
+        # Cached ROI-intensity traces of the "integrated intensity
+        # (ROI)" metric: {"frames", "traces", "params", "fp",
+        # "target"} — valid only while payload fingerprint, ROI
+        # parameters and (file, entry) still match (_roi_cache_valid).
+        # ``_roi_pending`` stamps fp/target of an in-flight
+        # RoiTraceWorker run.
+        self._roi_traces: dict | None = None
+        self._roi_pending: dict | None = None
         # Interquartile-band items of the amplitude tab's median mode.
         # FillBetweenItems are NOT pyqtgraph data items, so
         # ``_clear_overlays`` misses them — torn down explicitly.
@@ -293,6 +687,33 @@ class PhaseViewsWindow(QMainWindow):
         self._struct_toggle_layout.addStretch(1)
         self._struct_toggle_widget.setVisible(False)
         central_layout.addWidget(self._struct_toggle_widget)
+        # Window-wide frame interval for the member-based plots
+        # (trajectories + amplitude evolution): only members whose frame
+        # falls inside [from, to] are drawn. The q-map keeps the full
+        # tracks (its mean-image window is a separate control) and the
+        # waterfall is frame-complete by nature.
+        frame_row_widget = QWidget(central)
+        frame_row = QHBoxLayout(frame_row_widget)
+        frame_row.setContentsMargins(6, 2, 6, 2)
+        frame_row.setSpacing(6)
+        frame_row.addWidget(QLabel("Frames:", central))
+        self.frame_lo = QSpinBox(frame_row_widget)
+        self.frame_hi = QSpinBox(frame_row_widget)
+        for spin in (self.frame_lo, self.frame_hi):
+            spin.setRange(0, 0)
+            spin.setEnabled(False)
+            spin.setToolTip(
+                "Show only the frame interval [from, to] in the "
+                "trajectories and amplitude-evolution plots (the q-map "
+                "and waterfall are unaffected). Set from=first and "
+                "to=last to see everything again."
+            )
+            spin.valueChanged.connect(self._on_frame_interval_changed)
+        frame_row.addWidget(self.frame_lo)
+        frame_row.addWidget(QLabel("to", central))
+        frame_row.addWidget(self.frame_hi)
+        frame_row.addStretch(1)
+        central_layout.addWidget(frame_row_widget)
         self._tabs = QTabWidget(central)
         central_layout.addWidget(self._tabs)
         self.setCentralWidget(central)
@@ -430,6 +851,27 @@ class PhaseViewsWindow(QMainWindow):
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
         controls = self._controls_row()
+        controls.addWidget(QLabel("Metric:", tab))
+        self.amp_metric = QComboBox(tab)
+        self.amp_metric.addItem("amplitude", userData="amplitude")
+        self.amp_metric.addItem(
+            "integrated intensity (ROI)", userData="roi"
+        )
+        self.amp_metric.setToolTip(
+            "What the curves show per tracked peak and frame: the "
+            "FITTED peak amplitude (from the per-frame fit results), "
+            "or the background-subtracted INTEGRATED intensity of a "
+            "q-space ROI box around the tracked position, summed from "
+            "the image data itself. The ROI metric has a value on "
+            "EVERY frame (a failed fit leaves no gap) and is "
+            "proportional to the diffracting volume; it costs one "
+            "full read of the scan (computed in the background and "
+            "cached until tracking or the ROI settings change)."
+        )
+        self.amp_metric.currentIndexChanged.connect(
+            lambda _i: self._on_metric_changed()
+        )
+        controls.addWidget(self.amp_metric)
         controls.addWidget(QLabel("Smoothing window", tab))
         self.amp_window = QSpinBox(tab)
         self.amp_window.setRange(1, 99)
@@ -449,6 +891,31 @@ class PhaseViewsWindow(QMainWindow):
             lambda _c: self._refresh_amplitude()
         )
         controls.addWidget(self.amp_normalize)
+        self.amp_zero = QCheckBox("Zeros at start/end", tab)
+        self.amp_zero.setToolTip(
+            "Median mode: pad each structure's MEDIAN curve with "
+            "zero-intensity points from the visible start to its first "
+            "observed frame and from its last one to the visible end, "
+            "so the evolution rises from and falls back to zero. The "
+            "zeros are added to the finished median only — individual "
+            "tracks never contribute zeros to the statistics, so an "
+            "absent track cannot drag the median down. Gaps inside the "
+            "series stay open."
+        )
+        self.amp_zero.setEnabled(False)
+        self.amp_zero.toggled.connect(lambda _c: self._refresh_amplitude())
+        controls.addWidget(self.amp_zero)
+        self.btn_amp_tracks = QPushButton("Select tracks…", tab)
+        self.btn_amp_tracks.setToolTip(
+            "Choose per matched structure which tracks feed the "
+            "grouped bands and per-structure medians — a sortable "
+            "table (including mean amplitude) with a checkbox per "
+            "track, applied live. Needs Matching to have run; a new "
+            "tracking run resets the selection."
+        )
+        self.btn_amp_tracks.setEnabled(False)
+        self.btn_amp_tracks.clicked.connect(self._on_select_amp_tracks)
+        controls.addWidget(self.btn_amp_tracks)
         self.amp_group = QCheckBox("Group by structure", tab)
         self.amp_group.setToolTip(
             "Stack the tracks by matched crystal phase (CIF): each "
@@ -474,6 +941,66 @@ class PhaseViewsWindow(QMainWindow):
         controls.addWidget(self.amp_median)
         controls.addStretch(1)
         layout.addLayout(controls)
+        # ROI-metric settings on their own row, visible only while the
+        # ROI metric is selected. Changes debounce into one recompute.
+        self._roi_controls = QWidget(tab)
+        roi_row = QHBoxLayout(self._roi_controls)
+        roi_row.setContentsMargins(0, 0, 0, 0)
+        roi_row.setSpacing(6)
+        roi_row.addWidget(QLabel("ROI half-width q_xy", self._roi_controls))
+        self.roi_dqxy = QDoubleSpinBox(self._roi_controls)
+        self.roi_dqz = QDoubleSpinBox(self._roi_controls)
+        for spin, name, default in (
+            (self.roi_dqxy, "q_xy", roi_intensity.DEFAULT_HALF_Q_XY),
+            (self.roi_dqz, "q_z", roi_intensity.DEFAULT_HALF_Q_Z),
+        ):
+            spin.setRange(0.001, 1.0)
+            spin.setDecimals(3)
+            spin.setSingleStep(0.005)
+            spin.setValue(default)
+            spin.setSuffix(" Å⁻¹")
+            spin.setToolTip(
+                f"Half-width of the integration box along {name}: the "
+                f"box spans the tracked position ± this value."
+            )
+            spin.valueChanged.connect(
+                lambda _v: self._roi_param_timer.start()
+            )
+        roi_row.addWidget(self.roi_dqxy)
+        roi_row.addWidget(QLabel("q_z", self._roi_controls))
+        roi_row.addWidget(self.roi_dqz)
+        roi_row.addWidget(QLabel("Background gap", self._roi_controls))
+        self.roi_gap = QSpinBox(self._roi_controls)
+        self.roi_gap.setRange(0, 50)
+        self.roi_gap.setValue(roi_intensity.DEFAULT_BG_GAP_PX)
+        self.roi_strip = QSpinBox(self._roi_controls)
+        self.roi_strip.setRange(1, 50)
+        self.roi_strip.setValue(roi_intensity.DEFAULT_BG_STRIP_PX)
+        for spin, tip in (
+            (self.roi_gap,
+             "Pixels between the box edge and each background strip."),
+            (self.roi_strip,
+             "Width of each background strip in pixels. The local "
+             "background is the mean per-pixel intensity of the TWO "
+             "strips flanking the box (along q_z for near-axis peaks, "
+             "along q_xy otherwise), averaged together so a neighbor "
+             "peak under one strip cannot over-subtract the trace."),
+        ):
+            spin.setSuffix(" px")
+            spin.setToolTip(tip)
+            spin.valueChanged.connect(
+                lambda _v: self._roi_param_timer.start()
+            )
+        roi_row.addWidget(self.roi_gap)
+        roi_row.addWidget(QLabel("strip", self._roi_controls))
+        roi_row.addWidget(self.roi_strip)
+        roi_row.addStretch(1)
+        self._roi_controls.setVisible(False)
+        layout.addWidget(self._roi_controls)
+        self._roi_param_timer = QTimer(self)
+        self._roi_param_timer.setSingleShot(True)
+        self._roi_param_timer.setInterval(400)
+        self._roi_param_timer.timeout.connect(self._refresh_amplitude)
         # The per-structure show/hide toggles live in a window-wide bar
         # (built in __init__) so they also govern the q-map/trajectories.
         self.amp_plot = self._make_plot(
@@ -531,6 +1058,43 @@ class PhaseViewsWindow(QMainWindow):
 
     def set_payload(self, payload: TrackingPayload | None) -> None:
         self._payload = payload
+        # Track indices are only meaningful against one payload SHAPE:
+        # a new tracking run (new object) or a Delete-key track removal
+        # (same object, fewer tracks) shifts them, so the amplitude
+        # track selection resets on either — but NOT on a plain re-push
+        # of the unchanged payload (re-opening the window), which would
+        # needlessly wipe the user's picks.
+        fingerprint = (
+            (id(payload), payload.n_tracks) if payload is not None else None
+        )
+        if fingerprint != self._amp_payload_fp:
+            self._amp_payload_fp = fingerprint
+            self._amp_excluded = {}
+            # ROI traces were computed for the old payload's tracks.
+            self._roi_traces = None
+            if self._amp_track_dialog is not None:
+                self._amp_track_dialog.close()
+                self._amp_track_dialog = None
+            self._update_amp_tracks_button()
+        # Re-bound the frame-interval spinboxes and reset them to "show
+        # everything" (a NEW tracking run invalidates any previous
+        # narrowing). Preferred bounds are the SCAN's frame range (known
+        # once the host has pushed set_context) so frame 0 is reachable
+        # even when the first track appears late — the zero-baseline
+        # padding needs it; payload range is the context-less fallback.
+        # Blocked: each setValue would otherwise trigger a refresh of
+        # the still-stale plots.
+        has_frames = payload is not None and payload.n_members > 0
+        if has_frames and self._n_frames > 0:
+            lo, hi = 0, self._n_frames - 1
+        else:
+            lo = int(payload.frame_num.min()) if has_frames else 0
+            hi = int(payload.frame_num.max()) if has_frames else 0
+        for spin, val in ((self.frame_lo, lo), (self.frame_hi, hi)):
+            with QSignalBlocker(spin):
+                spin.setRange(lo, hi)
+                spin.setValue(val)
+            spin.setEnabled(has_frames)
         self._refresh_trajectories()
         self._refresh_qmap()
         self._refresh_amplitude()
@@ -551,12 +1115,7 @@ class PhaseViewsWindow(QMainWindow):
         re-renders the q-map.
         """
         self._track_phases = {int(k): list(v) for k, v in mapping.items()}
-        cifs = sorted({c for lst in self._track_phases.values() for c in lst})
-        hues = max(9, len(cifs))
-        self._phase_colors = {
-            cif: pg.intColor(i, hues=hues, maxValue=255)
-            for i, cif in enumerate(cifs)
-        }
+        self._rebuild_phase_colors()
         has_phases = bool(self._track_phases)
         self._rebuild_structure_toggles()
         # Trajectories 'matched' colour option follows phase availability.
@@ -567,6 +1126,7 @@ class PhaseViewsWindow(QMainWindow):
             self._refresh_trajectories()
         self.amp_group.setEnabled(has_phases)
         self.amp_median.setEnabled(has_phases)
+        self.btn_amp_tracks.setEnabled(has_phases)
         if not has_phases and self.amp_median.isChecked():
             self.amp_median.setChecked(False)  # triggers _refresh_amplitude
         if not has_phases and self.amp_group.isChecked():
@@ -578,6 +1138,98 @@ class PhaseViewsWindow(QMainWindow):
             self.qmap_phase.setChecked(False)   # triggers _refresh_qmap
         else:
             self._refresh_qmap()
+
+    def set_member_phases(self, mapping: dict) -> None:
+        """Install ``{member index: [cif, ...]}`` (from
+        ``phase_tracking.member_matched_phases``) and re-render the
+        plots that colour by phase. See ``_member_phases`` for the
+        semantics; the host pushes this right after
+        ``set_track_phases``, so a no-op guard keeps the second
+        refresh cascade away when nothing changed."""
+        mapping = {int(k): list(v) for k, v in mapping.items()}
+        if mapping == self._member_phases:
+            return
+        self._member_phases = mapping
+        self._rebuild_structure_toggles()
+        self._refresh_trajectories()
+        self._refresh_amplitude()
+        self._refresh_qmap()
+
+    def _member_structure_key(self, i: int, k: int) -> str:
+        """Structure key of member ``i`` of track ``k``: the phase that
+        claimed the member on its frame (preferring the track's dominant
+        order so member and track colours agree), ``_UNMATCHED`` for a
+        never-claimed member, and the track-level key when no member
+        attribution exists at all."""
+        if not self._member_phases:
+            return self._structure_key_of(k)
+        claims = self._member_phases.get(int(i))
+        if not claims:
+            return _UNMATCHED
+        for cif in self._track_phases.get(k, []):
+            if cif in claims:
+                return cif
+        return claims[0]
+
+    def _member_subsets(
+        self, k: int, interval: bool = True
+    ) -> dict[str, np.ndarray]:
+        """Track ``k``'s members split by structure key, insertion
+        ordered by first occurrence. One whole-track subset under its
+        dominant key when no member attribution exists — the pre-split
+        rendering. ``interval=False`` skips the frame-interval filter
+        (the q-map stays frame-complete)."""
+        members = (
+            self._interval_members(k) if interval
+            else self._payload.track_members(k)
+        )
+        out: dict = {}
+        for i in members:
+            key = self._member_structure_key(int(i), k)
+            out.setdefault(key, []).append(int(i))
+        return {
+            key: np.asarray(v, dtype=int) for key, v in out.items()
+        }
+
+    def _any_unmatched_member(self) -> bool:
+        """True when the member attribution leaves any tracked member
+        unclaimed — the condition for an 'unmatched' toggle/band/legend
+        entry beyond the track-level one."""
+        if self._payload is None or not self._member_phases:
+            return False
+        return any(
+            not self._member_phases.get(int(i))
+            for comp in self._payload.components
+            for i in comp
+        )
+
+    def _rebuild_phase_colors(self) -> None:
+        """Stable colour per unique CIF across the phase map: the
+        automatic hue wheel, then the host's custom colours on top."""
+        cifs = sorted({c for lst in self._track_phases.values() for c in lst})
+        hues = max(9, len(cifs))
+        self._phase_colors = {
+            cif: pg.intColor(i, hues=hues, maxValue=255)
+            for i, cif in enumerate(cifs)
+        }
+        for cif, hex_color in self._phase_color_overrides.items():
+            if cif in self._phase_colors:
+                self._phase_colors[cif] = pg.mkColor(hex_color)
+
+    def set_phase_color_overrides(self, mapping: dict) -> None:
+        """Install ``{cif: hex}`` custom colours (picked in the host's
+        matched-peaks legend) and re-render everything that shows phase
+        colours. No-op when nothing changed, so the host can push
+        unconditionally."""
+        mapping = {str(k): str(v) for k, v in mapping.items()}
+        if mapping == self._phase_color_overrides:
+            return
+        self._phase_color_overrides = mapping
+        self._rebuild_phase_colors()
+        self._rebuild_structure_toggles()
+        self._refresh_trajectories()
+        self._refresh_amplitude()
+        self._refresh_qmap()
 
     def _rebuild_structure_toggles(self) -> None:
         """Rebuild the per-structure show/hide checkboxes from the phase
@@ -616,10 +1268,20 @@ class PhaseViewsWindow(QMainWindow):
         cifs = sorted({
             v[0] for v in self._track_phases.values() if v
         })
+        if self._member_phases:
+            # Per-frame attribution can key members to a track's
+            # NON-dominant phase; give those their own entry so their
+            # band/toggle exists (only keys that actually hold members,
+            # so no empty bands appear).
+            extra: set = set()
+            for k in range(self._payload.n_tracks):
+                extra.update(self._member_subsets(k, interval=False))
+            extra.discard(_UNMATCHED)
+            cifs = sorted(set(cifs) | extra)
         has_unmatched = any(
             not self._track_phases.get(k)
             for k in range(self._payload.n_tracks)
-        )
+        ) or self._any_unmatched_member()
         return cifs + ([_UNMATCHED] if has_unmatched else [])
 
     def _structure_color(self, key: str):
@@ -719,6 +1381,7 @@ class PhaseViewsWindow(QMainWindow):
     def clear(self) -> None:
         self._ring_tracks = set()
         self.set_track_phases({})
+        self.set_member_phases({})
         self.set_payload(None)
 
     def apply_theme_colors(self, background, foreground) -> None:
@@ -749,6 +1412,25 @@ class PhaseViewsWindow(QMainWindow):
         # ImageItems are not data items; they persist across refreshes.
         del keep
 
+    def _on_frame_interval_changed(self, _value: int) -> None:
+        self._refresh_trajectories()
+        self._refresh_amplitude()
+
+    def _frame_interval(self) -> tuple[int, int]:
+        """The user's [from, to] frame interval, normalized so a crossed
+        pair (from > to) still reads as a valid interval."""
+        lo, hi = self.frame_lo.value(), self.frame_hi.value()
+        return (lo, hi) if lo <= hi else (hi, lo)
+
+    def _interval_members(self, k: int) -> np.ndarray:
+        """Track ``k``'s member indices restricted to the frame
+        interval — the member set the trajectories and amplitude plots
+        draw (the q-map and waterfall stay frame-complete)."""
+        members = self._payload.track_members(k)
+        lo, hi = self._frame_interval()
+        frames = self._payload.frame_num[members]
+        return members[(frames >= lo) & (frames <= hi)]
+
     def _refresh_trajectories(self) -> None:
         self._clear_overlays(self.traj_plot)
         axis = self.axis_combo.currentData() or "radius"
@@ -762,9 +1444,30 @@ class PhaseViewsWindow(QMainWindow):
         )
         values = payload.axis_values(axis)
         for k in range(payload.n_tracks):
+            if phase_mode:
+                # Per-frame attribution: one curve per structure key the
+                # track's members resolve to, so a track matched only
+                # from frame z renders z.. in the phase colour and the
+                # earlier members as unmatched grey (with member data
+                # absent this is one whole-track curve, as before).
+                for key, mem in self._member_subsets(k).items():
+                    if not self._structure_key_visible(key):
+                        continue
+                    color = self._structure_color(key)
+                    curve = self.traj_plot.plot(
+                        payload.frame_num[mem], values[mem],
+                        pen=self._curve_pen(color),
+                        **self._symbol_kwargs(4, color),
+                    )
+                    curve.sigPointsClicked.connect(
+                        self._on_traj_points_clicked
+                    )
+                continue
             if not self._structure_visible(k):
                 continue
-            members = payload.track_members(k)
+            members = self._interval_members(k)
+            if not len(members):
+                continue
             frames = payload.frame_num[members]
             color = self._qmap_track_color(k, payload.n_tracks, phase_mode)
             curve = self.traj_plot.plot(
@@ -801,14 +1504,17 @@ class PhaseViewsWindow(QMainWindow):
             self._qmap_legend.setVisible(False)
             return
         for k in range(payload.n_tracks):
-            if not self._structure_visible(k):
-                continue
-            color = self._qmap_track_color(k, payload.n_tracks, phase_mode)
             if k in self._ring_tracks:
+                if not self._structure_visible(k):
+                    continue
+                color = self._qmap_track_color(
+                    k, payload.n_tracks, phase_mode
+                )
                 # A ring spans the whole azimuth at a fixed |q|, so it
                 # reads as a dashed quarter-circle arc (0deg along q_xy
                 # to 90deg along q_z) at its mean radius — not a cluster
-                # of points.
+                # of points. One arc per track: splitting it by member
+                # attribution would just overdraw the same radius.
                 r = payload.track_mean("radius", k)
                 theta = np.linspace(0.0, np.pi / 2, 100)
                 self.qmap_plot.plot(
@@ -819,11 +1525,35 @@ class PhaseViewsWindow(QMainWindow):
                     ),
                 )
                 continue
-            members = payload.track_members(k)
-            self.qmap_plot.plot(
-                payload.q_xy[members], payload.q_z[members],
-                pen=self._curve_pen(color),
-            )
+            if phase_mode:
+                # Per-frame attribution: the track's points split by the
+                # phase that claimed each member on its frame (frame-
+                # complete — the frame-interval control does not narrow
+                # the q-map). The mean marker stays one per track, in
+                # the dominant colour.
+                for key, mem in self._member_subsets(
+                    k, interval=False
+                ).items():
+                    if not self._structure_key_visible(key):
+                        continue
+                    self.qmap_plot.plot(
+                        payload.q_xy[mem], payload.q_z[mem],
+                        pen=self._curve_pen(self._structure_color(key)),
+                    )
+                if not self._structure_visible(k):
+                    continue
+                color = self._qmap_track_color(k, payload.n_tracks, True)
+            else:
+                if not self._structure_visible(k):
+                    continue
+                color = self._qmap_track_color(
+                    k, payload.n_tracks, phase_mode
+                )
+                members = payload.track_members(k)
+                self.qmap_plot.plot(
+                    payload.q_xy[members], payload.q_z[members],
+                    pen=self._curve_pen(color),
+                )
             self.qmap_plot.plot(
                 [payload.track_mean("q_xy", k)],
                 [payload.track_mean("q_z", k)],
@@ -852,24 +1582,25 @@ class PhaseViewsWindow(QMainWindow):
         return pg.mkColor(*self._UNMATCHED_COLOR)
 
     def _rebuild_phase_legend(self, payload) -> None:
-        """One legend entry per unique dominant CIF present among the
-        VISIBLE tracks (+ 'unmatched' if any visible track has no
-        phase) — so hiding a structure drops it from the legend too."""
+        """One legend entry per unique structure key drawn among the
+        VISIBLE member subsets (+ 'unmatched' when any visible portion
+        is unclaimed) — so hiding a structure drops it from the legend
+        too. With no member attribution this reduces to the dominant
+        CIF per visible track, the pre-split legend."""
         self._qmap_legend.clear()
         seen: list = []
         has_unmatched = False
         for k in range(payload.n_tracks):
-            if not self._structure_visible(k):
-                continue
-            cifs = self._track_phases.get(k)
-            if cifs:
-                if cifs[0] not in seen:
-                    seen.append(cifs[0])
-            else:
-                has_unmatched = True
+            for key in self._member_subsets(k, interval=False):
+                if not self._structure_key_visible(key):
+                    continue
+                if key == _UNMATCHED:
+                    has_unmatched = True
+                elif key not in seen:
+                    seen.append(key)
         for cif in seen:
             sample = pg.PlotDataItem(
-                pen=pg.mkPen(self._phase_colors[cif], width=2)
+                pen=pg.mkPen(self._structure_color(cif), width=2)
             )
             self._qmap_legend.addItem(sample, cif)
         if has_unmatched:
@@ -887,25 +1618,248 @@ class PhaseViewsWindow(QMainWindow):
             self.amp_plot.removeItem(fill)
         self._amp_fills = []
 
-    def _amp_median_series(self, tracks, window, normalize):
-        """Per-frame MEDIAN + interquartile bounds of the given tracks'
-        amplitudes.
+    def _zero_padding_active(self) -> bool:
+        """The "Zeros at start/end" toggle is effective only in median
+        mode (the checkbox is disabled otherwise but keeps its checked
+        state, so both must be tested)."""
+        return self.amp_zero.isEnabled() and self.amp_zero.isChecked()
 
-        Each track's series goes through the same smoothing window /
-        per-track normalization as the individual curves, then a track
-        with several same-frame members contributes their mean once.
-        Per frame the statistics run over the tracks that HAVE a value
+    def _zero_pad(self, frames, *value_arrays):
+        """"Zeros at start/end": pad a per-STRUCTURE median series with
+        per-frame zero points from the visible start to the first
+        observed frame and from the last one to the visible end — the
+        structure is genuinely absent before forming / after vanishing,
+        so its median evolution rises from and falls back to zero.
+        Applied to the RESULT of the per-frame statistics, never to the
+        individual tracks feeding them: a track absent on a frame must
+        not contribute a zero there, or the median is dragged down
+        whenever only some of the structure's tracks are present. Gaps
+        inside the series stay open."""
+        if not self._zero_padding_active() or frames.size == 0:
+            return (frames, *value_arrays)
+        lo, hi = self._frame_interval()
+        lead = np.arange(lo, int(frames.min()))
+        tail = np.arange(int(frames.max()) + 1, hi + 1)
+        if not len(lead) and not len(tail):
+            return (frames, *value_arrays)
+        frames = np.concatenate([lead, frames, tail])
+        padded = tuple(
+            np.concatenate([np.zeros(len(lead)), arr, np.zeros(len(tail))])
+            for arr in value_arrays
+        )
+        return (frames, *padded)
+
+    def _update_amp_tracks_button(self) -> None:
+        n_off = sum(len(v) for v in self._amp_excluded.values())
+        self.btn_amp_tracks.setText(
+            f"Select tracks… ({n_off} off)" if n_off else "Select tracks…"
+        )
+
+    def _on_select_amp_tracks(self) -> None:
+        """Open the per-structure track picker — modeless (the plots
+        update live next to it), rebuilt fresh on every open so it
+        always reflects the current payload/phases."""
+        if self._payload is None or not self._track_phases:
+            return
+        if self._amp_track_dialog is not None:
+            self._amp_track_dialog.close()
+        dlg = _TrackSelectDialog(self)
+        self._amp_track_dialog = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _amp_groups(self) -> dict:
+        """``{structure key: [member arrays]}`` feeding the amplitude
+        displays: the per-frame member subsets minus the tracks the
+        user unticked in the Select-tracks dialog (per structure).
+        Interval-filtered like the plots themselves."""
+        groups: dict = {}
+        for k in range(self._payload.n_tracks):
+            for key, mem in self._member_subsets(k).items():
+                if k in self._amp_excluded.get(key, ()):
+                    continue
+                groups.setdefault(key, []).append(mem)
+        return groups
+
+    # --- Metric abstraction (fitted amplitude vs ROI intensity) ---
+    #
+    # Every amplitude-tab consumer (curves, medians, CSV export) works
+    # on metric-agnostic SERIES — ``(frames, values)`` array pairs —
+    # built here. The fitted-amplitude metric reads the payload's
+    # member arrays; the ROI metric reads the worker-computed traces,
+    # which cover EVERY scan frame (a failed fit leaves no gap).
+
+    def _metric(self) -> str:
+        return self.amp_metric.currentData() or "amplitude"
+
+    def _metric_label(self) -> str:
+        return (
+            "Integrated ROI intensity (arb. u.)"
+            if self._metric() == "roi" else AXIS_LABELS["amplitude"]
+        )
+
+    def _member_series(self, members) -> tuple:
+        """Fitted-amplitude series of a member-index array."""
+        payload = self._payload
+        return payload.frame_num[members], payload.amplitude[members]
+
+    def _roi_params(self) -> tuple:
+        return (
+            float(self.roi_dqxy.value()), float(self.roi_dqz.value()),
+            int(self.roi_gap.value()), int(self.roi_strip.value()),
+        )
+
+    def _roi_cache_valid(self) -> bool:
+        cache = self._roi_traces
+        return (
+            cache is not None
+            and cache["params"] == self._roi_params()
+            and cache["fp"] == self._amp_payload_fp
+            and cache["target"] == (self._file_path, self._entry)
+        )
+
+    def _ensure_roi_traces(self) -> bool:
+        """True when valid ROI traces are cached. Otherwise kick the
+        background computation (when the scan context allows one) and
+        return False — the worker's finish re-renders the tab."""
+        if self._roi_cache_valid():
+            return True
+        if (
+            self._payload is None or self._file_path is None
+            or not self._entry or self._n_frames <= 0
+        ):
+            self.statusBar().showMessage(
+                "The ROI metric needs the scan file — no scan context "
+                "is set for this tracking result.", 6000,
+            )
+            return False
+        if self._worker_thread is not None:
+            # A view worker is running; its finish handler re-kicks.
+            return False
+        positions = {
+            k: roi_intensity.track_frame_positions(
+                self._payload, k, self._n_frames
+            )
+            for k in range(self._payload.n_tracks)
+        }
+        params = self._roi_params()
+        started = self._start_worker(RoiTraceWorker(
+            self._file_path, self._entry, positions, *params
+        ))
+        if started:
+            self._roi_pending = {
+                "fp": self._amp_payload_fp,
+                "target": (self._file_path, self._entry),
+            }
+            self.statusBar().showMessage(
+                "Computing ROI intensity traces…"
+            )
+        return False
+
+    def _roi_track_series(self, k: int, frames=None):
+        """Track ``k``'s cached ROI trace as a series — restricted to
+        the frame interval, or to explicit ``frames``. None while the
+        cache is missing or stale."""
+        if not self._roi_cache_valid():
+            return None
+        trace = self._roi_traces["traces"].get(k)
+        if trace is None:
+            return None
+        if frames is None:
+            lo, hi = self._frame_interval()
+            frames = np.arange(lo, min(hi, trace.size - 1) + 1)
+        else:
+            frames = np.asarray(frames, dtype=int)
+            frames = frames[(frames >= 0) & (frames < trace.size)]
+        return frames, trace[frames]
+
+    def _track_series(self, k: int):
+        """Metric series of track ``k`` over the frame interval (the
+        ungrouped per-track view / export). None with nothing to show."""
+        if self._metric() == "roi":
+            return self._roi_track_series(k)
+        members = self._interval_members(k)
+        if not len(members):
+            return None
+        return self._member_series(members)
+
+    def _roi_key_frames(self, k: int) -> dict:
+        """Partition the interval frames of track ``k``'s ROI trace
+        among the track's structure keys: each frame follows the key of
+        the NEAREST member frame (ties -> earlier) — the ROI companion
+        of ``_member_subsets``' per-frame attribution, extended to the
+        synthesized gap/lead/tail frames. Single-key tracks (the usual
+        case) get the whole trace."""
+        lo, hi = self._frame_interval()
+        frames = np.arange(lo, hi + 1)
+        subsets = self._member_subsets(k, interval=False)
+        if len(subsets) <= 1:
+            key = next(iter(subsets), self._structure_key_of(k))
+            return {key: frames}
+        payload = self._payload
+        frame_key: dict = {}
+        for i in payload.track_members(k):
+            f = int(payload.frame_num[i])
+            if f not in frame_key:
+                frame_key[f] = self._member_structure_key(int(i), k)
+        uf = np.array(sorted(frame_key))
+        keys = [frame_key[int(f)] for f in uf]
+        idx = np.clip(np.searchsorted(uf, frames), 0, uf.size - 1)
+        prev = np.clip(idx - 1, 0, uf.size - 1)
+        take_prev = np.abs(frames - uf[prev]) <= np.abs(uf[idx] - frames)
+        choice = np.where(take_prev, prev, idx)
+        out: dict = {}
+        for f, c in zip(frames, choice):
+            out.setdefault(keys[int(c)], []).append(int(f))
+        return {
+            key: np.asarray(v, dtype=int) for key, v in out.items()
+        }
+
+    def _amp_group_series(self) -> dict:
+        """``{structure key: [series]}`` feeding the grouped / median
+        displays under the current metric, minus the tracks unticked in
+        the Select-tracks dialog."""
+        if self._metric() != "roi":
+            return {
+                key: [self._member_series(mem) for mem in mem_lists]
+                for key, mem_lists in self._amp_groups().items()
+            }
+        groups: dict = {}
+        for k in range(self._payload.n_tracks):
+            for key, frames in self._roi_key_frames(k).items():
+                if k in self._amp_excluded.get(key, ()):
+                    continue
+                series = self._roi_track_series(k, frames)
+                if series is not None and len(series[0]):
+                    groups.setdefault(key, []).append(series)
+        return groups
+
+    def _on_metric_changed(self) -> None:
+        self._roi_controls.setVisible(self._metric() == "roi")
+        self._refresh_amplitude()
+
+    def _amp_median_series(self, series_list, window, normalize):
+        """Per-frame MEDIAN + interquartile bounds over
+        ``series_list`` — one ``(frames, values)`` series per
+        contributing track (or track portion, with per-frame phase
+        attribution).
+
+        Each series goes through the same smoothing window /
+        per-track normalization as the individual curves, then a series
+        with several same-frame points contributes their mean once.
+        Per frame the statistics run over the series that HAVE a value
         there (a track absent from a frame does not drag the median
         down). Returns ``(frames, median, q25, q75)`` — the 25th/75th
         percentile bounds collapse onto the median where only one track
         contributes — or ``None`` with no data.
         """
         per_frame: dict = {}
-        for k in tracks:
-            members = self._payload.track_members(k)
+        for series in series_list:
+            if series is None or not len(series[0]):
+                continue
             frames, amps = smooth_normalize_amplitude(
-                self._payload.frame_num[members],
-                self._payload.amplitude[members],
+                series[0], series[1],
                 window=window, normalize=normalize,
             )
             track_vals: dict = {}
@@ -921,14 +1875,22 @@ class PhaseViewsWindow(QMainWindow):
         med = np.array([np.median(per_frame[int(f)]) for f in xs])
         q25 = np.array([np.percentile(per_frame[int(f)], 25) for f in xs])
         q75 = np.array([np.percentile(per_frame[int(f)], 75) for f in xs])
+        # Zero baseline on the RESULT only (see _zero_pad): the stats
+        # above ran over present tracks, so an absent track never drags
+        # the median down; the finished curve then rises from and falls
+        # back to zero. The IQR bounds pad to zero too — the band
+        # collapses where the structure is absent.
+        xs, med, q25, q75 = self._zero_pad(xs, med, q25, q75)
         return xs, med, q25, q75
 
-    def _amp_median_band(self, tracks, window, normalize, baseline, color):
-        """Draw one structure's median amplitude curve with a
+    def _amp_median_band(
+        self, series_list, window, normalize, baseline, color
+    ):
+        """Draw one structure's median metric curve with a
         transparent interquartile band — 25th to 75th percentile
         (``pg.FillBetweenItem`` between the bound curves, tracked in
         ``_amp_fills`` because fills are not pyqtgraph data items)."""
-        series = self._amp_median_series(tracks, window, normalize)
+        series = self._amp_median_series(series_list, window, normalize)
         if series is None:
             return
         xs, med, q25, q75 = series
@@ -950,14 +1912,14 @@ class PhaseViewsWindow(QMainWindow):
             **self._symbol_kwargs(4, color),
         )
 
-    def _amp_extreme_lines(self, tracks, window, baseline, color):
-        """Thin horizontal reference lines at a structure's amplitude
+    def _amp_extreme_lines(self, series_list, window, baseline, color):
+        """Thin horizontal reference lines at a structure's metric
         MAXIMUM and MINIMUM (grouped view): the extremes of its
         per-frame median series (per-track normalized, like the grouped
         curves), spanning the structure's frame range — so every point
         of the band reads off how far it sits from the structure's own
         max/min."""
-        series = self._amp_median_series(tracks, window, True)
+        series = self._amp_median_series(series_list, window, True)
         if series is None or not len(series[0]):
             return
         xs, med, _q25, _q75 = series
@@ -966,11 +1928,11 @@ class PhaseViewsWindow(QMainWindow):
         for y in (float(np.nanmax(med)), float(np.nanmin(med))):
             self.amp_plot.plot(span, [y + baseline] * 2, pen=pen)
 
-    def _amp_curve(self, k, window, normalize, baseline, color):
-        members = self._payload.track_members(k)
+    def _amp_curve(self, series, window, normalize, baseline, color):
+        if series is None or not len(series[0]):
+            return
         frames, amps = smooth_normalize_amplitude(
-            self._payload.frame_num[members],
-            self._payload.amplitude[members],
+            series[0], series[1],
             window=window, normalize=normalize,
         )
         self.amp_plot.plot(
@@ -979,22 +1941,51 @@ class PhaseViewsWindow(QMainWindow):
             **self._symbol_kwargs(3, color),
         )
 
+    def _fit_amp_xrange(self) -> None:
+        """Pin the amplitude plot's x-axis to the tracked frame
+        interval. Auto-range used to run away far beyond the data
+        (thousands of frames on a 350-frame scan) — the grouped view's
+        pixel-sized structure labels fed back into the range
+        computation — so the axis is set explicitly to the range the
+        curves and the CSV export actually cover."""
+        lo, hi = self._frame_interval()
+        if hi > lo:
+            self.amp_plot.setXRange(float(lo), float(hi), padding=0.02)
+
     def _refresh_amplitude(self) -> None:
         self._clear_overlays(self.amp_plot)
         self._clear_amp_labels()
         left_axis = self.amp_plot.getPlotItem().getAxis("left")
         payload = self._payload
         grouped = self.amp_group.isChecked() and bool(self._track_phases)
+        median = self.amp_median.isChecked() and bool(self._track_phases)
         # Grouped bands are always per-track normalized (the offset needs
         # a fixed 0..1 range), so the manual normalize toggle is moot.
         self.amp_normalize.setEnabled(not grouped)
+        # Zero baseline is a median-curve feature (per-structure lead-in
+        # and tail); outside median mode the box is inert — shown
+        # disabled but keeping its checked state.
+        self.amp_zero.setEnabled(median)
         if payload is None:
             left_axis.setStyle(showValues=True)
             self.amp_plot.setLabel("left", "Amplitude")
             return
+        if self._metric() == "roi" and not self._ensure_roi_traces():
+            # No traces yet: leave the tab empty until the worker's
+            # finish handler re-renders (status bar shows the state).
+            left_axis.setStyle(showValues=True)
+            self.amp_plot.setLabel("left", self._metric_label())
+            return
         window = int(self.amp_window.value())
-        median = self.amp_median.isChecked() and bool(self._track_phases)
+        try:
+            self._draw_amplitude(payload, grouped, median, window,
+                                 left_axis)
+        finally:
+            self._fit_amp_xrange()
 
+    def _draw_amplitude(
+        self, payload, grouped, median, window, left_axis
+    ) -> None:
         if grouped:
             # Stack structures: each CIF group at its own vertical
             # offset, normalized per track (y-scale arbitrary), coloured
@@ -1004,34 +1995,49 @@ class PhaseViewsWindow(QMainWindow):
             # instead of the group's individual tracks.
             left_axis.setStyle(showValues=False)
             self.amp_plot.setLabel("left", "Structure (stacked, arb.)")
-            groups: dict = {}
-            for k in range(payload.n_tracks):
-                groups.setdefault(self._structure_key_of(k), []).append(k)
+            # Member-level grouping: a track matched only on part of its
+            # span contributes those members to its phase's band and the
+            # rest to "unmatched" (one whole-track entry under the
+            # dominant key when no member attribution exists). Tracks
+            # unticked in the Select-tracks dialog drop out here.
+            groups = self._amp_group_series()
             keys = [
                 key for key in self._structure_keys()
                 if self._structure_key_visible(key)
             ]
             x0 = float(payload.frame_num.min()) if payload.n_members else 0.0
+            # With a narrowed frame interval the bands start there, so
+            # the labels follow the visible left edge.
+            x0 = max(x0, float(self._frame_interval()[0]))
             for g, key in enumerate(keys):
                 baseline = g * self._AMP_GROUP_STEP
                 color = self._structure_color(key)
-                tracks = groups.get(key, [])
+                series_list = groups.get(key, [])
                 if median:
                     self._amp_median_band(
-                        tracks, window, True, baseline, color
+                        series_list, window, True, baseline, color
                     )
                 else:
-                    for k in tracks:
-                        self._amp_curve(k, window, True, baseline, color)
+                    for series in series_list:
+                        self._amp_curve(
+                            series, window, True, baseline, color
+                        )
                 # Thin dashed reference lines at this structure's
                 # median max / min.
-                self._amp_extreme_lines(tracks, window, baseline, color)
+                self._amp_extreme_lines(series_list, window, baseline, color)
+                # Bottom-left anchored just above the band's top: the
+                # curves and the dashed max reference line stay within
+                # baseline..baseline+1.0, so the label sits in the
+                # inter-band gap instead of on the curves (it used to
+                # be vertically centred IN the band, overlapping them).
+                # ignoreBounds: the pixel-sized label must not feed the
+                # view's auto-range (see _fit_amp_xrange).
                 label = pg.TextItem(
                     text="unmatched" if key == _UNMATCHED else key,
-                    color=color, anchor=(0.0, 0.5),
+                    color=color, anchor=(0.0, 1.0),
                 )
-                label.setPos(x0, baseline + 0.5)
-                self.amp_plot.addItem(label)
+                label.setPos(x0, baseline + 1.02)
+                self.amp_plot.addItem(label, ignoreBounds=True)
                 self._amp_labels.append(label)
             return
 
@@ -1040,15 +2046,16 @@ class PhaseViewsWindow(QMainWindow):
         # tracks into one phase-coloured median curve + IQR band.
         left_axis.setStyle(showValues=True)
         normalize = self.amp_normalize.isChecked()
-        self.amp_plot.setLabel(
-            "left",
-            "Amplitude (normalized)" if normalize
-            else AXIS_LABELS["amplitude"],
-        )
+        if normalize:
+            label = (
+                "Integrated ROI intensity (normalized)"
+                if self._metric() == "roi" else "Amplitude (normalized)"
+            )
+        else:
+            label = self._metric_label()
+        self.amp_plot.setLabel("left", label)
         if median:
-            groups = {}
-            for k in range(payload.n_tracks):
-                groups.setdefault(self._structure_key_of(k), []).append(k)
+            groups = self._amp_group_series()
             for key in self._structure_keys():
                 if not self._structure_key_visible(key):
                     continue
@@ -1061,7 +2068,8 @@ class PhaseViewsWindow(QMainWindow):
             if not self._structure_visible(k):
                 continue
             self._amp_curve(
-                k, window, normalize, 0.0, _track_pen(k, payload.n_tracks)
+                self._track_series(k), window, normalize, 0.0,
+                _track_pen(k, payload.n_tracks),
             )
 
     # Vertical spacing between stacked structure bands (each track is
@@ -1133,6 +2141,7 @@ class PhaseViewsWindow(QMainWindow):
         self.btn_waterfall.setEnabled(True)
         self.btn_mean_image.setEnabled(True)
         if error is not None:
+            self._roi_pending = None
             self.statusBar().showMessage(f"View computation failed: {error}")
             QMessageBox.warning(self, "Phase tracking views", str(error))
             return
@@ -1144,7 +2153,26 @@ class PhaseViewsWindow(QMainWindow):
         elif result.get("kind") == "mean_image":
             self._mean_image = result
             self._refresh_qmap()
+        elif result.get("kind") == "roi_traces":
+            pending = self._roi_pending or {}
+            self._roi_pending = None
+            self._roi_traces = {
+                "frames": result["frames"],
+                "traces": result["traces"],
+                "params": result["params"],
+                "fp": pending.get("fp"),
+                "target": pending.get("target"),
+            }
         self.statusBar().showMessage("Done.", 3000)
+        # The ROI metric may be waiting on a worker slot (only one view
+        # worker runs at a time) or on fresher parameters than the run
+        # that just landed — the refresh re-kicks in that case, and
+        # otherwise renders the new traces.
+        if self._metric() == "roi" and (
+            result.get("kind") == "roi_traces"
+            or not self._roi_cache_valid()
+        ):
+            self._refresh_amplitude()
 
     def _on_compute_waterfall(self) -> None:
         if self._file_path is None or not self._entry:
@@ -1285,50 +2313,94 @@ class PhaseViewsWindow(QMainWindow):
         return header, rows
 
     def _amplitude_export(self):
-        """Amplitude tab numbers AS DISPLAYED: honours the smoothing
-        window, the normalize toggle (forced on when grouped) and the
-        median mode (-> per-structure median/quartile columns). The
-        grouped view's vertical offsets are display-only and NOT
-        included."""
+        """Amplitude tab numbers AS DISPLAYED: honours the metric
+        selector, the smoothing window, the normalize toggle (forced on
+        when grouped) and the median mode (-> per-structure
+        median/quartile columns). The grouped view's vertical offsets
+        are display-only and NOT included.
+
+        Every frame of the exported range gets a row (per track /
+        structure): frames without a value carry an explicit ``nan``
+        instead of being skipped, so naive plots cannot silently
+        interpolate across fit gaps. Same-frame duplicate points (a
+        track with several members on one frame) average into the
+        frame's single row."""
         payload = self._payload
+        roi = self._metric() == "roi"
         grouped = self.amp_group.isChecked() and bool(self._track_phases)
         median = self.amp_median.isChecked() and bool(self._track_phases)
         window = int(self.amp_window.value())
         normalize = True if grouped else self.amp_normalize.isChecked()
+        lo, hi = self._frame_interval()
+        custom = any(self._amp_excluded.values())
+        metric_name = "integrated intensity (ROI)" if roi else "amplitude"
+        roi_settings = ""
+        if roi:
+            dqxy, dqz, gap, strip = self._roi_params()
+            roi_settings = (
+                f", roi=+-{dqxy:g}/+-{dqz:g} 1/A "
+                f"bg gap {gap} px strips {strip} px"
+            )
         settings = (
+            f"metric={metric_name}{roi_settings}, "
             f"window={window}, normalize={normalize}, "
-            f"mode={'median per structure' if median else 'per track'}; "
-            "grouped-display offsets not included"
+            f"mode={'median per structure' if median else 'per track'}, "
+            f"frames={lo}..{hi}, "
+            f"zeros={'lead+tail' if self._zero_padding_active() else 'off'}, "
+            f"tracks={'custom' if custom else 'all'}; "
+            "grouped-display offsets not included; "
+            "one row per frame, nan = no value"
         )
+
+        full = np.arange(lo, hi + 1)
+
+        def _frame_complete(frames, values):
+            """One value per frame of the exported range: same-frame
+            duplicates averaged, missing frames NaN."""
+            out = np.full(full.size, np.nan)
+            fi = np.asarray(frames, dtype=int) - lo
+            ok = (fi >= 0) & (fi < full.size)
+            sums = np.zeros(full.size)
+            counts = np.zeros(full.size)
+            np.add.at(sums, fi[ok], np.asarray(values, dtype=float)[ok])
+            np.add.at(counts, fi[ok], 1.0)
+            has = counts > 0
+            out[has] = sums[has] / counts[has]
+            return out
+
+        value_col = "roi_intensity" if roi else "amplitude"
         if median:
             header = ["structure", "frame", "median", "q25", "q75"]
             rows = []
-            groups: dict = {}
-            for k in range(payload.n_tracks):
-                groups.setdefault(self._structure_key_of(k), []).append(k)
+            groups = self._amp_group_series()
             for key in self._structure_keys():
                 series = self._amp_median_series(
-                    groups.get(key, []), window, normalize
+                    groups.get(key, []), window, normalize,
                 )
                 if series is None:
                     continue
                 label = "unmatched" if key == _UNMATCHED else key
-                for x, med, lo, hi in zip(*series):
+                med = _frame_complete(series[0], series[1])
+                q25 = _frame_complete(series[0], series[2])
+                q75 = _frame_complete(series[0], series[3])
+                for f, m, b_lo, b_hi in zip(full, med, q25, q75):
                     rows.append([
-                        label, int(x), f"{med:.8g}",
-                        f"{lo:.8g}", f"{hi:.8g}",
+                        label, int(f), f"{m:.8g}",
+                        f"{b_lo:.8g}", f"{b_hi:.8g}",
                     ])
             return header, rows, settings
-        header = ["track", "structure", "frame", "amplitude"]
+        header = ["track", "structure", "frame", value_col]
         rows = []
         for k in range(payload.n_tracks):
             label = self._track_structure_label(k)
-            members = payload.track_members(k)
+            series = self._track_series(k)
+            if series is None or not len(series[0]):
+                continue
             frames, amps = smooth_normalize_amplitude(
-                payload.frame_num[members], payload.amplitude[members],
+                series[0], series[1],
                 window=window, normalize=normalize,
             )
-            for f, a in zip(frames, amps):
+            for f, a in zip(full, _frame_complete(frames, amps)):
                 rows.append([k, label, int(f), f"{a:.8g}"])
         return header, rows, settings
 

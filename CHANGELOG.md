@@ -4,6 +4,261 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## 0.1.0a15 — fifteenth alpha (2026-08-11)
+
+### Added
+
+- **Integrated ROI intensity as a second tracking metric.** The
+  amplitude-evolution tab gains a Metric selector: "amplitude" (the
+  fitted peak amplitude, as before — the default) or "integrated
+  intensity (ROI)" — the background-subtracted integrated intensity
+  of a q-space box around each tracked peak, summed from the image
+  data itself. The ROI trace has a value on EVERY frame: frames where
+  the fit failed (or before the peak first appeared) center the box
+  on the nearest fitted position, so fit dropouts no longer punch
+  gaps or spurious zeros into the evolution curves, and the value is
+  proportional to the diffracting volume instead of swinging with the
+  fit's amplitude-width trade-off on clipped peaks. The local
+  background is the pooled MEDIAN per-pixel intensity of two strips
+  flanking the box radially (along q_z for near-axis peaks, along
+  q_xy otherwise) times the box area — two flanks so a neighboring
+  peak under one of them cannot poison the estimate, the median so a
+  bright feature under part of the strips is ignored outright. Box
+  half-widths (default 0.03 Å⁻¹) and strip gap/width (2 px / 4 px)
+  are adjustable next to the selector. Traces are computed in the
+  background (one full pass over the scan, progress in the status
+  bar) and cached until tracking, the entry or the ROI settings
+  change; grouping, per-structure medians, normalization, smoothing,
+  the frame interval, track selection and the CSV export all work
+  identically for both metrics.
+- **Expected pattern: orientation modes instead of the big hkl
+  list.** The overlay's orientation is now picked by mode: "matched"
+  (the current frame's matched orientations for the structure,
+  probability-labelled, with a clear hint when the frame has none),
+  "random (powder rings)" (the orientation-free ring pattern), or
+  "user-specified hkl" — type the three Miller indices directly
+  instead of scrolling every symmetry-distinct orientation. Typed
+  indices are validated against the structure's precomputed
+  orientations: equivalent spellings (2 2 0, 0 0 -1, 0 0 1 for a
+  stored 0 0 2) resolve automatically with a note, and invalid or
+  unsimulated indices show a red hint plus a status-bar message
+  instead of failing silently. Until the mode is touched it follows
+  the data: matched when matches exist, random otherwise.
+- **Amplitude CSV export: one row per frame, metric recorded.** The
+  export now writes a row for EVERY frame of the exported range per
+  track (or structure, in median mode) — frames without a value carry
+  an explicit `nan` instead of being silently skipped, so plotting
+  the CSV can no longer interpolate across fit gaps unnoticed. The
+  provenance line records the selected metric (plus the ROI geometry
+  when active), and the value column is named after the metric.
+- **Amplitude evolution: zero baseline and brightest-tracks limit.**
+  Two new controls on the phase-views amplitude tab. "Zeros at
+  start/end" (median mode) pads each structure's MEDIAN curve with
+  zero-intensity points from the visible start to its first observed
+  frame and from its last one to the visible end, so the evolution
+  rises from zero at frame 0 and falls back to zero after vanishing.
+  The zeros are added to the finished median only — individual tracks
+  never contribute zeros to the statistics, so a track absent on some
+  frames cannot drag the median down there; gaps inside the series
+  stay open. "Select tracks…" opens a per-structure table of every
+  track — sortable by track id, frame count, first/last frame, mean
+  |q| and mean amplitude — with a checkbox per track: untick a track
+  and it drops out of that structure's grouped band and median
+  immediately (the plots update live next to the modeless dialog, and
+  the button shows how many tracks are off). Next to the tables, a
+  non-interactive scan preview with a frame slider shows the SELECTED
+  row's track on the image: clicking a row jumps the slider to the
+  track's first frame, rings its peaks on the current frame in the
+  structure colour and draws the full trajectory faintly — judging a
+  faint or spurious track is a matter of looking, not of reading
+  numbers. The selection resets on
+  a new tracking run or a track deletion. The amplitude CSV export
+  mirrors both controls and records them in its provenance line, and
+  the phase-views frame interval now spans the whole scan (not just
+  the tracked frames) so frame 0 is always reachable.
+- **Frame interval for the phase views.** A window-wide "Frames:
+  from..to" control in the tracking views narrows the trajectories and
+  amplitude-evolution plots to that interval (members outside it are
+  not drawn); the q-map and waterfall stay frame-complete. Bounds
+  follow the tracked scan and reset to the full range on a new
+  tracking run; the amplitude CSV export mirrors the visible interval
+  and records it in its provenance line.
+- **Frame range for pipeline operations.** The Frames dropdown of
+  Detection, Fitting and Matching gains a "Frame range…" option with
+  an expression field (comma-separated indices and inclusive A-B
+  ranges, e.g. `0-34,40`): only those frames are processed. The range
+  is validated against the scan when you press Run — malformed input
+  or a range entirely outside the scan blocks the run with a message;
+  frames partly outside are dropped with a log note. Progress totals
+  follow the restricted count.
+- **Pick your own colour per matched structure.** The colour swatch in
+  the matched-peaks legend (Display dock and its Expected-pattern
+  twin) is a button now: clicking it opens a compact grid of 40
+  preset colours plus "Automatic" (back to the assigned palette
+  colour) and "More…" (full colour dialog). The chosen colour follows
+  the structure everywhere — image overlays in both box and marker
+  style, both legends, the selected-peak swatch, and the phase-views
+  window (q-map, amplitude bands, structure toggles and legend) for
+  that CIF. Colours are remembered across sessions per structure
+  (CIF + hkl), in any file.
+- **"Single entry in single file" conversion output mode.** All
+  selected images convert into ONE fresh entry of one new file — each
+  image becomes a frame of a real N-frame scan instead of its own
+  `entry_NNNN` group. The result browses with the frame slider and
+  can be peak-tracked across the scan (impossible with N sibling
+  entries), and the auto-open at the end is a single file. Mutually
+  exclusive with append-to-existing-entry; a post-run check warns if
+  any frame was diverted because its detector size didn't match.
+- **Import pre-converted images as one scan.** For q-space maps
+  produced outside mlgidLAB: File → Import images as converted scan…
+  stacks N image files as one N-frame scan saved to a new .h5 (no
+  conversion runs — the pixels are copied verbatim, streamed with
+  constant memory). Optional q_xy/q_z ranges give the entry real
+  reciprocal-space axes; without them it shows pixel axes. Opening a
+  batch of float-pixel images offers this flow automatically (raw
+  detector frames are integer counts; interpolated maps are float) —
+  one click opens them as raw instead if the guess is wrong.
+- **Imported scans can run the full pipeline when you supply the
+  wavelength.** Typing the beam wavelength (with the q ranges) in the
+  import dialog makes detection, fitting and matching work on the
+  imported scan: the entry gets a real wavelength + incidence angle
+  and documented zero placeholders for the detector fields none of
+  the three operations consume (verified against mlgidbase 0.1.5 with
+  a real fitting run). Without the wavelength the import is view-only
+  and pipeline runs are refused with a message explaining how to
+  re-import.
+- **Track list: structure column and Delete-to-remove.** The
+  Scan-tracking table now shows which matched crystal structures each
+  track belongs to (dominant phase first, filled once Matching has
+  run), and pressing Delete on a selected row removes that track from
+  the results — from the table, the phase views, the only-tracked
+  filter and the phase colouring. Display state only: no peaks are
+  deleted from the file.
+- **Progress indicator for big image-batch loads.** While the file
+  browser streams a batch's rows in, the status bar shows a small
+  determinate "Browser: n/N files" bar (separate from the open/load
+  indicator, which the first image's async load drives). Only appears
+  for batches of 10 or more files; clears when the fill completes.
+- **"Select all" in the conversion Selection tree.** One checkbox
+  above the file/entry tree checks or unchecks the whole batch (0.02 s
+  even at 6000 image files); its state mirrors manual edits as
+  checked, unchecked, or partial. A click never lands on "partial" —
+  anything mixed becomes fully checked.
+- **File-browser rows for image files are clickable now.** Clicking a
+  TIFF/CBF/EDF row in the file browser selects that image in the entry
+  dropdown and shows it in the viewer — the same behavior clicking an
+  `entry_*` group has for NeXus files. Double-click additionally
+  renders the image in the Data tab. Previously image rows were inert,
+  which made the browser feel dead for image batches.
+
+### Changed
+
+- **The Controls & shortcuts reference (F1) is a real dialog now.**
+  Modeless and filterable (type to narrow, e.g. "paste" or "track"),
+  with grouped sections and key badges, styled for both the dark and
+  light theme and following live theme switches. The inventory is
+  complete: it now lists the copy/paste shortcuts, Ctrl+A,
+  Ctrl+click multi-select, F11, F5, the tracking-table Delete key,
+  trajectory-point and colour-swatch clicks, drag & drop, and more
+  that the old static box omitted; two wrong entries were corrected
+  (Esc deletes the selected manual peak; ROI dragging resizes manual
+  and detected peaks only).
+
+### Fixed
+
+- **Phase-views colours match the Display legend.** The tracking
+  views (q-map, amplitude bands, structure toggles, legend) used
+  their own hue wheel and only followed the matched-peaks legend for
+  hand-picked custom colours — an automatically coloured structure
+  showed one colour in the Display dock and a different one in the
+  views. The host now pushes the viewer's EFFECTIVE per-CIF colours
+  (automatic palette plus custom picks, a pick on any hkl row of a
+  CIF winning for that CIF) at window open, on every pick and on
+  every tracking run, so both sides always agree.
+- **Amplitude plot x-axis no longer runs away.** The amplitude
+  evolution's auto-range could inflate the frame axis far beyond the
+  data (thousands of frames on a 350-frame scan): the grouped view's
+  pixel-sized structure labels fed back into the range computation.
+  The labels are excluded from ranging now and the x-axis is pinned to
+  the tracked frame interval — the same range the CSV export covers.
+- **Phase colouring follows the frames matching actually claimed.** A
+  track fitted on frames x..y but matched only from frame z was
+  painted with its phase colour over the whole span. The views now
+  attribute each tracked peak per frame: in the trajectories
+  ("matched" colouring), the grouped/median amplitude bands, the
+  q-map phase overlay and its legend, the claimed members render in
+  the phase colour and the never-claimed ones as unmatched grey. The
+  "unmatched" toggle then shows/hides exactly the unclaimed portions;
+  the amplitude CSV export in median mode groups the same way.
+- **Amplitude band labels no longer sit on the curves.** The structure
+  labels of the grouped amplitude view were vertically centred inside
+  their band; they now sit in the gap above the band's top reference
+  line.
+- **Opening large image batches no longer freezes the window.** With
+  1000 detector TIFFs the open froze the GUI for ~8 s on warm NVMe
+  (longer on cold or network storage) before anything rendered; with
+  6000 the browser was unusable. Causes, all fixed: every image spun
+  up its own classifier thread (classification is a pure extension
+  check — it now runs inline); every image became a full silx browser
+  row, each insert decoding the whole image on the GUI thread AND
+  pinning its pixels for the session (~10 MB per row — the browser
+  alone held ~10 GB for a 1000-file batch); and the recent-files menu
+  was rebuilt once per file (now one batched update). Image files are
+  now listed as lightweight name-only rows (no decode, no pixel
+  memory, streamed in chunks off a timer), so ALL files of a batch
+  appear in the browser regardless of size. For 6000 detector images:
+  first image renders in ~0.5 s, the browser fills within ~7 s in the
+  background, clicks answer in ~1 ms, and memory stays flat. Rows
+  queued behind a tree detach are re-queued by the reattach, so
+  pipeline runs and session closes stay consistent mid-fill (the
+  reattach itself previously re-froze the window on every pipeline
+  run while a big batch was open).
+- **The Open dialog stays responsive in huge image directories.**
+  File → Open now uses Qt's own dialog with a constant-time icon
+  provider instead of the platform-native picker: native dialogs
+  preview/thumbnail image files, which made a directory of thousands
+  of detector TIFFs take ages to even list. The last-visited
+  directory now also persists across app restarts.
+- **Closing no longer lags with a big batch open.** Emptying the file
+  browser (session close, app exit, and the detach before every
+  pipeline run or save) removed rows one at a time — each removal a
+  model event the sort proxy and view reacted to, quadratic overall.
+  The browser now empties in a single model reset; h5 file handles
+  are still released per row.
+- **The pipeline progress bar no longer lags the log and jumps at the
+  end.** The per-frame bar counted only mlgidbase's "Saved … peaks"
+  lines, but frames that produce nothing end with a different line
+  instead (matching: "No solutions …"; detection: "No peaks detected
+  …" or "Detection failed …"). On runs with such frames the bar fell
+  behind the log output and then leapt to 100% when the run finished.
+  Those skip lines now count as completed frames too, so the bar
+  tracks the log one-to-one. Most visible on matching, where
+  no-solution frames are routine.
+- **Peak tracking no longer gets the app killed on big scans — it
+  runs in bounded memory instead.** mlgidBASE's tracking compares
+  every fitted peak of the scan with every other one in a dense
+  matrix, so its memory grows with the square of the total peak count
+  (64 bytes per peak pair, measured) — a 602-frame scan with ~44k
+  fitted peaks needs over 120 GB and the kernel OOM-killed the whole
+  window mid-run. The pipeline now pre-estimates that need against
+  the machine's available memory and, when the dense run would not
+  fit, computes the identical result with a memory-safe blocked
+  equivalent: the IoU streams in row blocks keeping only the
+  above-threshold pairs, and tracks come from sparse connected
+  components — same boxes, same IoU formula, same threshold and
+  length semantics, verified edge-for-edge and payload-for-payload
+  against the official upstream run. The 602-frame scan that used to
+  kill the app now tracks in ~80 s within ~1.3 GB (122 tracks).
+  Only the official mlgidBASE figure export still needs the dense
+  upstream run; on oversized scans it refuses with the numbers and
+  points at the phase-views image export instead.
+- **The tracking dialog shows a busy marquee instead of freezing at
+  95%.** The old bar faked progress toward 95% within seconds and
+  then sat there for the rest of the run (tracking is one opaque
+  mlgidBASE call with no per-frame progress). It is now an honest
+  indeterminate busy bar that animates for the whole run; the
+  Interpolate-track dialog keeps its real per-frame percentages.
+
 ## 0.1.0a14 — fourteenth alpha (2026-08-05)
 
 Hotfix on `0.1.0a13`: the in-GUI updater could not update a running

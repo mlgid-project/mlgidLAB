@@ -65,6 +65,10 @@ FRAME_LIST = "List"
 
 OUTPUT_SEPARATE_FILES = "Separate files"
 OUTPUT_SEPARATE_DATASETS = "Separate datasets in single file"
+# All selected scans land as FRAMES of one entry in one (new) output
+# file — the converted result browses with the frame slider and can be
+# peak-tracked as a scan, unlike N separate entry_NNNN groups.
+OUTPUT_SINGLE_ENTRY = "Single entry in single file"
 
 
 def _make_form(parent: QWidget | None = None) -> QFormLayout:
@@ -434,6 +438,17 @@ class ConversionPanel(QWidget):
         hint.setWordWrap(True)
         section.body_layout.addWidget(hint)
 
+        # Whole-batch toggle — with thousands of image files per raw
+        # batch, per-file ticking is impractical. Tristate is display
+        # only: a click never lands on "partial" (see
+        # _on_select_all_clicked), it just mirrors a mixed tree.
+        self.select_all_box = QCheckBox("Select all")
+        self.select_all_box.setTristate(True)
+        # Enabled once set_raw_inputs delivers something to select.
+        self.select_all_box.setEnabled(False)
+        self.select_all_box.clicked.connect(self._on_select_all_clicked)
+        section.body_layout.addWidget(self.select_all_box)
+
         self.selection_tree = QTreeWidget()
         self.selection_tree.setColumnCount(3)
         self.selection_tree.setHeaderLabels(["Source", "Shape", "Dtype"])
@@ -474,6 +489,70 @@ class ConversionPanel(QWidget):
         self.frame_single.setVisible(mode == FRAME_SINGLE)
         self.frame_list.setVisible(mode == FRAME_LIST)
 
+    def _all_top_level_checked(self) -> bool:
+        tree = self.selection_tree
+        n = tree.topLevelItemCount()
+        return n > 0 and all(
+            tree.topLevelItem(i).checkState(0) == Qt.CheckState.Checked
+            for i in range(n)
+        )
+
+    def _on_select_all_clicked(self) -> None:
+        """Check or uncheck the whole tree in one pass.
+
+        Anything not fully checked becomes checked; fully checked
+        becomes unchecked (Qt's native tristate click-cycle would force
+        the user through the partial state — the target is computed
+        from the TREE, then stamped on the box). Tree signals are
+        blocked while stamping: letting the per-item cascade run would
+        fire ``_on_selection_changed`` (parent-state recompute + a
+        full-tree runnability walk) once per file — quadratic on a
+        several-thousand-image batch.
+        """
+        target = (
+            Qt.CheckState.Unchecked
+            if self._all_top_level_checked()
+            else Qt.CheckState.Checked
+        )
+        self.select_all_box.setCheckState(target)
+        tree = self.selection_tree
+        tree.blockSignals(True)
+        try:
+            for i in range(tree.topLevelItemCount()):
+                item = tree.topLevelItem(i)
+                item.setCheckState(0, target)
+                for j in range(item.childCount()):
+                    item.child(j).setCheckState(0, target)
+        finally:
+            tree.blockSignals(False)
+        self._refresh_runnable()
+
+    def _sync_select_all_state(self) -> None:
+        """Mirror the tree's aggregate check state on the box.
+
+        Programmatic ``setCheckState`` does not emit ``clicked``, so
+        this never re-enters ``_on_select_all_clicked``.
+        """
+        tree = self.selection_tree
+        n = tree.topLevelItemCount()
+        checked = sum(
+            1
+            for i in range(n)
+            if tree.topLevelItem(i).checkState(0) == Qt.CheckState.Checked
+        )
+        partial = any(
+            tree.topLevelItem(i).checkState(0)
+            == Qt.CheckState.PartiallyChecked
+            for i in range(n)
+        )
+        if n == 0 or checked == 0 and not partial:
+            state = Qt.CheckState.Unchecked
+        elif checked == n:
+            state = Qt.CheckState.Checked
+        else:
+            state = Qt.CheckState.PartiallyChecked
+        self.select_all_box.setCheckState(state)
+
     def _on_selection_changed(self, item: QTreeWidgetItem, col: int) -> None:
         # Only react to checkbox changes; column edits are not editable
         # in the selection tree.
@@ -490,6 +569,7 @@ class ConversionPanel(QWidget):
                 item.child(i).setCheckState(0, state)
         else:
             self._refresh_parent_check_state(item.parent())
+        self._sync_select_all_state()
         self._refresh_runnable()
 
     def _refresh_parent_check_state(self, parent: QTreeWidgetItem) -> None:
@@ -514,6 +594,9 @@ class ConversionPanel(QWidget):
             parent.treeWidget().blockSignals(False)
 
     def _refresh_selection_tree(self) -> None:
+        # Fresh tree, fresh box: check-state was dropped with the items.
+        self.select_all_box.setCheckState(Qt.CheckState.Unchecked)
+        self.select_all_box.setEnabled(bool(self._raw_inputs))
         self.selection_tree.clear()
         for file_path, entries in self._raw_inputs:
             file_item = QTreeWidgetItem([file_path.name, "", ""])
@@ -1078,10 +1161,14 @@ class ConversionPanel(QWidget):
 
         self.output_mode_combo = QComboBox()
         self.output_mode_combo.addItems(
-            [OUTPUT_SEPARATE_FILES, OUTPUT_SEPARATE_DATASETS]
+            [OUTPUT_SEPARATE_FILES, OUTPUT_SEPARATE_DATASETS,
+             OUTPUT_SINGLE_ENTRY]
         )
         self.output_mode_combo.currentTextChanged.connect(
             self._update_output_filename_placeholder
+        )
+        self.output_mode_combo.currentTextChanged.connect(
+            self._on_output_mode_changed
         )
         form.addRow("Save as:", self.output_mode_combo)
 
@@ -1179,9 +1266,11 @@ class ConversionPanel(QWidget):
         except ValueError:
             scans = []
         if not scans:
-            # No selection yet — only the shared-file mode has a
+            # No selection yet — only the shared-file modes have a
             # selection-independent target.
-            if cfg.output_mode != OUTPUT_SEPARATE_DATASETS:
+            if cfg.output_mode not in (
+                OUTPUT_SEPARATE_DATASETS, OUTPUT_SINGLE_ENTRY
+            ):
                 return None
             scans = [RawScan(file_path=Path("_"), entry="_")]
         try:
@@ -1231,7 +1320,7 @@ class ConversionPanel(QWidget):
 
     def _update_output_filename_placeholder(self, mode: str) -> None:
         """Adjust the filename placeholder so the user knows what blank means."""
-        if mode == OUTPUT_SEPARATE_DATASETS:
+        if mode in (OUTPUT_SEPARATE_DATASETS, OUTPUT_SINGLE_ENTRY):
             self.output_filename.setPlaceholderText(
                 "Optional. Default: converted.h5"
             )
@@ -1239,6 +1328,15 @@ class ConversionPanel(QWidget):
             self.output_filename.setPlaceholderText(
                 "Optional. Default: {raw_stem}_converted.h5  (or prefix for batches)"
             )
+
+    def _on_output_mode_changed(self, mode: str) -> None:
+        """Single-entry mode and append-to-existing are mutually
+        exclusive (one creates a fresh entry, the other requires an
+        existing one) — lock the append controls out while it's active."""
+        single = mode == OUTPUT_SINGLE_ENTRY
+        if single and self.append_frames_chk.isChecked():
+            self.append_frames_chk.setChecked(False)
+        self.append_frames_chk.setEnabled(not single)
 
     # ---------------- Run wiring ----------------
 

@@ -86,9 +86,10 @@ def test_track_run_end_to_end(main_window, synthetic_fitted_scan, qtbot):
     assert panel.btn_track.isEnabled()
 
     main_window._on_track_scan_requested(0.5, 3)
-    # A loading dialog appears immediately (and its timer is running).
+    # A loading dialog appears immediately, as a busy marquee (the run
+    # is one opaque call — an honest indeterminate bar, range 0..0).
     assert main_window._track_progress_dialog is not None
-    assert main_window._track_progress_timer is not None
+    assert main_window._track_progress_dialog.maximum() == 0
     qtbot.waitUntil(
         lambda: main_window._pipe_thread is None
         and not main_window._pipeline_queue
@@ -97,7 +98,6 @@ def test_track_run_end_to_end(main_window, synthetic_fitted_scan, qtbot):
     )
     # ...and it is torn down when the run finishes.
     assert main_window._track_progress_dialog is None
-    assert main_window._track_progress_timer is None
     payload = main_window._scan_payload
     assert payload.n_tracks == 1
     assert payload.track_span(0) == (0, 5, 6, 6)
@@ -426,7 +426,8 @@ def test_interpolate_button_plans_and_enqueues(
     assert chain is not None
     assert chain["total"] == 1 and chain["base"] == 0
     assert main_window._track_progress_dialog is not None
-    assert main_window._track_progress_timer is None   # no fake timer
+    # Manual mode keeps the determinate 0..100 bar (no busy marquee).
+    assert main_window._track_progress_dialog.maximum() == 100
     # Real per-frame progress drives the dialog: the fill command's
     # only frame done -> the whole chain -> 100%.
     main_window._pipe_command = enqueued[0]
@@ -896,23 +897,166 @@ def test_pipeline_and_view_workers_mutually_gated(
 
 
 def test_tracking_progress_dialog_lifecycle(main_window, synthetic_fitted_scan):
-    """The loading dialog shows on demand (immediately, with a running
-    timer) and tears down cleanly — backend-free unit of the helpers."""
+    """The loading dialog shows on demand (immediately, as a busy
+    marquee) and tears down cleanly — backend-free unit of the
+    helpers. Manual mode keeps the determinate bar for real ticks."""
     _open(main_window, synthetic_fitted_scan)
     main_window._show_tracking_progress()
     dlg = main_window._track_progress_dialog
-    assert dlg is not None and dlg.maximum() == 100
-    assert main_window._track_progress_timer.isActive()
+    assert dlg is not None
+    # Busy marquee (range 0..0): honest motion for one opaque call —
+    # regression against the fake timer that stalled at 95%.
+    assert dlg.minimum() == 0 and dlg.maximum() == 0
     # A finished track_peaks command closes it (both success and error).
     main_window._pipe_command = PipelineCommand("track_peaks", {"entry": ENTRY})
     main_window._on_pipeline_finished(None, None)
     assert main_window._track_progress_dialog is None
-    assert main_window._track_progress_timer is None
-    # Re-showing replaces cleanly (no leak of the previous dialog).
-    main_window._show_tracking_progress()
-    assert main_window._track_progress_dialog is not None
+    # Re-showing replaces cleanly (no leak of the previous dialog),
+    # and manual mode is determinate.
+    main_window._show_tracking_progress("Interpolate…", manual=True)
+    assert main_window._track_progress_dialog.maximum() == 100
     main_window._close_tracking_progress()
     assert main_window._track_progress_dialog is None
+
+
+def test_estimate_tracking_memory_counts_fitted_rows(synthetic_fitted_scan):
+    """The pre-flight estimate counts every fitted row of the entry
+    (h5py shape metadata only) and prices the run at 64*N^2 bytes —
+    the measured floor of upstream's dense IoU step (eight (N, N)
+    float64 arrays live at once). Unknown entries price at (0, 0),
+    which callers read as "cannot estimate, do not block"."""
+    import h5py
+
+    from mlgidlab import phase_tracking
+
+    with h5py.File(synthetic_fitted_scan, "r") as f:
+        ana = f[f"{ENTRY}/data/analysis"]
+        expected = sum(
+            ana[g]["fitted_peaks"].shape[0]
+            for g in ana
+            if "fitted_peaks" in ana[g]
+        )
+    n, needed = phase_tracking.estimate_tracking_memory(
+        synthetic_fitted_scan, ENTRY
+    )
+    assert n == expected and n > 0
+    assert needed == phase_tracking.TRACKING_BYTES_PER_PEAK_PAIR * n * n
+    assert phase_tracking.estimate_tracking_memory(
+        synthetic_fitted_scan, "not_an_entry"
+    ) == (0, 0)
+
+
+def test_track_scan_runs_blocked_when_memory_insufficient(
+    main_window, synthetic_fitted_scan, qtbot, monkeypatch,
+):
+    """OOM-kill regression, end to end: a scan whose estimated dense
+    tracking memory exceeds what the machine has (the kernel killed
+    the whole app at 27 GB RSS on a 602-frame / 43645-peak scan) now
+    runs through ``track_peaks_blocked`` instead — same payload, same
+    panel result, no upstream dense IoU."""
+    pytest.importorskip("mlgidbase")
+    from mlgidlab import phase_tracking
+
+    calls: list = []
+    real = phase_tracking.track_peaks_blocked
+
+    def _spy(*args, **kwargs):
+        calls.append(args)
+        return real(*args, **kwargs)
+
+    # Pretend ~1 kB is available: any real scan exceeds it.
+    monkeypatch.setattr(
+        phase_tracking, "available_memory_bytes", lambda: 1000
+    )
+    monkeypatch.setattr(phase_tracking, "track_peaks_blocked", _spy)
+    _open(main_window, synthetic_fitted_scan)
+    main_window._on_track_scan_requested(0.5, 3)
+    assert main_window._track_progress_dialog is not None
+    qtbot.waitUntil(
+        lambda: main_window._pipe_thread is None
+        and not main_window._pipeline_queue
+        and main_window._scan_payload is not None,
+        timeout=60000,
+    )
+    assert len(calls) == 1
+    payload = main_window._scan_payload
+    assert payload.n_tracks == 1
+    assert payload.track_span(0) == (0, 5, 6, 6)
+    assert main_window.scan_tracking_panel._model.rowCount() == 1
+
+
+def test_save_figures_refused_on_big_scan(
+    main_window, synthetic_fitted_scan, monkeypatch,
+):
+    """The official figure export reruns UPSTREAM tracking (dense
+    IoU, no blocked equivalent renders its matplotlib output), so on
+    scans where that would OOM it must refuse and point at the
+    phase-views image export instead."""
+    from mlgidlab import phase_tracking
+
+    _open(main_window, synthetic_fitted_scan)
+    _install_fake(main_window)
+    seen: list = []
+    monkeypatch.setattr(
+        QMessageBox, "warning",
+        staticmethod(lambda *a, **k: seen.append(a)),
+    )
+    monkeypatch.setattr(
+        phase_tracking, "available_memory_bytes", lambda: 1000
+    )
+    main_window._on_save_official_figures("/tmp/x.png", "radius")
+    assert len(seen) == 1
+    assert "phase-views" in seen[0][2]
+
+
+def test_delete_key_removes_track(
+    main_window, synthetic_fitted_scan, qtbot,
+):
+    """Delete on a selected table row removes the track from the
+    RESULTS only: table row gone, payload shrunk, track-indexed ring
+    and phase maps remapped to the shifted indices, fitted rows in
+    the file untouched."""
+    _open(main_window, synthetic_fitted_scan)
+    payload = _fake_payload()
+    # Two 3-member tracks so something is left after the delete.
+    payload.components = [[0, 1, 2], [3, 4, 5]]
+    _install_fake(main_window, payload)
+    main_window._scan_ring_tracks = {1}
+    main_window._scan_track_phases = {1: ["PbI2"]}
+    panel = main_window.scan_tracking_panel
+    assert panel._model.rowCount() == 2
+    panel._table.setFocus()
+    panel._table.selectRow(0)
+    qtbot.keyClick(panel._table, Qt.Key.Key_Delete)
+    assert panel._model.rowCount() == 1
+    assert main_window._scan_payload.n_tracks == 1
+    assert main_window._scan_payload.components == [[3, 4, 5]]
+    # Index-keyed derived state shifted down with the removal.
+    assert main_window._scan_ring_tracks == {0}
+    assert main_window._scan_track_phases == {0: ["PbI2"]}
+    # Display-only: the file still carries its fitted rows.
+    tab = file_model.load_peaks(
+        main_window.session.temp_path, ENTRY, 0
+    )["fitted"]
+    assert len(tab) > 0
+    assert "removed" in main_window.statusBar().currentMessage()
+
+
+def test_structure_column_shows_matched_phases(
+    main_window, synthetic_fitted_scan,
+):
+    """The structure column lists each track's matched CIFs (dominant
+    first, comma-joined); tracks without a matched member show a
+    dash placeholder."""
+    _open(main_window, synthetic_fitted_scan)
+    payload = _fake_payload()
+    payload.components = [[0, 1, 2], [3, 4, 5]]
+    ids = [(int(f), 0) for f in payload.frame_num]
+    panel = main_window.scan_tracking_panel
+    panel.set_payload(payload, ids, {0: ["PbI2", "Other"]})
+    col = panel._model.columnCount() - 1
+    assert panel._model.item(0, col).text() == "PbI2, Other"
+    assert panel._model.item(1, col).text() == "—"
 
 
 def test_track_button_gated_without_backend(
@@ -1060,8 +1204,11 @@ def test_qmap_colors_by_matched_phase(main_window, synthetic_fitted_scan):
 
     w.qmap_phase.setChecked(True)
     assert w._qmap_legend.isVisible()
-    # One legend entry (PbI2); no "unmatched" since the only track matched.
-    assert len(w._qmap_legend.items) == 1
+    # Per-frame attribution: matching claimed only the frame-2 member,
+    # so the legend carries PbI2 AND "unmatched" (the other frames'
+    # members render grey — previously the whole track was painted
+    # with the dominant phase and the legend had one entry).
+    assert len(w._qmap_legend.items) == 2
 
 
 def test_qmap_phase_toggle_disabled_without_matching(
@@ -1076,6 +1223,525 @@ def test_qmap_phase_toggle_disabled_without_matching(
     w = main_window._phase_views_window
     assert not w.qmap_phase.isEnabled()
     assert not w._qmap_legend.isVisible()
+
+
+def test_phase_color_overrides_recolor_views(phase_window):
+    """A pushed per-CIF colour replaces the automatic hue everywhere the
+    phase colour shows (q-map track colour, structure toggles); other
+    CIFs keep their automatic colour, and an empty push restores it."""
+    w = phase_window
+    auto_a = w._phase_colors["A"].name()
+    auto_b = w._phase_colors["B"].name()
+
+    w.set_phase_color_overrides({"A": "#123456"})
+    assert w._phase_colors["A"].name() == "#123456"
+    assert w._phase_colors["B"].name() == auto_b
+    assert w._qmap_track_color(0, 3, phase_mode=True).name() == "#123456"
+    assert "#123456" in w._struct_checks["A"].styleSheet()
+
+    w.set_phase_color_overrides({})
+    assert w._phase_colors["A"].name() == auto_a
+
+
+def test_matched_color_pick_reaches_phase_views(
+    main_window, synthetic_fitted_scan, clean_matched_colors,
+):
+    """A colour picked in the matched-peaks legend lands in the phase
+    views: at window open (persisted override) and live while the
+    window is showing."""
+    _write_matched(synthetic_fitted_scan, 2, [("PbI2", [0])])
+    _open(main_window, synthetic_fitted_scan)
+    _run_result(main_window, synthetic_fitted_scan)
+
+    # Picked before the window exists -> honoured on open.
+    main_window._on_matched_color_picked(("PbI2", 0, 0, 1), "#123456")
+    main_window._on_show_phase_views()
+    w = main_window._phase_views_window
+    assert w._phase_colors["PbI2"].name() == "#123456"
+
+    # Picked while the window is open -> re-rendered live.
+    main_window._on_matched_color_picked(("PbI2", 0, 0, 1), "#654321")
+    assert w._phase_colors["PbI2"].name() == "#654321"
+    assert w._qmap_track_color(0, 1, phase_mode=True).name() == "#654321"
+
+
+def test_display_palette_colors_reach_phase_views(
+    main_window, synthetic_fitted_scan, clean_matched_colors,
+):
+    """WITHOUT any hand-picked colour, the phase views use the Display
+    legend's ACTUAL automatic palette colour for a matched structure
+    (not the views' own hue wheel) — in the colour map, the q-map
+    track pen and the structure toggle — at window open and re-pushed
+    on a fresh tracking install while the window is showing."""
+    import pyqtgraph as pg
+
+    from mlgidlab.image_viewer import matched_pen_for
+
+    _write_matched(synthetic_fitted_scan, 2, [("PbI2", [0])])
+    _open(main_window, synthetic_fitted_scan)
+    _run_result(main_window, synthetic_fitted_scan)
+
+    viewer = main_window.viewer
+    assert viewer.cif_color_overrides() == {}     # nothing picked
+    display = viewer.cif_effective_colors()["PbI2"]
+    assert display == matched_pen_for(
+        viewer._color_index_for_key(("PbI2", 1, 1, 0))
+    )["color"]
+    expected = pg.mkColor(display).name()
+
+    main_window._on_show_phase_views()
+    w = main_window._phase_views_window
+    assert w._phase_colors["PbI2"].name() == expected
+    assert w._qmap_track_color(0, 1, phase_mode=True).name() == expected
+    assert expected in w._struct_checks["PbI2"].styleSheet()
+
+    # A fresh tracking install while the window is open re-pushes the
+    # (re-seeded) palette before the phase mapping.
+    w.set_phase_color_overrides({})               # wipe to prove the push
+    _run_result(main_window, synthetic_fitted_scan)
+    assert w._phase_colors["PbI2"].name() == expected
+
+
+def test_frame_interval_filters_trajectories_and_amplitude(phase_window):
+    """The window-wide "Frames: from..to" interval narrows the
+    member-based plots to those frames; the q-map stays
+    frame-complete. Bounds follow the payload and default to the full
+    range."""
+    w = phase_window
+    assert (w.frame_lo.value(), w.frame_hi.value()) == (0, 1)
+    assert w.frame_lo.isEnabled() and w.frame_hi.isEnabled()
+    traj = w.traj_plot.getPlotItem().listDataItems()
+    assert [list(c.xData) for c in traj] == [[0.0, 1.0]] * 3
+
+    w.frame_lo.setValue(1)
+    traj = w.traj_plot.getPlotItem().listDataItems()
+    assert [list(c.xData) for c in traj] == [[1.0]] * 3
+    amp = w.amp_plot.getPlotItem().listDataItems()
+    assert amp and all(list(c.xData) == [1.0] for c in amp)
+    # q-map member curves keep both frames (2 points).
+    qmap_curves = [
+        it for it in w.qmap_plot.getPlotItem().listDataItems()
+        if it.xData is not None and len(it.xData) == 2
+    ]
+    assert len(qmap_curves) == 3
+    # A crossed pair still reads as a valid interval.
+    assert w._frame_interval() == (1, 1)
+
+
+def test_frame_interval_resets_on_new_payload(phase_window):
+    w = phase_window
+    w.frame_lo.setValue(1)
+    fn = np.array([0, 1, 2, 3])
+    q = np.zeros(4)
+    payload = TrackingPayload(
+        entry="e", threshold=0.5, length=1, q_xy=q, q_z=q.copy(),
+        frame_num=fn, amplitude=np.array([1.0, 2.0, 3.0, 4.0]),
+        components=[[0, 1, 2, 3]],
+    )
+    w.set_payload(payload)
+    assert (w.frame_lo.value(), w.frame_hi.value()) == (0, 3)
+    assert (w.frame_lo.minimum(), w.frame_hi.maximum()) == (0, 3)
+
+
+def _late_track_window(qtbot, tmp_path):
+    """6-frame scan (context set), track 0 on frames 2..3 and track 1 on
+    frames 0 and 3 (a gap at 1..2) — the zero-padding test bed."""
+    from mlgidlab.phase_views_window import PhaseViewsWindow
+
+    w = PhaseViewsWindow()
+    qtbot.addWidget(w)
+    w.set_context(str(tmp_path / "x.h5"), "e", 6)
+    fn = np.array([2, 3, 0, 3])
+    q = np.zeros(4)
+    payload = TrackingPayload(
+        entry="e", threshold=0.5, length=1, q_xy=q, q_z=q.copy(),
+        frame_num=fn, amplitude=np.array([7.0, 9.0, 4.0, 2.0]),
+        components=[[0, 1], [2, 3]],
+    )
+    w.set_payload(payload)
+    w.amp_window.setValue(1)
+    w.amp_normalize.setChecked(False)
+    return w
+
+
+def test_amp_zero_pads_median_result_only(qtbot, tmp_path):
+    """"Zeros at start/end" is a MEDIAN-curve feature: individual track
+    curves never get zeros (and the box is disabled outside median
+    mode), the per-frame statistics run over present tracks only (an
+    absent track cannot drag the median down), and the finished median
+    series is padded with lead-in + tail zeros over the visible range.
+    With scan context set the interval bounds cover the whole scan."""
+    w = _late_track_window(qtbot, tmp_path)
+    assert (w.frame_lo.value(), w.frame_hi.value()) == (0, 5)
+    # Outside median mode the toggle is disabled and checking it must
+    # not touch the per-track curves.
+    assert not w.amp_zero.isEnabled()
+    w.amp_zero.setChecked(True)
+    curves = w.amp_plot.getPlotItem().listDataItems()
+    assert sorted(tuple(c.xData) for c in curves) == [
+        (0.0, 3.0), (2.0, 3.0),
+    ]
+
+    w.set_track_phases({0: ["A"], 1: ["A"]})
+    w.amp_median.setChecked(True)
+    assert w.amp_zero.isEnabled()
+    xs, med, q25, q75 = w._amp_median_series(
+        [w._member_series(w._interval_members(0)),
+         w._member_series(w._interval_members(1))], 1, False
+    )
+    # Present-only statistics: frame 0 is track 1's value alone (4.0),
+    # NOT median(0, 4); frame 1 stays a hole (gap in track 1, track 0
+    # absent); tail frames 4..5 pad to zero, IQR bounds included.
+    assert list(xs) == [0.0, 2.0, 3.0, 4.0, 5.0]
+    assert list(med) == [4.0, 7.0, 5.5, 0.0, 0.0]
+    assert q25[-1] == 0.0 and q75[-1] == 0.0
+
+    # Narrowing the interval clips the padding; unticking removes it.
+    w.frame_hi.setValue(3)
+    xs, _med, _q25, _q75 = w._amp_median_series(
+        [w._member_series(w._interval_members(0)),
+         w._member_series(w._interval_members(1))], 1, False
+    )
+    assert list(xs) == [0.0, 2.0, 3.0]
+    w.frame_hi.setValue(5)
+    w.amp_zero.setChecked(False)
+    xs, _med, _q25, _q75 = w._amp_median_series(
+        [w._member_series(w._interval_members(0)),
+         w._member_series(w._interval_members(1))], 1, False
+    )
+    assert list(xs) == [0.0, 2.0, 3.0]
+
+
+def test_amp_track_exclusion_filters_structure(phase_window):
+    """Tracks unticked in the Select-tracks dialog drop out of their
+    structure's grouped band and median; the selection resets when the
+    payload SHAPE changes but survives a plain re-push."""
+    w = phase_window
+    w.set_track_phases({0: ["A"], 1: ["A"], 2: ["A"]})
+    w._amp_excluded = {"A": {2}}
+    assert [list(m) for m in w._amp_groups()["A"]] == [[0, 1], [2, 3]]
+
+    w.amp_group.setChecked(True)
+    curves, _lines = _split_curves_extreme_lines(
+        w.amp_plot.getPlotItem().listDataItems()
+    )
+    assert len(curves) == 2          # excluded track dropped
+    w._amp_excluded = {}
+    w._refresh_amplitude()
+    curves, _lines = _split_curves_extreme_lines(
+        w.amp_plot.getPlotItem().listDataItems()
+    )
+    assert len(curves) == 3
+
+    # Same payload object re-pushed -> selection kept; a new payload
+    # object -> reset.
+    w._amp_excluded = {"A": {2}}
+    w.set_payload(w._payload)
+    assert w._amp_excluded == {"A": {2}}
+    fn = np.array([0, 1])
+    q = np.zeros(2)
+    w.set_payload(TrackingPayload(
+        entry="e", threshold=0.5, length=1, q_xy=q, q_z=q.copy(),
+        frame_num=fn, amplitude=np.array([1.0, 2.0]),
+        components=[[0, 1]],
+    ))
+    assert w._amp_excluded == {}
+
+
+def test_amp_track_select_dialog(phase_window):
+    """The Select-tracks dialog: one sortable table per structure with
+    a mean-amplitude column; unchecking applies live (checks keyed to
+    the track via UserRole, so sorting cannot desync them); All/None
+    batch-toggle; the button label shows the off-count."""
+    w = phase_window
+    w.set_track_phases({0: ["A"], 1: ["A"], 2: ["A"]})
+    assert w.btn_amp_tracks.isEnabled()
+    w.amp_group.setChecked(True)
+    w._on_select_amp_tracks()
+    dlg = w._amp_track_dialog
+    assert dlg is not None and not dlg.isModal()
+    assert dlg._tabs.count() == 1 and dlg._tabs.tabText(0) == "A (3)"
+    table = dlg._tables["A"]
+    assert table.rowCount() == 3
+    amp_col = [
+        table.item(r, 6).data(Qt.ItemDataRole.EditRole) for r in range(3)
+    ]
+    assert amp_col == [9.0, 5.5, 3.5]
+
+    # Sort ascending by mean amplitude, then untick the faintest row:
+    # the RIGHT track (index 2) is excluded despite the reorder.
+    table.sortItems(6, Qt.SortOrder.AscendingOrder)
+    assert table.item(0, 0).data(Qt.ItemDataRole.UserRole) == 2
+    table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
+    assert w._amp_excluded == {"A": {2}}
+    assert "(1 off)" in w.btn_amp_tracks.text()
+    curves, _lines = _split_curves_extreme_lines(
+        w.amp_plot.getPlotItem().listDataItems()
+    )
+    assert len(curves) == 2
+
+    dlg._set_all("A", False)
+    assert w._amp_excluded == {"A": {0, 1, 2}}
+    assert w._amp_groups().get("A", []) == []
+    dlg._set_all("A", True)
+    assert w._amp_excluded == {"A": set()}
+    assert w.btn_amp_tracks.text() == "Select tracks…"
+    # Context-less host (this fixture): the dialog builds WITHOUT the
+    # preview panel and all preview paths are inert.
+    assert dlg._preview is None
+
+
+def _preview_scan_file(tmp_path):
+    """A minimal file matching the preview's read path: entry group
+    "e/data" with a signal attr, a (4, 8, 12) stack and q axes."""
+    import h5py
+
+    path = tmp_path / "scan.h5"
+    rng = np.random.default_rng(0)
+    with h5py.File(path, "w") as f:
+        data = f.create_group("e/data")
+        data.attrs["signal"] = "img_gid_q"
+        data.create_dataset(
+            "img_gid_q", data=rng.random((4, 8, 12)).astype(np.float32)
+        )
+        data.create_dataset("q_xy", data=np.linspace(-1.0, 2.0, 12))
+        data.create_dataset("q_z", data=np.linspace(0.0, 3.0, 8))
+    return path
+
+
+def test_track_select_preview_highlights_selected_track(qtbot, tmp_path):
+    """The Select-tracks preview: frame image from the file, slider
+    spanning the scan, selected row ringed on its frames and jumped-to."""
+    from mlgidlab.phase_views_window import PhaseViewsWindow
+
+    w = PhaseViewsWindow()
+    qtbot.addWidget(w)
+    w.set_context(str(_preview_scan_file(tmp_path)), "e", 4)
+    payload = TrackingPayload(
+        entry="e", threshold=0.5, length=1,
+        q_xy=np.array([0.5, 0.6, 1.0, 1.1]),
+        q_z=np.array([1.0, 1.1, 2.0, 2.1]),
+        frame_num=np.array([0, 1, 2, 3]),
+        amplitude=np.array([5.0, 6.0, 7.0, 8.0]),
+        components=[[0, 1], [2, 3]],  # track 0: frames 0-1, track 1: 2-3
+    )
+    w.set_payload(payload)
+    w.set_track_phases({0: ["A"], 1: ["A"]})
+    w._on_select_amp_tracks()
+    dlg = w._amp_track_dialog
+    assert dlg._preview is not None
+    assert dlg.preview_slider.maximum() == 3
+    # Opening auto-selects the first row (track 0, default Track sort):
+    # slider on its first frame, marker on its frame-0 member.
+    assert dlg._selected_track == 0
+    assert dlg.preview_slider.value() == 0
+    dlg._do_load_preview_frame()  # bypass the debounce timer
+    assert dlg._preview_image.isVisible()
+    assert not dlg._preview_missing.isVisible()
+    x, y = dlg._preview_marker.getData()
+    assert list(x) == [0.5] and list(y) == [1.0]
+    # Selecting the other track jumps the slider to ITS first frame and
+    # moves the ring; the faint trajectory holds the whole track.
+    table = dlg._tables["A"]
+    row1 = next(
+        r for r in range(table.rowCount())
+        if int(table.item(r, 0).data(Qt.ItemDataRole.UserRole)) == 1
+    )
+    table.selectRow(row1)
+    assert dlg._selected_track == 1
+    assert dlg.preview_slider.value() == 2
+    x, y = dlg._preview_marker.getData()
+    assert list(x) == [1.0] and list(y) == [2.0]
+    tx, ty = dlg._preview_traj.getData()
+    assert list(tx) == [1.0, 1.1]
+    # A frame without members of the selected track: ring gone,
+    # trajectory kept, image still loads.
+    dlg.preview_slider.setValue(0)
+    x, y = dlg._preview_marker.getData()
+    assert x is None or len(x) == 0
+    tx, ty = dlg._preview_traj.getData()
+    assert list(tx) == [1.0, 1.1]
+    dlg._do_load_preview_frame()
+    assert dlg._preview_image.isVisible()
+
+
+def test_track_select_preview_jumps_to_subset_first_frame(qtbot, tmp_path):
+    """Regression: the row-click jump must target the first frame of
+    the row's STRUCTURE SUBSET (the "First" column), not of the whole
+    track. A track fitted on frames 0..3 but claimed by matching only
+    on 2..3 jumped to frame 0, where the tab's ring cannot appear."""
+    from mlgidlab.phase_views_window import PhaseViewsWindow
+
+    w = PhaseViewsWindow()
+    qtbot.addWidget(w)
+    w.set_context(str(_preview_scan_file(tmp_path)), "e", 4)
+    payload = TrackingPayload(
+        entry="e", threshold=0.5, length=1,
+        q_xy=np.array([0.5, 0.6, 0.7, 0.8]),
+        q_z=np.array([1.0, 1.1, 1.2, 1.3]),
+        frame_num=np.array([0, 1, 2, 3]),
+        amplitude=np.array([5.0, 6.0, 7.0, 8.0]),
+        components=[[0, 1, 2, 3]],
+    )
+    w.set_payload(payload)
+    w.set_track_phases({0: ["A"]})
+    w.set_member_phases({2: ["A"], 3: ["A"]})  # claimed from frame 2 only
+    w._on_select_amp_tracks()
+    dlg = w._amp_track_dialog
+    # Tab "A" holds the claimed subset (First column = 2): the auto-
+    # selected row must land the slider on 2 with the frame-2 member
+    # ringed; the trajectory holds only the subset's two members.
+    table = dlg._tables["A"]
+    assert int(table.item(0, 3).data(Qt.ItemDataRole.EditRole)) == 2
+    assert dlg.preview_slider.value() == 2
+    x, y = dlg._preview_marker.getData()
+    assert list(x) == [0.7] and list(y) == [1.2]
+    tx, _ty = dlg._preview_traj.getData()
+    assert list(tx) == [0.7, 0.8]
+    # The unmatched tab's subset starts at frame 0: switching to it and
+    # selecting its row jumps there.
+    from mlgidlab.phase_views_window import _UNMATCHED
+
+    idx = dlg._tab_keys.index(_UNMATCHED)
+    dlg._tabs.setCurrentIndex(idx)
+    dlg._tables[_UNMATCHED].selectRow(0)
+    assert dlg.preview_slider.value() == 0
+    x, y = dlg._preview_marker.getData()
+    assert list(x) == [0.5] and list(y) == [1.0]
+
+
+def test_track_select_preview_survives_missing_file(qtbot, tmp_path):
+    """Context set but the file does not exist (and could vanish in real
+    use): the preview degrades to a placeholder, never raises, and row
+    selection still drives the slider."""
+    w = _late_track_window(qtbot, tmp_path)  # x.h5 is never written
+    w.set_track_phases({0: ["A"], 1: ["A"]})
+    w._on_select_amp_tracks()
+    dlg = w._amp_track_dialog
+    assert dlg._preview is not None
+    # Auto-selection picked track 0 (frames 2..3) and jumped the slider.
+    assert dlg._selected_track == 0
+    assert dlg.preview_slider.value() == 2
+    dlg._do_load_preview_frame()  # must not raise
+    assert not dlg._preview_image.isVisible()
+    assert dlg._preview_missing.isVisible()
+    assert "no image" in dlg._preview_missing.toPlainText()
+    table = dlg._tables["A"]
+    row1 = next(
+        r for r in range(table.rowCount())
+        if int(table.item(r, 0).data(Qt.ItemDataRole.UserRole)) == 1
+    )
+    table.selectRow(row1)
+    assert dlg.preview_slider.value() == 0  # track 1 starts at frame 0
+
+
+def test_amp_export_mirrors_zero_and_top(qtbot, tmp_path):
+    """The amplitude CSV exports the numbers AS DISPLAYED: per-track
+    rows stay unpadded even with the toggle checked (median-only
+    feature, effective state recorded), and the median CSV carries the
+    padded zero rows."""
+    w = _late_track_window(qtbot, tmp_path)
+    w.amp_zero.setChecked(True)
+    # Per-track mode: toggle ineffective (disabled) -> no zero rows,
+    # but EVERY frame of the exported range gets a row (frames without
+    # a fitted value carry an explicit nan, never a skipped row).
+    w._export_data_files(["amplitude"], str(tmp_path / "raw"))
+    lines = (tmp_path / "raw_amplitude.csv").read_text().splitlines()
+    assert "metric=amplitude" in lines[0]
+    assert "zeros=off" in lines[0] and "tracks=all" in lines[0]
+    rows = [line.split(",") for line in lines[2:]]
+    track0 = dict(
+        (int(r[2]), float(r[3])) for r in rows if r[0] == "0"
+    )
+    assert sorted(track0) == [0, 1, 2, 3, 4, 5]
+    assert (track0[2], track0[3]) == (7.0, 9.0)
+    assert all(np.isnan(track0[f]) for f in (0, 1, 4, 5))
+
+    # Median mode: the padded structure median lands in the CSV, and a
+    # track unticked in the Select-tracks dialog drops out of it.
+    w.set_track_phases({0: ["A"], 1: ["A"]})
+    w.amp_median.setChecked(True)
+    w._amp_excluded = {"A": {1}}
+    w._export_data_files(["amplitude"], str(tmp_path / "med"))
+    lines = (tmp_path / "med_amplitude.csv").read_text().splitlines()
+    assert "zeros=lead+tail" in lines[0] and "tracks=custom" in lines[0]
+    rows = [line.split(",") for line in lines[2:]]
+    a_rows = [(int(r[1]), float(r[2])) for r in rows if r[0] == "A"]
+    # Track 1 (frames 0 and 3) excluded: only track 0's 2..3 values
+    # remain, zero-padded lead (0..1) and tail (4..5).
+    assert a_rows == [
+        (0, 0.0), (1, 0.0), (2, 7.0), (3, 9.0), (4, 0.0), (5, 0.0),
+    ]
+
+
+def test_member_phases_split_track_at_matching_start(qtbot):
+    """Per-frame phase attribution: a track fitted on frames 0..3 but
+    matched only on 2..3 renders 2..3 in the phase colour and 0..1 as
+    unmatched — in the trajectories (matched colouring), the grouped
+    amplitude bands and the q-map legend — instead of painting the
+    whole span with the dominant phase."""
+    from mlgidlab.phase_views_window import PhaseViewsWindow, _UNMATCHED
+
+    w = PhaseViewsWindow()
+    qtbot.addWidget(w)
+    fn = np.array([0, 1, 2, 3])
+    q = np.zeros(4)
+    payload = TrackingPayload(
+        entry="e", threshold=0.5, length=1, q_xy=q, q_z=q.copy(),
+        frame_num=fn, amplitude=np.array([1.0, 2.0, 3.0, 4.0]),
+        components=[[0, 1, 2, 3]],
+    )
+    w.set_payload(payload)
+    w.set_track_phases({0: ["A"]})
+    w.set_member_phases({2: ["A"], 3: ["A"]})   # claimed on 2..3 only
+
+    assert w._member_structure_key(0, 0) == _UNMATCHED
+    assert w._member_structure_key(2, 0) == "A"
+    assert {
+        k: list(v) for k, v in w._member_subsets(0).items()
+    } == {_UNMATCHED: [0, 1], "A": [2, 3]}
+    # The toggles gain an "unmatched" entry although every TRACK has
+    # a phase.
+    assert set(w._struct_checks) == {"A", _UNMATCHED}
+
+    # Trajectories, matched colouring: the track splits into two curves
+    # at the matching start.
+    w.traj_color.setCurrentIndex(1)
+    curves = w.traj_plot.getPlotItem().listDataItems()
+    assert sorted(tuple(c.xData) for c in curves) == [
+        (0.0, 1.0), (2.0, 3.0),
+    ]
+    # q-map phase mode: legend lists the phase AND unmatched.
+    w.qmap_phase.setChecked(True)
+    assert len(w._qmap_legend.items) == 2
+    # Grouped amplitude: the claimed members build the A band, the
+    # unclaimed ones the unmatched band above it.
+    w.amp_group.setChecked(True)
+    assert [l.toPlainText() for l in w._amp_labels] == ["A", "unmatched"]
+    bands = w.amp_plot.getPlotItem().listDataItems()
+    xdatas = sorted(tuple(c.xData) for c in bands if len(c.xData) == 2)
+    assert (2.0, 3.0) in xdatas and (0.0, 1.0) in xdatas
+    # Unticking "unmatched" hides exactly the unclaimed portion.
+    w._struct_checks[_UNMATCHED].setChecked(False)
+    curves = w.traj_plot.getPlotItem().listDataItems()
+    assert [tuple(c.xData) for c in curves] == [(2.0, 3.0)]
+
+
+def test_member_phases_pushed_from_matching(
+    main_window, synthetic_fitted_scan,
+):
+    """End to end: after tracking a scan whose matched data covers only
+    frame 2, the member-phase map holds exactly that member and reaches
+    the phase views."""
+    _write_matched(synthetic_fitted_scan, 2, [("PbI2", [0])])
+    _open(main_window, synthetic_fitted_scan)
+    _run_result(main_window, synthetic_fitted_scan)
+    mp = main_window._scan_member_phases
+    assert list(mp.values()) == [["PbI2"]]
+    (idx,) = mp.keys()
+    assert main_window._scan_member_ids[idx][0] == 2   # the claimed frame
+    main_window._on_show_phase_views()
+    assert main_window._phase_views_window._member_phases == mp
 
 
 # --- amplitude grouping by structure + per-structure toggles ---
@@ -1120,6 +1786,12 @@ def test_amp_grouped_stacks_structures(phase_window):
         1.0, 2.3, 3.6,
     ]
     assert [l.toPlainText() for l in w._amp_labels] == ["A", "B", "unmatched"]
+    # Labels sit in the inter-band gap ABOVE their band (bottom-left
+    # anchored), not on the curves: y just above baseline + 1.0.
+    assert [round(float(l.pos().y()), 2) for l in w._amp_labels] == [
+        1.02, 2.32, 3.62,
+    ]
+    assert all(tuple(l.anchor) == (0.0, 1.0) for l in w._amp_labels)
     # Grouped mode always normalizes -> the manual toggle is disabled.
     assert not w.amp_normalize.isEnabled()
 
@@ -1301,6 +1973,156 @@ def test_amp_group_disabled_without_phases(qtbot):
     assert not w.amp_group.isEnabled()
     assert not w.amp_median.isEnabled()
     assert w._struct_toggle_widget.isHidden()
+
+
+# --- ROI-intensity metric (integrated intensity, image-based) ---
+
+def _roi_scan_window(qtbot, tmp_path):
+    """A views window over a real 4-frame file: constant pedestal 1.0
+    with a bright block at q = (0.4..0.6, 0.4..0.6) whose excess grows
+    10-per-frame, and ONE track on the block with fitted members only
+    on frames 0 and 3 (a fit gap at 1..2)."""
+    import h5py
+
+    from mlgidlab.phase_views_window import PhaseViewsWindow
+    from mlgidlab.roi_intensity import axis_slice
+
+    n_f, n_z, n_xy = 4, 40, 50
+    q_xy_axis = np.linspace(0.0, 1.0, n_xy)
+    q_z_axis = np.linspace(0.0, 1.0, n_z)
+    z0, z1 = axis_slice(q_z_axis, 0.4, 0.6)
+    x0, x1 = axis_slice(q_xy_axis, 0.4, 0.6)
+    stack = np.ones((n_f, n_z, n_xy), dtype=np.float32)
+    for i in range(n_f):
+        stack[i, z0:z1, x0:x1] += 10.0 * (i + 1)
+    path = tmp_path / "roi_scan.h5"
+    with h5py.File(path, "w") as f:
+        data = f.create_group("e/data")
+        data.attrs["signal"] = "img_gid_q"
+        data.create_dataset("img_gid_q", data=stack)
+        data.create_dataset("q_xy", data=q_xy_axis)
+        data.create_dataset("q_z", data=q_z_axis)
+
+    w = PhaseViewsWindow()
+    qtbot.addWidget(w)
+    w.set_context(str(path), "e", n_f)
+    w.set_payload(TrackingPayload(
+        entry="e", threshold=0.5, length=1,
+        q_xy=np.array([0.5, 0.5]), q_z=np.array([0.5, 0.5]),
+        frame_num=np.array([0, 3]), amplitude=np.array([3.0, 9.0]),
+        components=[[0, 1]],
+    ))
+    w.amp_window.setValue(1)
+    w.amp_normalize.setChecked(False)
+    return w, stack, q_xy_axis, q_z_axis
+
+
+def test_amp_metric_roi_computes_gapfree_trace(qtbot, tmp_path):
+    """Switching the metric to "integrated intensity (ROI)" computes
+    per-track traces from the image data in a background worker: the
+    curve covers EVERY frame (the fit gap at 1..2 and the member-less
+    frames borrow the nearest fitted position), and the values match
+    the unit-tested ``integrate_roi`` on the same frames."""
+    from mlgidlab.roi_intensity import integrate_roi
+
+    w, stack, q_xy_axis, q_z_axis = _roi_scan_window(qtbot, tmp_path)
+    assert w.amp_metric.currentData() == "amplitude"   # default
+    assert w._roi_controls.isHidden()
+
+    # Wider box than the default so the whole block integrates.
+    w.roi_dqxy.setValue(0.12)
+    w.roi_dqz.setValue(0.12)
+    w.amp_metric.setCurrentIndex(1)
+    assert not w._roi_controls.isHidden()
+    qtbot.waitUntil(lambda: w._roi_cache_valid(), timeout=30000)
+    qtbot.waitUntil(lambda: w._worker_thread is None, timeout=30000)
+
+    curves = w.amp_plot.getPlotItem().listDataItems()
+    assert len(curves) == 1
+    xs = np.asarray(curves[0].xData)
+    ys = np.asarray(curves[0].yData)
+    assert list(xs) == [0, 1, 2, 3]           # gap-free
+    expected = [
+        integrate_roi(
+            stack[i].astype(float), q_xy_axis, q_z_axis,
+            0.5, 0.5, 0.12, 0.12, 2, 4,
+        )
+        for i in range(4)
+    ]
+    np.testing.assert_allclose(ys, expected, rtol=1e-5)
+    assert np.all(np.diff(ys) > 0)            # grows 10/frame
+
+    # CSV export: metric + ROI geometry recorded, value column renamed,
+    # one row per frame of the range.
+    w._export_data_files(["amplitude"], str(tmp_path / "roi"))
+    lines = (tmp_path / "roi_amplitude.csv").read_text().splitlines()
+    assert "metric=integrated intensity (ROI)" in lines[0]
+    assert "roi=+-0.12/+-0.12 1/A bg gap 2 px strips 4 px" in lines[0]
+    assert lines[1].split(",")[-1] == "roi_intensity"
+    rows = [line.split(",") for line in lines[2:]]
+    assert [int(r[2]) for r in rows] == [0, 1, 2, 3]
+    np.testing.assert_allclose(
+        [float(r[3]) for r in rows], expected, rtol=1e-5,
+    )
+
+    # Back to the fitted-amplitude metric: member-frame curves return.
+    w.amp_metric.setCurrentIndex(0)
+    assert w._roi_controls.isHidden()
+    curves = w.amp_plot.getPlotItem().listDataItems()
+    assert list(curves[0].xData) == [0, 3]
+
+
+def test_amp_metric_roi_without_context_stays_empty(phase_window):
+    """A tracking result without scan context (no file to integrate)
+    leaves the ROI tab empty instead of crashing or spawning a worker;
+    switching back restores the amplitude curves."""
+    w = phase_window
+    w.amp_metric.setCurrentIndex(1)
+    assert w.amp_plot.getPlotItem().listDataItems() == []
+    assert w._worker_thread is None
+    w.amp_metric.setCurrentIndex(0)
+    assert len(w.amp_plot.getPlotItem().listDataItems()) == 3
+
+
+def test_roi_key_frames_partition_by_nearest_member(qtbot, tmp_path):
+    """Per-frame phase attribution for ROI traces: each frame of the
+    interval follows the key of the nearest member frame, so a track
+    matched only from frame 2 splits its trace into an unmatched head
+    and a matched tail (synthesized tail frames included)."""
+    from mlgidlab.phase_views_window import PhaseViewsWindow, _UNMATCHED
+
+    w = PhaseViewsWindow()
+    qtbot.addWidget(w)
+    w.set_context(str(tmp_path / "x.h5"), "e", 6)
+    q = np.zeros(4)
+    w.set_payload(TrackingPayload(
+        entry="e", threshold=0.5, length=1, q_xy=q, q_z=q.copy(),
+        frame_num=np.array([0, 1, 2, 3]),
+        amplitude=np.array([1.0, 2.0, 3.0, 4.0]),
+        components=[[0, 1, 2, 3]],
+    ))
+    w.set_track_phases({0: ["A"]})
+    w.set_member_phases({2: ["A"], 3: ["A"]})   # claimed on 2..3 only
+    parts = w._roi_key_frames(0)
+    assert {k: list(v) for k, v in parts.items()} == {
+        _UNMATCHED: [0, 1], "A": [2, 3, 4, 5],
+    }
+    # Single-key track: the whole interval in one part.
+    w.set_member_phases({})
+    assert list(w._roi_key_frames(0)["A"]) == [0, 1, 2, 3, 4, 5]
+
+
+def test_amp_xrange_pinned_to_frame_interval(phase_window):
+    """The amplitude x-axis fits the tracked frame interval — the
+    grouped view's structure labels no longer feed the auto-range
+    (which used to run away to thousands of frames)."""
+    w = phase_window
+    w.amp_group.setChecked(True)
+    lo, hi = w._frame_interval()
+    span = hi - lo
+    (x0, x1), _y = w.amp_plot.getPlotItem().getViewBox().viewRange()
+    assert x0 == pytest.approx(lo - 0.02 * span, abs=1e-9)
+    assert x1 == pytest.approx(hi + 0.02 * span, abs=1e-9)
 
 
 def _ring_window(qtbot):

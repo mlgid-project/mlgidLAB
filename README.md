@@ -8,7 +8,7 @@ window: convert raw detector images to NeXus, then **detect / fit /
 match**, **review and edit** peaks, and **export** — same algorithms,
 visual control.
 
-> **Alpha (`v0.1.0a14`).** The detect → fit → match → edit loop works end-to-end; expect
+> **Alpha (`v0.1.0a15`).** The detect → fit → match → edit loop works end-to-end; expect
 > rough edges and report issues. See [`CHANGELOG.md`](CHANGELOG.md) for
 > highlights.
 
@@ -27,7 +27,7 @@ conda create -n mlgidlab python=3.12 -y
 conda activate mlgidlab
 
 # full pipeline (detection / fitting / matching + raw conversion)
-pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a14"
+pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a15"
 mlgidlab
 ```
 

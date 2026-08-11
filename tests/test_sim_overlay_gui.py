@@ -151,15 +151,12 @@ def test_cache_signal_and_combo_population(main_window, synthetic_nexus, qtbot):
     assert [combo.itemData(i) for i in range(combo.count())] == [
         "in2o3", "pbi2"
     ]
-    orient = mw._sim_orient_combo
-    # No matches on the frame: powder first (and selected), then the
-    # precomputed orientations in upstream order.
-    assert orient.itemData(0) == (0, 0, 0)
-    assert orient.itemText(0) == "Powder (rings)"
-    assert [orient.itemData(i) for i in range(orient.count())] == [
-        (0, 0, 0), (1, 1, 1), (0, 0, 2)
-    ]
-    assert orient.currentData() == (0, 0, 0)
+    # No matches on the frame: the auto mode default is random
+    # (powder), the matched combo is empty, and only that combo and
+    # the mode selector exist — no big all-orientations list.
+    assert mw._sim_orient_mode.currentData() == "random"
+    assert mw._sim_matched_combo.count() == 0
+    assert mw._sim_selected_hkl() == (0, 0, 0)
 
 
 def test_master_toggle_installs_and_clears_pattern(main_window, synthetic_nexus):
@@ -194,19 +191,121 @@ def test_matched_entries_listed_first_and_default(main_window, synthetic_nexus):
     assert cif_combo.itemText(0).endswith("— matched")
     assert cif_combo.itemText(1) == "pbi2"
 
-    orient = mw._sim_orient_combo
-    assert orient.itemData(0) == (1, 1, 1)
-    assert "matched p=0.94" in orient.itemText(0)
-    assert orient.currentData() == (1, 1, 1)
-    # The matched hkl is not duplicated in the plain orientation list.
-    datas = [orient.itemData(i) for i in range(orient.count())]
-    assert datas == [(1, 1, 1), (0, 0, 0), (0, 0, 2)]
+    # A matched orientation exists -> the auto mode default is
+    # "matched" with the matched combo carrying (and selecting) it,
+    # probability-labelled.
+    assert mw._sim_orient_mode.currentData() == "matched"
+    matched = mw._sim_matched_combo
+    assert [matched.itemData(i) for i in range(matched.count())] == [
+        (1, 1, 1)
+    ]
+    assert "p=0.94" in matched.itemText(0)
+    assert mw._sim_selected_hkl() == (1, 1, 1)
 
 
 def _markers_style(mw) -> None:
     idx = mw._matched_style_combo.findData("markers")
     assert idx >= 0
     mw._matched_style_combo.setCurrentIndex(idx)
+
+
+def _type_user_hkl(mw, text: str) -> None:
+    """Drive the user-specified orientation mode: select it, type
+    ``text`` and commit (editingFinished does not fire without real
+    focus events offscreen)."""
+    mw._sim_orient_mode.setCurrentIndex(
+        mw._combo_data_index(mw._sim_orient_mode, "user")
+    )
+    mw._sim_hkl_edit.setText(text)
+    mw._on_sim_hkl_edited()
+
+
+def test_user_hkl_validation_and_resolution(main_window, synthetic_nexus):
+    """User-specified mode: garbage and unknown indices are rejected
+    with a visible red hint and a cleared overlay; direction-equivalent
+    spellings resolve to the simulated orientation with a note."""
+    mw = main_window
+    _open(mw, synthetic_nexus)
+    mw.pipeline_panel.set_cif_pattern(_fake_cifpattern(), None)
+    mw._sim_master_check.setChecked(True)
+    assert mw.viewer.simulation_pattern().is_powder    # auto: random
+
+    _type_user_hkl(mw, "1 1")                          # not three ints
+    assert not mw._sim_hkl_edit.isHidden()
+    assert mw._sim_matched_combo.isHidden()
+    assert not mw._sim_orient_hint.isHidden()
+    assert "three integers" in mw._sim_orient_hint.text()
+    assert mw.viewer.simulation_pattern() is None
+
+    _type_user_hkl(mw, "a b c")
+    assert "integers" in mw._sim_orient_hint.text()
+    assert mw.viewer.simulation_pattern() is None
+
+    _type_user_hkl(mw, "0 0 0")                        # direction-less
+    assert "random (powder) mode" in mw._sim_orient_hint.text()
+    assert mw.viewer.simulation_pattern() is None
+
+    _type_user_hkl(mw, "0 1 0")                        # not simulated
+    assert (
+        "not a simulated orientation of in2o3"
+        in mw._sim_orient_hint.text()
+    )
+    assert "2 precomputed" in mw._sim_orient_hint.text()
+    assert mw.viewer.simulation_pattern() is None
+
+    _type_user_hkl(mw, "0 0 2")                        # exact hit
+    assert mw._sim_orient_hint.isHidden()
+    assert mw.viewer.simulation_pattern().hkl == (0, 0, 2)
+
+    # Direction-equivalent spellings resolve, with a non-error note.
+    _type_user_hkl(mw, "2 2 2")
+    assert mw.viewer.simulation_pattern().hkl == (1, 1, 1)
+    assert "equivalent" in mw._sim_orient_hint.text()
+    _type_user_hkl(mw, "0 0 -1")
+    assert mw.viewer.simulation_pattern().hkl == (0, 0, 2)
+
+
+def test_matched_mode_without_match_shows_hint(main_window, synthetic_nexus):
+    """Matched mode on a frame with no matched orientation for the CIF
+    renders nothing and says why; a match appearing fills the combo
+    and installs its pattern."""
+    mw = main_window
+    _open(mw, synthetic_nexus)
+    mw.pipeline_panel.set_cif_pattern(_fake_cifpattern(), None)
+    mw._sim_master_check.setChecked(True)
+    mode = mw._sim_orient_mode
+    mode.setCurrentIndex(mw._combo_data_index(mode, "matched"))
+    assert not mw._sim_matched_combo.isHidden()
+    assert mw._sim_hkl_edit.isHidden()
+    assert mw.viewer.simulation_pattern() is None
+    assert not mw._sim_orient_hint.isHidden()
+    assert "No matched orientation" in mw._sim_orient_hint.text()
+
+    mw.viewer.set_matched_structures(0, [_structure("In2O3", (1, 1, 1))])
+    assert mw._sim_matched_combo.count() == 1
+    assert mw.viewer.simulation_pattern().hkl == (1, 1, 1)
+    assert mw._sim_orient_hint.isHidden()
+
+
+def test_orient_mode_auto_follows_matches_until_user_choice(
+    main_window, synthetic_nexus,
+):
+    """The mode default is data-driven (matched when matches exist,
+    random otherwise) until the user explicitly picks a mode — from
+    then on it is pinned."""
+    mw = main_window
+    _open(mw, synthetic_nexus)
+    mw.pipeline_panel.set_cif_pattern(_fake_cifpattern(), None)
+    assert mw._sim_orient_mode.currentData() == "random"
+    mw.viewer.set_matched_structures(0, [_structure("In2O3", (1, 1, 1))])
+    assert mw._sim_orient_mode.currentData() == "matched"
+
+    mode = mw._sim_orient_mode
+    mode.setCurrentIndex(mw._combo_data_index(mode, "random"))
+    mw.viewer.set_matched_structures(
+        0, [_structure("In2O3", (1, 1, 1), prob=0.5, local_idx=1)]
+    )
+    assert mw._sim_orient_mode.currentData() == "random"
 
 
 def test_orientation_switch_and_intensity_cutoff(main_window, synthetic_nexus):
@@ -216,10 +315,7 @@ def test_orientation_switch_and_intensity_cutoff(main_window, synthetic_nexus):
     mw._sim_master_check.setChecked(True)
     _markers_style(mw)
 
-    orient = mw._sim_orient_combo
-    idx = mw._combo_data_index(orient, (1, 1, 1))
-    assert idx >= 0
-    orient.setCurrentIndex(idx)
+    _type_user_hkl(mw, "1 1 1")
     pattern = mw.viewer.simulation_pattern()
     assert pattern is not None and pattern.hkl == (1, 1, 1)
     # One scatter item carrying all three spots (rel 0.4, 1.0, 0.05).
@@ -279,7 +375,7 @@ def test_cache_invalidation_clears_overlay_and_disables(main_window, synthetic_n
     assert mw.viewer.simulation_pattern() is None
     assert mw.viewer._sim_items == []
     assert mw._sim_cif_combo.count() == 0
-    assert mw._sim_orient_combo.count() == 0
+    assert mw._sim_matched_combo.count() == 0
 
 
 def test_viewer_clear_drops_sim_items(main_window, synthetic_nexus):
@@ -301,8 +397,7 @@ def test_sim_overlay_follows_matched_style(main_window, synthetic_nexus):
     _open(mw, synthetic_nexus)
     mw.pipeline_panel.set_cif_pattern(_fake_cifpattern(), None)
     mw._sim_master_check.setChecked(True)
-    orient = mw._sim_orient_combo
-    orient.setCurrentIndex(mw._combo_data_index(orient, (1, 1, 1)))
+    _type_user_hkl(mw, "1 1 1")
 
     # Default: boxes — one dashed _PeakShapeItem for the missed bucket.
     assert [type(it) for it in mw.viewer._sim_items] == [_PeakShapeItem]
@@ -322,8 +417,7 @@ def _select_oriented(mw) -> None:
     no meaningful on-screen geometry)."""
     mw.pipeline_panel.set_cif_pattern(_fake_cifpattern(), None)
     mw._sim_master_check.setChecked(True)
-    orient = mw._sim_orient_combo
-    orient.setCurrentIndex(mw._combo_data_index(orient, (1, 1, 1)))
+    _type_user_hkl(mw, "1 1 1")
     vb = mw.viewer._plot.getViewBox()
     vb.viewPixelSize = lambda: (0.01, 0.5)  # (Å⁻¹, deg) per pixel
 
@@ -575,3 +669,51 @@ def test_selection_survives_frame_relabel_refresh(main_window, synthetic_nexus):
 
     mw._refresh_sim_matched_entries(1, [])
     assert mw.viewer.simulation_selected() == [0, 1, 2]
+
+
+def test_legend_swatch_recolors_structure_everywhere(
+    main_window, synthetic_nexus, clean_matched_colors,
+):
+    """The legend swatch is a clickable button in BOTH legends; a picked
+    colour recolours the overlay items and both legends' swatches, and
+    "Automatic" restores the palette colour. (The popup itself is unit
+    tested in test_color_picker.py; here the pick handler is invoked
+    directly.)"""
+    from PySide6.QtWidgets import QToolButton
+
+    mw = main_window
+    _open(mw, synthetic_nexus)
+    v = mw.viewer
+    s1 = _structure("In2O3", (1, 1, 1), local_idx=0)
+    s2 = _structure("PbI2", (0, 0, 0), prob=0.80, local_idx=1)
+    v.set_matched_structures(0, [s1, s2])
+    auto_color = v.matched_pen(s1)["color"]
+
+    def swatch_pixel(rows, uid) -> str:
+        btn = rows[uid].findChild(QToolButton)
+        assert btn is not None, "legend swatch should be a button"
+        size = btn.iconSize()
+        img = btn.icon().pixmap(size).toImage()
+        return img.pixelColor(size.width() // 2, size.height() // 2).name()
+
+    assert swatch_pixel(mw._matched_struct_rows, s1.unique_id) == auto_color
+    assert swatch_pixel(mw._sim_legend_struct_rows, s1.unique_id) == auto_color
+
+    mw._on_matched_color_picked(s1.color_key, "#123456")
+    assert v.matched_pen(s1)["color"] == "#123456"
+    # Both legends rebuilt their rows with the new colour.
+    assert swatch_pixel(mw._matched_struct_rows, s1.unique_id) == "#123456"
+    assert swatch_pixel(mw._sim_legend_struct_rows, s1.unique_id) == "#123456"
+    # The rendered overlay item carries the override; the other
+    # structure keeps its automatic colour.
+    colors = {
+        uid: it._pen.color().name()
+        for uid, it in v._matched_items
+        if uid in (s1.unique_id, s2.unique_id)
+    }
+    assert colors[s1.unique_id] == "#123456"
+    assert colors[s2.unique_id] == v.matched_pen(s2)["color"]
+
+    mw._on_matched_color_picked(s1.color_key, None)
+    assert v.matched_pen(s1)["color"] == auto_color
+    assert swatch_pixel(mw._matched_struct_rows, s1.unique_id) == auto_color

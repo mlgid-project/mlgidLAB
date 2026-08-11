@@ -76,6 +76,35 @@ def test_orientation_index_tolerance_and_miss():
     assert sp.orientation_index(fp, 0, (1, 1, 1)) == 0
 
 
+def test_parse_hkl_forms_and_errors():
+    """User-typed orientations: three integers with space/comma/semi
+    separators (signs fine); anything else raises with a readable
+    message, and the direction-less 0 0 0 points at the powder mode."""
+    assert sp.parse_hkl("0 0 1") == (0, 0, 1)
+    assert sp.parse_hkl("-1,1, 0") == (-1, 1, 0)
+    assert sp.parse_hkl(" 2;2;0 ") == (2, 2, 0)
+    for bad in ("", "1 1", "1 1 1 1", "a b c", "1.5 0 0"):
+        with pytest.raises(ValueError):
+            sp.parse_hkl(bad)
+    with pytest.raises(ValueError, match="random \\(powder\\) mode"):
+        sp.parse_hkl("0 0 0")
+
+
+def test_resolve_orientation_direction_equivalents():
+    """Spellings differing by a common factor or an overall sign are
+    the same texture direction: both sides compare gcd-reduced, so
+    0 0 1 / 0 0 -1 / 0 0 4 all resolve to the stored (0, 0, 2), and
+    unknown directions return None."""
+    fp = _fake_cifpattern()          # orientations (1,1,1), (0,0,2)
+    assert sp.resolve_orientation(fp, 0, (1, 1, 1)) == (1, 1, 1)
+    assert sp.resolve_orientation(fp, 0, (2, 2, 2)) == (1, 1, 1)
+    assert sp.resolve_orientation(fp, 0, (-1, -1, -1)) == (1, 1, 1)
+    assert sp.resolve_orientation(fp, 0, (0, 0, 1)) == (0, 0, 2)
+    assert sp.resolve_orientation(fp, 0, (0, 0, -4)) == (0, 0, 2)
+    assert sp.resolve_orientation(fp, 0, (0, 1, 0)) is None
+    assert sp.resolve_orientation(fp, 1, (1, 1, 1)) is None
+
+
 def test_extract_oriented_folds_dedupes_and_normalises():
     fp = _fake_cifpattern()
     pattern = sp.extract_pattern(fp, 0, (1, 1, 1))

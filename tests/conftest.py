@@ -209,6 +209,38 @@ def main_window(qtbot):
                 raise
 
 
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_teardown(item, nextitem):
+    """Destroy the widgets pytest-qt closed — really destroy them.
+
+    pytest-qt's teardown closes every ``qtbot.addWidget`` widget,
+    calls ``deleteLater()`` and then ``processEvents()`` — but Qt
+    never delivers ``DeferredDelete`` events through
+    ``processEvents``; they need a running event loop or an explicit
+    ``sendPostedEvents(None, DeferredDelete)``. In an exec()-less
+    pytest process every closed window's C++ widget tree therefore
+    stayed alive until interpreter exit: ~1,400 widgets per
+    ``MainWindow`` test, tens of thousands over one serial CI shard.
+    That accumulation pushed CI shard 0 past its 30-minute timeout
+    the moment ``test_theme_persistence`` landed late in the shard
+    (adding a test FILE re-deals the round-robin shards):
+    ``_set_theme`` swaps the app stylesheet and repolishes
+    ``allWidgets()`` — three theme switches in that test — and both
+    costs scale with every widget the process ever leaked.
+
+    ``trylast``: fixture finalizers (e.g. ``main_window``'s second,
+    defensive ``close()``) must run BEFORE the flush so they never
+    touch an already-destroyed C++ object.
+    """
+    from PySide6.QtCore import QCoreApplication, QEvent
+
+    app = QCoreApplication.instance()
+    if app is not None:
+        QCoreApplication.sendPostedEvents(
+            None, QEvent.Type.DeferredDelete
+        )
+
+
 @pytest.fixture(autouse=True)
 def _cleanup_session_temp_dirs():
     """Remove any NexusSession working-copy temp dir a test left open.
@@ -222,6 +254,20 @@ def _cleanup_session_temp_dirs():
         session.cleanup_registered_temp_dirs()
     except Exception:
         pass
+
+
+@pytest.fixture
+def clean_matched_colors():
+    """Drop the persisted custom structure colours around a test.
+
+    ``GIWAXSImageViewer`` loads the ``matchedColors`` QSettings key at
+    construction, so a test that picks colours would otherwise leak them
+    into every later viewer/MainWindow built in the same run."""
+    from PySide6.QtCore import QSettings
+
+    QSettings().remove("matchedColors")
+    yield
+    QSettings().remove("matchedColors")
 
 
 @pytest.fixture

@@ -294,3 +294,80 @@ def test_matched_color_and_visibility_reset_on_clear(viewer):
     assert v._matched_color_index and v._matched_visibility
     v.clear()
     assert v._matched_color_index == {} and v._matched_visibility == {}
+
+
+def test_custom_matched_color_overrides_palette(
+    viewer, clean_matched_colors,
+):
+    """A picked colour replaces the palette colour for that identity
+    only; line style/width and every other structure stay automatic,
+    and ``None`` returns to the palette."""
+    v = viewer
+    f0 = [_structure(0, "Aaa", (1, 1, 0)), _structure(1, "Zzz", (2, 0, 0))]
+    v._frame_index = 0
+    v.set_matched_structures(0, f0)
+    aaa, zzz = _by_cif(f0, "Aaa"), _by_cif(f0, "Zzz")
+    pen_before = dict(v.matched_pen(aaa))
+    zzz_before = dict(v.matched_pen(zzz))
+
+    v.set_matched_color(aaa.color_key, "#123456")
+    pen = v.matched_pen(aaa)
+    assert pen["color"] == "#123456"
+    assert pen["style"] == pen_before["style"]
+    assert pen["width"] == pen_before["width"]
+    assert v.matched_pen(zzz) == zzz_before
+
+    v.set_matched_color(aaa.color_key, None)
+    assert v.matched_pen(aaa) == pen_before
+
+
+def test_custom_matched_color_reemits_structures(
+    viewer, clean_matched_colors,
+):
+    """``set_matched_color`` re-emits ``matchedStructuresChanged`` for
+    the current frame so both legends rebuild their swatches."""
+    v = viewer
+    f0 = [_structure(0, "Aaa", (1, 1, 0))]
+    v._frame_index = 0
+    v.set_matched_structures(0, f0)
+    got = []
+    v.matchedStructuresChanged.connect(lambda f, s: got.append((f, s)))
+    v.set_matched_color(("Aaa", 1, 1, 0), "#123456")
+    assert len(got) == 1
+    frame, structs = got[0]
+    assert frame == 0 and [s.cif for s in structs] == ["Aaa"]
+
+
+def test_custom_matched_color_survives_clear_and_restart(
+    viewer, qtbot, clean_matched_colors,
+):
+    """Overrides are preferences, not file state: they outlive
+    ``clear()`` and, via QSettings, a fresh viewer instance (the
+    restart stand-in)."""
+    from mlgidlab.image_viewer import GIWAXSImageViewer
+    v = viewer
+    key = ("Aaa", 1, 1, 0)
+    v.set_matched_color(key, "#123456")
+    v.clear()
+    assert v._pen_for_key(key)["color"] == "#123456"
+
+    v2 = GIWAXSImageViewer()
+    qtbot.addWidget(v2)
+    assert v2._pen_for_key(key)["color"] == "#123456"
+    # Resetting in the new instance clears the stored value too.
+    v2.set_matched_color(key, None)
+    v3 = GIWAXSImageViewer()
+    qtbot.addWidget(v3)
+    assert v3._matched_color_overrides == {}
+
+
+def test_cif_color_overrides_smallest_hkl_wins(
+    viewer, clean_matched_colors,
+):
+    """The CIF-level view (for the phase views) is deterministic when
+    several hkl rows of one CIF are overridden."""
+    v = viewer
+    v.set_matched_color(("Aaa", 2, 0, 0), "#222222")
+    v.set_matched_color(("Aaa", 1, 1, 0), "#111111")
+    v.set_matched_color(("Bbb", 0, 0, 1), "#333333")
+    assert v.cif_color_overrides() == {"Aaa": "#111111", "Bbb": "#333333"}

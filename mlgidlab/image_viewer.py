@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 
 # Pin pyqtgraph to PySide6 before it auto-detects.
@@ -200,6 +201,30 @@ def matched_pen_for(index: int) -> dict:
     color = MATCHED_PALETTE[index % n_colors]
     style = MATCHED_LINE_STYLES[(index // n_colors) % n_styles]
     return {"color": color, "style": style, "width": MATCHED_LINE_WIDTH}
+
+
+# User-picked colours per structure identity (CIF + hkl), overriding the
+# automatic palette. Persisted app-wide (same JSON-in-QSettings idiom as
+# the recent-files list) so a structure keeps its chosen colour across
+# sessions and files.
+_MATCHED_COLORS_KEY = "matchedColors"
+
+
+def _load_matched_color_overrides() -> dict[tuple, str]:
+    raw = QSettings().value(_MATCHED_COLORS_KEY, "")
+    try:
+        pairs = json.loads(str(raw)) if raw else []
+        return {
+            (str(c), int(h), int(k), int(l)): str(color)
+            for (c, h, k, l), color in pairs
+        }
+    except (ValueError, TypeError):
+        return {}
+
+
+def _save_matched_color_overrides(overrides: dict[tuple, str]) -> None:
+    pairs = [[list(key), color] for key, color in overrides.items()]
+    QSettings().setValue(_MATCHED_COLORS_KEY, json.dumps(pairs))
 
 # Curated list of colormaps. Names are matplotlib's; pg.colormap.get falls
 # back to matplotlib's registry, which is always available since matplotlib
@@ -1117,6 +1142,12 @@ class GIWAXSImageViewer(QWidget):
         # (previously coloured by per-frame position, which shuffled as
         # the structure set changed frame to frame).
         self._matched_color_index: dict[tuple, int] = {}
+        # User-picked colours per identity, layered over the palette.
+        # Loaded once here; ``set_matched_color`` keeps QSettings in
+        # sync. Survives ``clear()``: a preference, not file state.
+        self._matched_color_overrides: dict[tuple, str] = (
+            _load_matched_color_overrides()
+        )
         self._matched_master_visible: bool = True
         # How matched structures are drawn: "boxes" (default, per-peak
         # boxes) or "markers" (hollow circles for peaks + dashed arcs for
@@ -1813,13 +1844,70 @@ class GIWAXSImageViewer(QWidget):
         for key in keys:
             self._color_index_for_key(tuple(key))
 
+    def _pen_for_key(self, key: tuple) -> dict:
+        """Palette pen for an identity, with the user's colour override
+        (if any) layered on top. Line style/width stay palette-driven so
+        an overridden structure keeps its dash pattern."""
+        pen = matched_pen_for(self._color_index_for_key(key))
+        override = self._matched_color_overrides.get(key)
+        if override:
+            pen["color"] = override
+        return pen
+
     def matched_pen(self, structure: MatchedStructure) -> dict:
         """Return the full ``{color, style, width}`` pen for ``structure``.
 
         Keyed by the structure's cross-frame identity so the panel swatch
         and the overlay share one stable colour on every frame.
         """
-        return matched_pen_for(self._color_index_for(structure))
+        return self._pen_for_key(structure.color_key)
+
+    def set_matched_color(self, key: tuple, color: str | None) -> None:
+        """Set (hex string) or clear (``None`` = back to the automatic
+        palette) the user's colour for a structure identity. Persisted
+        app-wide; re-renders the current frame's overlays and re-emits
+        ``matchedStructuresChanged`` so both legends redraw their
+        swatches."""
+        key = tuple(key)
+        if color:
+            self._matched_color_overrides[key] = str(color)
+        else:
+            self._matched_color_overrides.pop(key, None)
+        _save_matched_color_overrides(self._matched_color_overrides)
+        self._render_overlays(self.current_frame)
+        self.matchedStructuresChanged.emit(
+            self.current_frame, self.matched_structures(self.current_frame)
+        )
+
+    def cif_color_overrides(self) -> dict[str, str]:
+        """CIF-level view of the colour overrides, for consumers keyed by
+        CIF name only (the phase views). When several hkl rows of one CIF
+        are overridden, the smallest sorted ``(h, k, l)`` wins."""
+        out: dict[str, str] = {}
+        for key in sorted(self._matched_color_overrides):
+            out.setdefault(str(key[0]), self._matched_color_overrides[key])
+        return out
+
+    def cif_effective_colors(self) -> dict[str, str]:
+        """Effective per-CIF colour exactly as the Display legend shows
+        it: the automatic palette pen for the identity with the user's
+        override layered on top (``_pen_for_key``). Where several (hkl)
+        identities of one CIF have colours assigned, the smallest sorted
+        identity wins — the same convention as ``cif_color_overrides``.
+
+        Feeds the phase views' colour map so the q-map, amplitude bands
+        and structure toggles agree with the Display-dock swatches even
+        for structures whose colour was never hand-picked (the views'
+        own hue wheel is only the fallback for CIFs this viewer has not
+        assigned yet). Custom picks keep CIF-level priority: a pick on
+        ANY (hkl) row of a CIF wins for that CIF, exactly as
+        ``cif_color_overrides`` alone behaved before."""
+        out: dict[str, str] = dict(self.cif_color_overrides())
+        for key in sorted(self._matched_color_index):
+            if key == UNMATCHED_KEY:
+                continue
+            out.setdefault(str(key[0]), str(self._pen_for_key(key)["color"]))
+        return out
 
     def matched_visibility(self, frame: int, unique_id: str) -> bool:
         """Show/hide state for the structure with ``unique_id`` on
@@ -3611,7 +3699,7 @@ class GIWAXSImageViewer(QWidget):
                 has_peaks = len(peaks) > 0
             if not has_peaks:
                 self._matched_empty_uids.add(s.unique_id)
-            pen_info = matched_pen_for(self._color_index_for(s))
+            pen_info = self._pen_for_key(s.color_key)
             visible = has_peaks and self._is_matched_item_visible(s.unique_id)
             if self._matched_display_style == "markers":
                 # q-map look: circles for peaks, dashed arcs for rings.
@@ -4038,7 +4126,7 @@ class GIWAXSImageViewer(QWidget):
                 if not self._is_matched_item_visible(s.unique_id):
                     continue
                 tbl = s.peaks
-                color = matched_pen_for(self._color_index_for(s))["color"]
+                color = self._pen_for_key(s.color_key)["color"]
                 # Under "show only tracked peaks", only this structure's
                 # tracked peaks are drawn — so only they are clickable,
                 # and the structure-level highlight covers just them.

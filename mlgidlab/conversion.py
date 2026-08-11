@@ -27,6 +27,7 @@ from mlgidlab.conversion_panel import (
     CONV_DET2Q,
     CONV_DET2Q_GID,
     OUTPUT_SEPARATE_FILES,
+    OUTPUT_SINGLE_ENTRY,
     ConversionConfig,
     RawScan,
 )
@@ -49,7 +50,9 @@ def execute(
     Returns a list of output file paths actually written. In
     ``OUTPUT_SEPARATE_FILES`` mode this is one path per scan
     (deduplicated); in ``OUTPUT_SEPARATE_DATASETS`` mode it's a single
-    path written incrementally with one group per scan.
+    path written incrementally with one group per scan; in
+    ``OUTPUT_SINGLE_ENTRY`` mode it's a single path holding one fresh
+    ``entry_NNNN`` whose image stack grows by one frame per scan.
     """
     import pygid  # lazy
 
@@ -136,12 +139,36 @@ def execute(
     # frames; on a frame-shape mismatch it diverts to a new sibling
     # group with a warning rather than corrupting the stack).
     if cfg.append_frames:
+        if cfg.output_mode == OUTPUT_SINGLE_ENTRY:
+            # The panel locks this combination out; refuse defensively —
+            # one mode creates a fresh entry, the other requires an
+            # existing one.
+            raise ValueError(
+                "Append frames and single-entry output are mutually "
+                "exclusive."
+            )
         _validate_append_target(cfg, raw_file_outputs)
+
+    # Single-entry mode: every scan's frames land in ONE fresh
+    # ``entry_NNNN`` of the shared output file. The first scan creates
+    # the group; each following scan writes into it with all overwrite
+    # flags off, which pygid's DataSaver treats as an append (image
+    # stack + frame_ind + angle_of_incidence are resizable, per-frame
+    # analysis groups extend). The result is a real N-frame scan —
+    # frame slider + peak tracking work, unlike N sibling entries.
+    single_entry_group: str | None = None
+    if cfg.output_mode == OUTPUT_SINGLE_ENTRY:
+        shared_out = next(iter(set(raw_file_outputs.values())))
+        idx = entry_counters[shared_out]
+        entry_counters[shared_out] = idx + 1
+        single_entry_group = _entry_group_name(idx)
 
     for scan in scans:
         out_path = raw_file_outputs[scan.file_path]
         if cfg.append_frames:
             h5_group = cfg.append_entry
+        elif single_entry_group is not None:
+            h5_group = single_entry_group
         else:
             idx = entry_counters[out_path]
             entry_counters[out_path] = idx + 1
@@ -150,11 +177,18 @@ def execute(
         # ``overwrite_file`` may only fire once per output file: pygid
         # truncates the file on the first call, then the next call into
         # the same path must append into a fresh group. Track first-touch
-        # per output path. Append mode never overwrites anything.
+        # per output path. Append mode never overwrites anything; in
+        # single-entry mode only the group-creating first scan may
+        # overwrite (a later overwrite would truncate the growing stack).
         first_touch = out_path not in seen_paths
         if cfg.append_frames:
             scan_overwrite_file = False
             scan_overwrite_group = False
+        elif single_entry_group is not None:
+            scan_overwrite_file = cfg.overwrite_file if first_touch else False
+            scan_overwrite_group = (
+                cfg.overwrite_dataset if first_touch else False
+            )
         else:
             scan_overwrite_file = cfg.overwrite_file if first_touch else False
             scan_overwrite_group = cfg.overwrite_dataset
@@ -189,10 +223,230 @@ def execute(
             written.append(out_path)
             seen_paths.add(out_path)
 
+    if single_entry_group is not None and written:
+        _warn_if_frames_diverted(written[0], single_entry_group, len(scans))
+
     return written
 
 
+def import_converted_stack(
+    paths: list[Path],
+    out_path: Path,
+    entry_name: str = "entry_0000",
+    qxy_range: tuple[float, float] | None = None,
+    qz_range: tuple[float, float] | None = None,
+    ai: float = 0.0,
+    flip_vertical: bool = False,
+    wavelength_A: float | None = None,
+    progress=None,
+) -> Path:
+    """Write already-converted images as ONE N-frame mlgid NeXus entry.
+
+    For q-space maps produced OUTSIDE mlgidLAB (other software /
+    beamline pipelines): no conversion runs — each image's pixels are
+    copied verbatim into ``data/img_gid_q``, streamed frame-by-frame
+    via fabio so memory stays at one frame regardless of N. Frames are
+    written in the order given (callers sort; the GUI uses natural
+    filename order).
+
+    Axes: with ``qxy_range``/``qz_range`` the q vectors are linear
+    ramps over the image width/height (1/Angstrom); without them the
+    axes fall back to pixel indices so the entry still classifies as a
+    converted mlgid scan and renders. ``ai`` fills
+    ``instrument/angle_of_incidence`` (one global value, repeated per
+    frame). ``flip_vertical`` flips each frame's rows for sources whose
+    q_z runs opposite to pygid's convention.
+
+    The written schema mirrors pygid's DataSaver layout for the pieces
+    the GUI reads (resizable ``img_gid_q`` + ``frame_ind``, per-frame
+    ``analysis/frameNNNNN`` groups, NXdata signal/axes attrs).
+
+    Pipeline capability is decided by ``wavelength_A``: with a real
+    wavelength AND both q ranges, a full ``instrument`` block is
+    written — real wavelength + incidence angle, plus explicit ZERO
+    placeholders for the detector fields (SDD, beam center, pixel
+    size, rotations). pygid's ``load_params`` hard-reads every one of
+    those datasets, but detection consumes only image + q axes,
+    fitting additionally only wavelength + ai (pygidfit's missing-
+    wedge / critical-angle math), and matching only fitted peaks + q
+    maxima — verified against mlgidbase 0.1.5 / pygidfit 0.1.3, and
+    recorded in docs/backend_compatibility.md so future backend bumps
+    re-check it. The placeholders carry a ``placeholder`` attr so the
+    file stays honest. Without a wavelength (or with pixel axes) no
+    geometry is written and the GUI refuses pipeline ops with a clear
+    message; a ``process/mlgidlab`` note records the provenance either
+    way.
+
+    All frames must match the first frame's (H, W) — mismatches raise
+    ``ValueError`` naming the offending file. Overwrites ``out_path``.
+    """
+    import datetime
+
+    import fabio
+    import h5py
+    import numpy as np
+
+    from mlgidlab import __version__, file_model
+
+    if not paths:
+        raise ValueError("No image files to import")
+    file_model._quiet_fabio()
+
+    first = np.asarray(fabio.open(str(paths[0])).data)
+    if first.ndim != 2:
+        raise ValueError(
+            f"{Path(paths[0]).name}: expected a single 2-D image, got "
+            f"shape {first.shape}"
+        )
+    h, w = first.shape
+    n = len(paths)
+
+    if qxy_range is not None:
+        q_xy = np.linspace(qxy_range[0], qxy_range[1], w)
+    else:
+        q_xy = np.arange(w, dtype=np.float64)
+    if qz_range is not None:
+        q_z = np.linspace(qz_range[0], qz_range[1], h)
+    else:
+        q_z = np.arange(h, dtype=np.float64)
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(out_path, "w") as f:
+        f.attrs["NX_class"] = "NXroot"
+        f.attrs["default"] = entry_name
+        entry = f.create_group(entry_name)
+        entry.attrs["NX_class"] = "NXentry"
+        entry.attrs["default"] = "data"
+        entry["title"] = entry_name
+
+        data = entry.create_group("data")
+        data.attrs["NX_class"] = "NXdata"
+        data.attrs["signal"] = "img_gid_q"
+        data.attrs["axes"] = ["frame_ind", "q_z", "q_xy"]
+
+        img = data.create_dataset(
+            "img_gid_q",
+            shape=(n, h, w),
+            maxshape=(None, h, w),
+            chunks=(1, h, w),
+            dtype=np.float32,
+        )
+        for ax_name, vec in (("q_xy", q_xy), ("q_z", q_z)):
+            ds = data.create_dataset(ax_name, data=vec.astype(np.float64))
+            ds.attrs["interpretation"] = "axis"
+            if qxy_range is not None or qz_range is not None:
+                ds.attrs["units"] = "1/Angstrom"
+        data.create_dataset(
+            "frame_ind",
+            data=np.arange(n, dtype=np.float32),
+            maxshape=(None,),
+        )
+        data["filename"] = [str(p) for p in paths]
+        data["frame_num"] = np.arange(n, dtype=np.int64)
+        analysis = data.create_group("analysis")
+        analysis.attrs["NX_class"] = "NXparameters"
+        for i in range(n):
+            g = analysis.create_group(f"frame{i:05d}")
+            g.attrs["NX_class"] = "NXparameters"
+
+        instrument = entry.create_group("instrument")
+        instrument.attrs["NX_class"] = "NXinstrument"
+        instrument["angle_of_incidence"] = np.full(n, float(ai))
+
+        with_geometry = (
+            wavelength_A is not None
+            and wavelength_A > 0
+            and qxy_range is not None
+            and qz_range is not None
+        )
+        if with_geometry:
+            mono = instrument.create_group("monochromator")
+            mono.attrs["NX_class"] = "NXmonochromator"
+            mono["wavelength"] = float(wavelength_A) * 1e-10  # Å → m
+            det = instrument.create_group("detector")
+            det.attrs["NX_class"] = "NXdetector"
+            for field in (
+                "distance", "x_pixel_size", "y_pixel_size",
+                "beam_center_x", "beam_center_y", "polar_angle",
+                "aequatorial_angle", "rotation_angle",
+            ):
+                ds = det.create_dataset(field, data=0.0)
+                ds.attrs["placeholder"] = (
+                    "imported data — true value unknown; unused by "
+                    "detection/fitting/matching"
+                )
+
+        process = entry.create_group("process")
+        process.attrs["NX_class"] = "NXprocess"
+        prov = process.create_group("mlgidlab")
+        prov.attrs["NX_class"] = "NXprocess"
+        prov["program"] = "mlgidlab"
+        prov["version"] = __version__
+        prov["date"] = datetime.datetime.now().isoformat(timespec="seconds")
+        if with_geometry:
+            prov["NOTE"] = (
+                "Imported from pre-converted image files. Wavelength "
+                "and incidence angle are user-supplied; the detector "
+                "fields are zero placeholders (unused by "
+                "detection/fitting/matching, which consume only the "
+                "image, q axes, wavelength and incidence angle)."
+            )
+        else:
+            prov["NOTE"] = (
+                "Imported from pre-converted image files; no detector "
+                "geometry available. Pipeline operations "
+                "(detection/fit/match) require re-importing with q "
+                "ranges and a wavelength, or a real conversion."
+            )
+
+        for i, p in enumerate(paths):
+            frame = np.asarray(fabio.open(str(p)).data)
+            if frame.shape != (h, w):
+                raise ValueError(
+                    f"{Path(p).name}: shape {frame.shape} does not match "
+                    f"the first frame's {(h, w)} — all imported images "
+                    "must share one detector size"
+                )
+            if flip_vertical:
+                frame = np.flipud(frame)
+            img[i] = frame.astype(np.float32, copy=False)
+            if progress is not None:
+                progress(i + 1, n)
+
+    return out_path
+
+
 # -------------- helpers --------------
+
+
+def _warn_if_frames_diverted(
+    out_path: Path, group: str, expected: int
+) -> None:
+    """Log a warning when a single-entry run did not land every frame.
+
+    pygid diverts a frame whose converted shape mismatches the growing
+    stack to a fresh sibling group (with only a ``UserWarning``), so a
+    mixed-size batch would silently produce extra entries. The frame
+    count lives in ``<group>/data/frame_ind``. Purely advisory — never
+    raises; the data that DID land is intact.
+    """
+    import h5py
+
+    try:
+        with h5py.File(out_path, "r") as f:
+            n = int(f[f"{group}/data/frame_ind"].shape[0])
+    except (OSError, KeyError):
+        logger.debug("suppressed frame-count check", exc_info=True)
+        return
+    if n != expected:
+        logger.warning(
+            "Single-entry conversion: only %d of %d frames landed in "
+            "%s — pygid diverted mismatched-shape frames to sibling "
+            "entries (check that every selected image has the same "
+            "detector size).",
+            n, expected, group,
+        )
 
 
 def _validate_append_target(

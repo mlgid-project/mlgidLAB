@@ -280,6 +280,7 @@ class RawSession(BaseSession):
         if not raw_paths:
             raise ValueError("RawSession requires at least one raw file path")
         self._raw_paths = list(raw_paths)
+        self._raw_path_strs: frozenset[str] | None = None
         # The "temp" of a raw session is just the first raw file: no
         # writable copy is made. Saving to a raw input is meaningless;
         # the user produces output via the Conversion panel instead.
@@ -295,6 +296,20 @@ class RawSession(BaseSession):
     @property
     def raw_paths(self) -> list[Path]:
         return list(self._raw_paths)
+
+    @property
+    def raw_path_strs(self) -> frozenset[str]:
+        """The (already-resolved) raw paths as a cached string set.
+
+        File-browser click resolution matches a clicked node's file
+        against the session; re-resolving thousands of ``Path`` objects
+        per click is measurable syscall load (and painful on network
+        mounts), while this set is O(1) per lookup. ``open`` resolved
+        every path once, so plain string equality is canonical.
+        """
+        if self._raw_path_strs is None:
+            self._raw_path_strs = frozenset(str(p) for p in self._raw_paths)
+        return self._raw_path_strs
 
     @classmethod
     def open(cls, raw_paths: list[Path | str]) -> RawSession:

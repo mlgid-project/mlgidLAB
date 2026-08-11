@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 
 import numpy as np
-from PySide6.QtCore import QModelIndex, Qt, Signal
+from PySide6.QtCore import QEvent, QModelIndex, Qt, Signal
 from PySide6.QtGui import QStandardItemModel
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -67,6 +67,10 @@ class ScanTrackingPanel(QWidget):
     # the inject + 2D-fit + match pipeline pass (real data, not a
     # display overlay).
     interpolateRequested = Signal()
+    # Delete pressed on a selected table row: (track index). The host
+    # removes the track from the tracking RESULTS only — no peaks are
+    # deleted from the file.
+    trackDeleteRequested = Signal(int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -178,7 +182,10 @@ class ScanTrackingPanel(QWidget):
              ("members", "Total member peaks in the track (a frame can "
                          "contribute more than one)"),
              ("|q|",     "Mean q magnitude (Å⁻¹) across the track"),
-             ("a",       "Mean polar angle (°) across the track")],
+             ("a",       "Mean polar angle (°) across the track"),
+             ("structure", "Matched crystal structures (CIFs) the "
+                         "track's peaks belong to, dominant phase "
+                         "first — empty until Matching has run")],
         )
         self._proxy = _PeakProxy(self)
         self._proxy.setSourceModel(self._model)
@@ -204,6 +211,13 @@ class ScanTrackingPanel(QWidget):
             self._on_row_changed
         )
         self._table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+        # Delete on the table removes the selected track from the
+        # RESULTS (host-side; the file is never touched). An event
+        # filter rather than a QShortcut: it fires on the key event
+        # delivered to the table itself, so Delete elsewhere in the
+        # app is unaffected and no focus-dependent shortcut map is
+        # involved.
+        self._table.installEventFilter(self)
         layout.addWidget(self._table)
 
         self._payload: TrackingPayload | None = None
@@ -255,16 +269,22 @@ class ScanTrackingPanel(QWidget):
         self,
         payload: TrackingPayload | None,
         ids: list | None = None,
+        phases: dict | None = None,
     ) -> None:
         """Repopulate from a completed upstream run.
 
         ``ids`` is ``phase_tracking.member_ids`` output — the
         best-effort ``(frame, fitted_peak_id)`` per payload member
-        (None entries allowed). Passing ``payload=None`` clears.
+        (None entries allowed). ``phases`` is
+        ``phase_tracking.match_tracks_to_structures`` output
+        (track index -> CIF names, dominant first) and fills the
+        "structure" column; tracks without a matched member show "—".
+        Passing ``payload=None`` clears.
         """
         self._payload = payload
         self._member_to_track = {}
         self._row_by_track = {}
+        phases = phases or {}
         self._repopulating = True
         try:
             self._model.removeRows(0, self._model.rowCount())
@@ -290,6 +310,7 @@ class ScanTrackingPanel(QWidget):
                     id_item.setData(int(rep_frame), _ROLE_FRAME)
                     id_item.setData(int(rep_id), _ROLE_PEAK_ID)
                     self._row_by_track[k] = k
+                    struct_names = phases.get(k) or []
                     self._model.appendRow([
                         id_item,
                         _int_item(first),
@@ -298,6 +319,10 @@ class ScanTrackingPanel(QWidget):
                         _int_item(n_members),
                         _num_item(payload.track_mean("radius", k)),
                         self._angle_item(payload.track_mean("angle", k)),
+                        _text_item(
+                            ", ".join(str(s) for s in struct_names)
+                            if struct_names else "—"
+                        ),
                     ])
         finally:
             self._repopulating = False
@@ -405,3 +430,23 @@ class ScanTrackingPanel(QWidget):
         if frame is None or peak_id is None:
             return
         self.trackRowSelected.emit(int(frame), int(peak_id))
+
+    def eventFilter(self, obj, event) -> bool:
+        if (
+            obj is self._table
+            and event.type() == QEvent.Type.KeyPress
+            and event.key() == Qt.Key.Key_Delete
+        ):
+            self._on_delete_pressed()
+            return True
+        return super().eventFilter(obj, event)
+
+    def _on_delete_pressed(self) -> None:
+        """Emit the selected row's track index for host-side removal."""
+        current = self._table.selectionModel().currentIndex()
+        if not current.isValid():
+            return
+        track = current.siblingAtColumn(0).data(_ROLE_TRACK_ID)
+        if track is None:
+            return
+        self.trackDeleteRequested.emit(int(track))

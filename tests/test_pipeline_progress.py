@@ -1,8 +1,10 @@
 """Per-frame progress wiring for ``PipelineWorker`` + ``PipelinePanel``.
 
 mlgidbase emits ``Saved <kind> peaks to file: ..., entry: <entry>,
-frame: <N>`` once per frame at completion time. The worker turns
-those into structured ``frameProgress(done, total, op, entry)``
+frame: <N>`` once per frame at completion time — or a skip line
+("No solutions for (...)", "No peaks detected for file: ...",
+"Detection failed. ...") when the frame produced nothing. The worker
+turns both into structured ``frameProgress(done, total, op, entry)``
 emits via ``_FrameProgressHandler``; the panel paints a determinate
 ``QProgressBar`` for multi-frame runs and stays hidden otherwise.
 These tests exercise the contract without driving a real mlgidbase
@@ -77,6 +79,76 @@ def test_progress_handler_counts_each_completion(qtbot):
         (2, 5, "run_detection", "entry_0"),
         (3, 5, "run_detection", "entry_0"),
     ]
+
+
+def test_progress_handler_counts_matching_no_solution_frames(qtbot):
+    """A matching frame with no solutions logs "No solutions for (…)"
+    instead of "Saved matched peaks" and must still tick the bar —
+    regression for the bar lagging the log and then jumping to 100%
+    at the end of a run with no-solution frames."""
+    sink = _ProgressSink()
+    handler = _FrameProgressHandler(sink.frameProgress, total=4, op_name="run_matching")
+
+    received: list[tuple[int, int, str, str]] = []
+    sink.frameProgress.connect(lambda d, t, o, e: received.append((d, t, o, e)))
+
+    handler.emit(_record("Saved matched peaks to file: /tmp/a.h5, entry: entry_0, frame: 0"))
+    handler.emit(_record(
+        "No solutions for (/tmp/a.h5, entry: entry_0, frame: 1) was found. "
+        "Try to decrease threshold"
+    ))
+    handler.emit(_record("Saved matched peaks to file: /tmp/a.h5, entry: entry_0, frame: 2"))
+    handler.emit(_record(
+        "No solutions for (/tmp/a.h5, entry: entry_0, frame: 3) was found. "
+        "Try to decrease threshold"
+    ))
+
+    assert received == [
+        (1, 4, "run_matching", "entry_0"),
+        (2, 4, "run_matching", "entry_0"),
+        (3, 4, "run_matching", "entry_0"),
+        (4, 4, "run_matching", "entry_0"),
+    ]
+
+
+def test_progress_handler_counts_detection_skip_frames(qtbot):
+    """Detection's two skip shapes both tick: "No peaks detected"
+    (carries entry/frame) and the bare "Detection failed. …" warning
+    (no entry in the text — the last-seen entry is reused for the
+    label)."""
+    sink = _ProgressSink()
+    handler = _FrameProgressHandler(sink.frameProgress, total=3, op_name="run_detection")
+
+    received: list[tuple[int, int, str, str]] = []
+    sink.frameProgress.connect(lambda d, t, o, e: received.append((d, t, o, e)))
+
+    handler.emit(_record("Saved detected peaks to file: /tmp/a.h5, entry: entry_0, frame: 0"))
+    handler.emit(_record("No peaks detected for file: /tmp/a.h5, entry: entry_0, frame: 1"))
+    handler.emit(_record("Detection failed. Couldn't detect any peaks"))
+
+    assert received == [
+        (1, 3, "run_detection", "entry_0"),
+        (2, 3, "run_detection", "entry_0"),
+        (3, 3, "run_detection", "entry_0"),
+    ]
+
+
+def test_progress_handler_ignores_skip_lookalikes(qtbot):
+    """Log lines that resemble skip lines but do not mark a frame
+    boundary must not tick: matching's from-memory variant (no
+    "for (" — the GUI never drives that path but the record could
+    appear) and mlgidbase's "No fitted peaks" hint."""
+    sink = _ProgressSink()
+    handler = _FrameProgressHandler(sink.frameProgress, total=3, op_name="run_matching")
+
+    received: list[int] = []
+    sink.frameProgress.connect(lambda d, t, o, e: received.append(d))
+
+    handler.emit(_record("No solutions was found. Try to decrease the threshold"))
+    handler.emit(_record("No fitted peaks. Use run_fitting() first."))
+    handler.emit(_record("No fitted peak 7 for entry entry_0; frame_num 2"))
+
+    assert received == []
 
 
 def test_progress_handler_caps_at_total(qtbot):

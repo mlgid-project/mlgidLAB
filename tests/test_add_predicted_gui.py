@@ -147,8 +147,13 @@ def _select_all(mw) -> list[int]:
 
 
 def _pick_oriented(mw) -> None:
-    orient = mw._sim_orient_combo
-    orient.setCurrentIndex(mw._combo_data_index(orient, (1, 1, 1)))
+    """Select the (1 1 1) orientation through the user-specified mode
+    (no matched entry exists for it in this harness)."""
+    mw._sim_orient_mode.setCurrentIndex(
+        mw._combo_data_index(mw._sim_orient_mode, "user")
+    )
+    mw._sim_hkl_edit.setText("1 1 1")
+    mw._on_sim_hkl_edited()
 
 
 def test_add_spots_restricted_scope(harness):
@@ -216,7 +221,10 @@ def test_add_spots_restricted_scope(harness):
 
 def test_add_powder_rings_matches_rings(harness):
     mw, enqueued, state = harness
-    assert mw._sim_orient_combo.currentData() == (0, 0, 0)
+    # No matched orientations -> the auto mode default is the random
+    # (powder) pattern.
+    assert mw._sim_orient_mode.currentData() == "random"
+    assert mw._sim_selected_hkl() == (0, 0, 0)
     assert _select_all(mw) == [0, 1, 2]
 
     mw._on_add_predicted_peaks()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 
 os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
 
@@ -451,27 +452,42 @@ class ProfileViewer(QWidget):
         except (RuntimeError, ValueError, OSError, KeyError):
             return
 
-        if self._selected is not None:
-            peak = self._selected
-            box_r, box_dr = peak.radius, peak.radius_width
-            box_a, box_da = peak.angle, peak.angle_width
-            a_slice = _bounds_to_slice(
-                self._angle,
-                box_a - box_da / 2.0,
-                box_a + box_da / 2.0,
+        # Polar maps legitimately hold all-NaN rows/columns — bins the
+        # detector never covers (missing wedge, gaps). ``nanmean`` of
+        # such a slice is NaN by design and pyqtgraph gaps the curve
+        # there, but numpy emits a "Mean of empty slice" RuntimeWarning
+        # for every one, spamming the console on each frame or
+        # selection change. Suppress exactly that warning, exactly here.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message="Mean of empty slice",
+                category=RuntimeWarning,
             )
-            r_slice = _bounds_to_slice(
-                self._radius,
-                box_r - box_dr / 2.0,
-                box_r + box_dr / 2.0,
-            )
-            radial_src = img[:, a_slice] if a_slice.stop > a_slice.start else img
-            angular_src = img[r_slice, :] if r_slice.stop > r_slice.start else img
-            radial = np.nanmean(radial_src, axis=1)
-            angular = np.nanmean(angular_src, axis=0)
-        else:
-            radial = np.nanmean(img, axis=1)
-            angular = np.nanmean(img, axis=0)
+            if self._selected is not None:
+                peak = self._selected
+                box_r, box_dr = peak.radius, peak.radius_width
+                box_a, box_da = peak.angle, peak.angle_width
+                a_slice = _bounds_to_slice(
+                    self._angle,
+                    box_a - box_da / 2.0,
+                    box_a + box_da / 2.0,
+                )
+                r_slice = _bounds_to_slice(
+                    self._radius,
+                    box_r - box_dr / 2.0,
+                    box_r + box_dr / 2.0,
+                )
+                radial_src = (
+                    img[:, a_slice] if a_slice.stop > a_slice.start else img
+                )
+                angular_src = (
+                    img[r_slice, :] if r_slice.stop > r_slice.start else img
+                )
+                radial = np.nanmean(radial_src, axis=1)
+                angular = np.nanmean(angular_src, axis=0)
+            else:
+                radial = np.nanmean(img, axis=1)
+                angular = np.nanmean(img, axis=0)
 
         self._radial_curve.setData(self._radius, radial)
         self._angular_curve.setData(self._angle, angular)

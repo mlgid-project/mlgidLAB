@@ -14,6 +14,7 @@ from PySide6.QtCore import (
     QCoreApplication,
     QEvent,
     QEventLoop,
+    QFileInfo,
     QMetaObject,
     QObject,
     QProcess,
@@ -35,6 +36,7 @@ from PySide6.QtGui import (
     QDragEnterEvent,
     QDropEvent,
     QFont,
+    QIcon,
     QKeySequence,
     QPainter,
     QPen,
@@ -50,6 +52,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QDockWidget,
     QFileDialog,
+    QFileIconProvider,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -80,6 +83,7 @@ from PySide6.QtWidgets import (
 )
 from silx.gui.data.DataViewerFrame import DataViewerFrame
 from silx.gui.hdf5 import Hdf5TreeModel, Hdf5TreeView
+from silx.gui.hdf5.Hdf5Node import Hdf5Node
 from silx.gui.hdf5.NexusSortFilterProxyModel import NexusSortFilterProxyModel
 
 from mlgidlab import file_model
@@ -87,6 +91,8 @@ from mlgidlab import frame_range
 from mlgidlab import manual_fit
 from mlgidlab import peak_clipboard
 from mlgidlab import update_check
+from mlgidlab.color_picker import ColorGridPopup
+from mlgidlab.controls_help import ControlsDialog
 from mlgidlab.image_viewer import (
     GIWAXSImageViewer,
     MATCHED_STYLE,
@@ -116,6 +122,7 @@ from mlgidlab.workers import (
     ConversionWorker,
     CopyWorker,
     EntryLoadWorker,
+    ImportWorker,
     PipelineWorker,
     PrefetchWorker,
 )
@@ -206,6 +213,84 @@ class _CallbackAction:
         self._redo_fn()
 
 
+class _FastFileIconProvider(QFileIconProvider):
+    """Constant-time icons for the Open dialog's file listing.
+
+    The default provider inspects every file (mime detection) to pick
+    an icon, and the platform-native dialogs go further and thumbnail
+    image files — either way a directory holding thousands of detector
+    images takes ages to become scrollable. Two cached icons keep the
+    per-entry cost at a dict lookup. Used together with
+    ``QFileDialog.Option.DontUseNativeDialog`` (the native dialog never
+    consults a Qt icon provider).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        style = QApplication.style()
+        self._dir_icon = style.standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+        self._file_icon = style.standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+
+    def icon(self, info):  # type: ignore[override]
+        if isinstance(info, QFileInfo):
+            return self._dir_icon if info.isDir() else self._file_icon
+        if info == QFileIconProvider.IconType.Folder:
+            return self._dir_icon
+        return self._file_icon
+
+
+class _ImageFileNode(Hdf5Node):
+    """Display-only file-browser row for a standalone image file.
+
+    silx's real rows fully decode the file they represent (the fabio
+    wrapper keeps the pixels alive), so listing a several-thousand-image
+    batch the normal way pinned tens of GB of RAM and ground the view
+    down — for rows whose only GUI purpose is click-to-view. This node
+    stores just the path, name and icon; ``MainWindow`` resolves clicks
+    to the matching entry-dropdown item (``_activate_image_node``) and
+    feeds the Data tab a freshly decoded frame on demand.
+
+    Modeled on silx's ``Hdf5LoadingItem`` (the other obj-less node the
+    model/view stack already handles): ``obj`` is ``None``, ``h5Class``
+    is FILE, and only name/description answer display roles. The nexus
+    sort proxy never touches ``obj`` for non-GROUP nodes, and
+    ``removeIndex``/``clear`` no-op on ``obj is None``.
+    """
+
+    def __init__(self, path: str, icon, parent=None) -> None:
+        super().__init__(parent, openedPath=path)
+        self.image_path = path
+        # What MainWindow._node_filename reads first — lets the shared
+        # session-resolution helpers treat this row like any file node.
+        self.local_filename = path
+        self._icon = icon
+        self._display_name = Path(path).name
+
+    @property
+    def obj(self):  # noqa: D401 - silx node contract
+        return None
+
+    @property
+    def h5Class(self):
+        import silx.io.utils
+
+        return silx.io.utils.H5Type.FILE
+
+    def dataName(self, role):
+        if role == Qt.ItemDataRole.DecorationRole:
+            return self._icon
+        if role == Qt.ItemDataRole.DisplayRole:
+            return self._display_name
+        if role == Qt.ItemDataRole.ToolTipRole:
+            return self.image_path
+        return None
+
+    def dataDescription(self, role):
+        if role == Qt.ItemDataRole.DisplayRole:
+            return "Image file"
+        return None
+
+
 class _MlgidHdf5TreeModel(Hdf5TreeModel):
     """Silx tree model that swaps the file-root icon for raw sessions.
 
@@ -257,6 +342,44 @@ class _MlgidHdf5TreeModel(Hdf5TreeModel):
         # PySide6. Icons just take effect on the next natural paint
         # (resize / scroll / new insert), which is good enough.
         self._raw_paths = {str(p) for p in paths}
+
+    def insertImageRow(self, path: str) -> None:
+        """Append a display-only ``_ImageFileNode`` row for ``path``.
+
+        The node needs the model root as its construction parent
+        (silx's ``insertChild`` does not re-parent); ``nodeFromIndex``
+        of the invalid index is the documented way to reach it.
+        """
+        from PySide6.QtCore import QModelIndex
+
+        root = self.nodeFromIndex(QModelIndex())
+        self.insertNode(-1, _ImageFileNode(path, self._raw_icon, parent=root))
+
+    def clear(self) -> None:  # type: ignore[override]
+        """Empty the model in ONE reset instead of silx's per-row loop.
+
+        silx's ``clear`` removes row 0 in a loop — each removal is a
+        ``beginRemoveRows`` the sort proxy and the view react to, so
+        tearing down a big image batch was quadratic and froze every
+        tree detach (session close, app exit, each pipeline run).
+        Owned h5 handles are still released per node, exactly like
+        silx's ``removeIndex`` does.
+        """
+        from PySide6.QtCore import QModelIndex
+
+        root = self.nodeFromIndex(QModelIndex())
+        self.beginResetModel()
+        try:
+            while root.childCount():
+                node = root.removeChildAtIndex(root.childCount() - 1)
+                try:
+                    self._closeFileIfOwned(node)
+                except Exception:
+                    logger.debug(
+                        "suppressed handle close in clear()", exc_info=True
+                    )
+        finally:
+            self.endResetModel()
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if (
@@ -778,6 +901,34 @@ class MainWindow(QMainWindow):
         # on the GUI thread (the walk takes seconds on a big beamtime
         # file and was the raw-open freeze).
         self._pending_raw_entry_cache: dict[str, list] = {}
+        # Raw-file rows enter the silx tree in chunks driven by a 0 ms
+        # timer instead of one synchronous loop: ``insertFile`` decodes a
+        # standalone image fully on the GUI thread, and a 1000-image batch
+        # froze the window for seconds (both on open and on every tree
+        # reattach). The queue is dropped on ``_detach_silx_tree`` — the
+        # rows belong to the model being cleared; the following reattach
+        # re-queues every session's files from scratch.
+        self._tree_insert_queue: list[str] = []
+        # Progress accounting for the status-bar "Browser: n/N files"
+        # indicator (reset whenever a fresh fill starts from an empty
+        # queue; see _queue_tree_inserts / _drain_tree_insert_queue).
+        self._tree_insert_total = 0
+        self._tree_insert_done = 0
+        self._tree_insert_timer = QTimer(self)
+        # A real (nonzero) interval: a 0 ms timer can fire several times
+        # within one event-processing pass, stacking insert chunks into
+        # a single user-visible stall. 15 ms guarantees paints and input
+        # get a slot between chunks.
+        self._tree_insert_timer.setInterval(15)
+        self._tree_insert_timer.timeout.connect(self._drain_tree_insert_queue)
+        # str(file path) → entry-combo label for the active raw session's
+        # image entries; lets a click on an ``_ImageFileNode`` browser row
+        # select its image without any scan. Rebuilt by
+        # ``_populate_raw_entries``.
+        self._raw_entry_label_by_path: dict[str, str] = {}
+        # Shared by every Open dialog; ``setIconProvider`` does not take
+        # ownership, so the provider must outlive the dialog.
+        self._file_dialog_icons = _FastFileIconProvider()
         self._thread: QThread | None = None
         self._worker: CopyWorker | None = None
         self._pipe_thread: QThread | None = None
@@ -797,6 +948,12 @@ class MainWindow(QMainWindow):
         # phase-views q-map "Color by matched phase" overlay. Empty
         # until Matching has run; cleared with the rest of the results.
         self._scan_track_phases: dict = {}
+        # {member index: [cif, ...]} — which members were actually
+        # claimed by a matched structure ON THEIR FRAME. The phase views
+        # use this to split a track's rendering at the frame where
+        # matching starts (claimed = phase colour, rest = unmatched)
+        # instead of painting the whole span with the dominant phase.
+        self._scan_member_phases: dict = {}
         # Track indices that are rings — the q-map draws them as dashed
         # quarter-circle arcs rather than trajectory points.
         self._scan_ring_tracks: set = set()
@@ -827,7 +984,6 @@ class MainWindow(QMainWindow):
         # is advanced by a GUI-thread timer (the op has no clean
         # per-frame progress — see the busy-bar note in pipeline_panel).
         self._track_progress_dialog: QProgressDialog | None = None
-        self._track_progress_timer: QTimer | None = None
         # pygid normalization is lazy (deferred off the open path). This
         # records which (temp-file, entry) pairs have already been
         # normalized so ``_ensure_entry_normalized`` runs the scoped
@@ -878,6 +1034,11 @@ class MainWindow(QMainWindow):
         self._conv_thread: QThread | None = None
         self._conv_worker: ConversionWorker | None = None
         self._conv_progress: QProgressDialog | None = None
+        # Converted-image import (File menu / float-batch offer): same
+        # thread + progress-dialog shape as the conversion run above.
+        self._import_thread: QThread | None = None
+        self._import_worker = None
+        self._import_progress: QProgressDialog | None = None
 
         # Background prefetch worker. Lives on its own QThread so it
         # can read frames + compute polar resamples without ever
@@ -1711,6 +1872,7 @@ class MainWindow(QMainWindow):
             getattr(self, "viewer", None),
             getattr(self, "profile_viewer", None),
             getattr(self, "_phase_views_window", None),
+            getattr(self, "_controls_dialog", None),
         ):
             fn = getattr(w, "apply_theme_colors", None)
             if fn is not None:
@@ -1818,8 +1980,8 @@ class MainWindow(QMainWindow):
         """Build the rightmost top-level Help menu.
 
         Three entries:
-        - **Controls & shortcuts…** — modal reference of every
-          keyboard shortcut and image-viewer interaction.
+        - **Controls & shortcuts…** — modeless, filterable reference of
+          every keyboard shortcut and mouse interaction.
         - **About mlgidLAB…** — modal "About" dialog with versions.
         - **Copy diagnostics** — clipboard-friendly env/session/log
           dump for bug reports.
@@ -1829,7 +1991,7 @@ class MainWindow(QMainWindow):
         self.action_controls.setShortcut(QKeySequence("F1"))
         self.action_controls.setToolTip(
             "Reference for every keyboard shortcut, mouse interaction, "
-            "and the manual-peak workflow."
+            "and the manual-peak workflow. Type to filter."
         )
         self.action_controls.triggered.connect(self._show_controls)
         help_menu.addAction(self.action_controls)
@@ -1894,88 +2056,22 @@ class MainWindow(QMainWindow):
         QSettings().setValue(self._AUTO_UPDATE_KEY, bool(enabled))
 
     def _show_controls(self) -> None:
-        """Modal reference for keyboard shortcuts + mouse + workflow.
-
-        Plain QMessageBox.about so we get the title bar, an OK
-        button, and rich-text rendering of the HTML body for free.
-        Three sections — keyboard, image interactions, workflow —
-        each presented as a small HTML table.
-        """
-        kbd_rows = [
-            ("←  /  →", "Previous / next frame"),
-            ("J  /  K", "Previous / next frame (Vim-style)"),
-            ("Home  /  End", "First / last frame"),
-            ("Ctrl+Z  /  Ctrl+Shift+Z (or Ctrl+Y)",
-             "Undo / redo manual + geometry edits"),
-            ("Ctrl+F", "Find peak by ID…"),
-            ("Delete", "Delete the selected peak (image viewer) / "
-             "remove the selected file (file browser)"),
-            ("Ctrl+W", "Close (remove) the active file from the browser"),
-            ("Esc", "Dismiss an in-progress manual draw"),
-            ("F1", "Show this Controls reference"),
-        ]
-        mouse_rows = [
-            ("Ctrl+Alt-drag (polar mode)",
-             "Draw a manual peak rectangle"),
-            ("Click a peak overlay",
-             "Select the peak (any kind: manual / detected / fitted / matched)"),
-            ("Drag ROI edges",
-             "Resize the selected manual / detected / fitted peak"),
-            ("LMB double-click on the image",
-             "Reset aspect to Default (per-mode shape) and refit the zoom"),
-            ("Mouse wheel on image",
-             "Zoom in / out"),
-            ("Click a row in the Peaks table",
-             "Select the corresponding peak on the image"),
-        ]
-        flow_rows = [
-            ("Manual peak workflow",
-             "Ctrl+Alt-drag to label a candidate. Commit via "
-             "<b>Add to detected</b> (box) or <b>Add to fitted</b> "
-             "(1D Gaussian fit). Click off the box to abandon it "
-             "(Ctrl+Z restores)."),
-            ("Save fitted as ring",
-             "Tick before Add to fitted to widen the angular extent "
-             "to the full sweep — only meaningful for ring peaks."),
-            ("Aspect (toolbar)",
-             "<b>Default</b> (startup) uses a per-mode shape (Cartesian "
-             "1:1, polar 2:1); <b>Fit</b> fills the panel; <b>Custom</b> "
-             "locks a width:height ratio (e.g. <code>2</code> = twice as "
-             "wide as tall). Scrolling over an axis switches to Custom and "
-             "adjusts the ratio live (x wider, y taller); double-click the "
-             "image to snap back to Default."),
-            ("Display dock filter",
-             "Type a CIF substring above the matched-structures "
-             "list to hide non-matching rows + their image overlays."),
-            ("Tools → Export figure…",
-             "Non-modal window that drives "
-             "<code>mlgidbase.plot_analysis_results</code> with a "
-             "live preview. <b>Render preview</b> updates the image; "
-             "<b>Save figure</b> writes the PNG."),
-            ("Tools → Clear peaks → Reset all peaks",
-             "Wipe detected + fitted + matched at three scopes "
-             "(active entry, all entries, active frame). Manual "
-             "peaks dropped from memory."),
-        ]
-
-        def _table(rows: list[tuple[str, str]]) -> str:
-            cells = "".join(
-                f"<tr><td style='padding-right:12px;white-space:nowrap'>"
-                f"<b>{k}</b></td><td>{v}</td></tr>"
-                for k, v in rows
+        """Modeless, filterable reference of every keyboard shortcut and
+        mouse interaction (controls_help.ControlsDialog). One cached
+        instance per window: Close hides it, so filter text, size and
+        position survive re-open; re-invoking (F1) raises + refocuses."""
+        dlg = getattr(self, "_controls_dialog", None)
+        if dlg is None:
+            dlg = ControlsDialog(
+                self, theme=getattr(self, "_current_theme", "dark")
             )
-            return f"<table>{cells}</table>"
-
-        body = (
-            "<h3>mlgidLAB — Controls &amp; shortcuts</h3>"
-            "<h4 style='margin-top:14px'>Keyboard</h4>"
-            + _table(kbd_rows) +
-            "<h4 style='margin-top:14px'>Mouse / image-viewer interactions</h4>"
-            + _table(mouse_rows) +
-            "<h4 style='margin-top:14px'>Workflow notes</h4>"
-            + _table(flow_rows)
-        )
-        QMessageBox.about(self, "Controls & shortcuts", body)
+            self._controls_dialog = dlg
+        if dlg.isMinimized():
+            dlg.showNormal()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        dlg.focus_filter()
 
     def _gather_versions(self) -> dict[str, str]:
         """Return a name → version-string map covering the modules
@@ -2533,6 +2629,18 @@ class MainWindow(QMainWindow):
         self.action_open.triggered.connect(self._action_open)
         file_menu.addAction(self.action_open)
 
+        # For q-space maps produced OUTSIDE mlgidLAB: stack N images as
+        # one scan entry in a new .h5 (no conversion runs — the pixels
+        # are already reciprocal-space). Opening float-pixel images via
+        # the regular Open also offers this flow automatically.
+        self.action_import_converted = QAction(
+            "&Import images as converted scan…", self
+        )
+        self.action_import_converted.triggered.connect(
+            self._action_import_converted
+        )
+        file_menu.addAction(self.action_import_converted)
+
         # Recent-files submenu — populated lazily on aboutToShow so the
         # missing-file filter stays accurate across sessions.
         self._recent_menu = file_menu.addMenu("Open &recent")
@@ -2617,13 +2725,32 @@ class MainWindow(QMainWindow):
         gets bubbled up to the top instead of duplicated. The list is
         capped at ``_MAX_RECENT_FILES``.
         """
-        if kind not in ("nexus", "raw"):
+        self._add_recent_files([path], kind)
+
+    def _add_recent_files(self, paths: list[str | Path], kind: str) -> None:
+        """Push a whole batch onto the recent list in ONE settings write
+        and menu rebuild.
+
+        Same net result as calling ``_add_recent_file`` per path (later
+        batch items end up higher, duplicates bubble instead of
+        repeating) — but a 1000-file batch open must not pay 1000
+        QSettings round-trips and menu rebuilds for a list capped at
+        ``_MAX_RECENT_FILES``; that loop alone froze the window for ~2 s.
+        """
+        if kind not in ("nexus", "raw") or not paths:
             return
-        path_str = str(path)
+        batch = [str(p) for p in paths]
+        # Last occurrence wins the higher slot, matching sequential
+        # move-to-front pushes.
+        fresh: list[dict] = []
+        seen: set[str] = set()
+        for p in reversed(batch):
+            if p not in seen:
+                seen.add(p)
+                fresh.append({"type": kind, "path": p})
         items = self._load_recent_files()
-        items = [i for i in items if i.get("path") != path_str]
-        items.insert(0, {"type": kind, "path": path_str})
-        items = items[: self._MAX_RECENT_FILES]
+        items = [i for i in items if i.get("path") not in seen]
+        items = (fresh + items)[: self._MAX_RECENT_FILES]
         self._save_recent_files(items)
         self._refresh_recent_files_menu()
 
@@ -3208,19 +3335,60 @@ class MainWindow(QMainWindow):
         sim_orient_row.setContentsMargins(20, 0, 0, 0)
         sim_orient_row.setSpacing(6)
         sim_orient_row.addWidget(QLabel("Orientation:"))
-        self._sim_orient_combo = QComboBox()
-        self._sim_orient_combo.setToolTip(
-            "Texture orientation (hkl) to render. 'Powder (rings)' "
-            "shows the orientation-free ring pattern; the current "
-            "frame's matched orientations are listed first."
+        self._sim_orient_mode = QComboBox()
+        self._sim_orient_mode.addItem("matched", userData="matched")
+        self._sim_orient_mode.addItem(
+            "random (powder rings)", userData="random"
         )
-        self._sim_orient_combo.currentIndexChanged.connect(
-            self._on_sim_orient_changed
+        self._sim_orient_mode.addItem(
+            "user-specified hkl", userData="user"
         )
-        sim_orient_row.addWidget(self._sim_orient_combo, 1)
+        self._sim_orient_mode.setToolTip(
+            "How to pick the texture orientation to render: 'matched' "
+            "follows the structure's matched orientation(s) on the "
+            "current frame; 'random' is the orientation-free powder "
+            "ring pattern (randomly oriented crystallites); "
+            "'user-specified' renders the (h k l) you type."
+        )
+        self._sim_orient_mode.currentIndexChanged.connect(
+            self._on_sim_orient_mode_changed
+        )
+        sim_orient_row.addWidget(self._sim_orient_mode)
+        self._sim_matched_combo = QComboBox()
+        self._sim_matched_combo.setToolTip(
+            "Matched orientation to render, labelled with its matching "
+            "probability on the current frame."
+        )
+        self._sim_matched_combo.currentIndexChanged.connect(
+            self._on_sim_matched_changed
+        )
+        sim_orient_row.addWidget(self._sim_matched_combo, 1)
+        self._sim_hkl_edit = QLineEdit()
+        self._sim_hkl_edit.setPlaceholderText("h k l   e.g. 0 0 1")
+        self._sim_hkl_edit.setToolTip(
+            "Miller indices of the orientation to render: three "
+            "integers separated by spaces or commas. Validated "
+            "against the structure's precomputed orientations; "
+            "equivalent spellings (2 2 0, 0 0 -1) resolve to the "
+            "simulated one (1 1 0, 0 0 1)."
+        )
+        self._sim_hkl_edit.editingFinished.connect(
+            self._on_sim_hkl_edited
+        )
+        self._sim_hkl_edit.setVisible(False)
+        sim_orient_row.addWidget(self._sim_hkl_edit, 1)
         sim_orient_widget = QWidget()
         sim_orient_widget.setLayout(sim_orient_row)
         sim_box.addWidget(sim_orient_widget)
+        # One-line state/validation hint under the orientation row:
+        # invalid typed hkl, equivalent-spelling note, or "no matched
+        # orientation on this frame". Hidden when there is nothing to
+        # say.
+        self._sim_orient_hint = QLabel()
+        self._sim_orient_hint.setContentsMargins(20, 0, 0, 0)
+        self._sim_orient_hint.setWordWrap(True)
+        self._sim_orient_hint.setVisible(False)
+        sim_box.addWidget(self._sim_orient_hint)
 
         sim_int_row = QHBoxLayout()
         sim_int_row.setContentsMargins(20, 0, 0, 0)
@@ -3333,6 +3501,13 @@ class MainWindow(QMainWindow):
         # labels without re-applying an unchanged pattern — re-applying
         # would drop the reflection selection.
         self._sim_applied: tuple | None = None
+        # User-typed orientation, kept only when it validated against
+        # the selected CIF's precomputed set (None = empty/invalid).
+        self._sim_user_hkl: tuple | None = None
+        # Until the user touches the mode combo, the mode follows the
+        # data: "matched" when the frame has matched orientations for
+        # the CIF, "random" (powder) otherwise — the pre-mode default.
+        self._sim_mode_auto = True
         self.viewer.matchedStructuresChanged.connect(
             self._refresh_sim_matched_entries
         )
@@ -3379,6 +3554,9 @@ class MainWindow(QMainWindow):
         )
         self.pipeline_panel.set_active_frame_resolver(
             lambda: self.viewer.current_frame if self.session is not None else None
+        )
+        self.pipeline_panel.set_frame_count_resolver(
+            lambda: self.viewer.n_frames if self.session is not None else None
         )
         self.pipeline_panel.runRequested.connect(self._on_run_requested)
         self.pipeline_panel.parseCifsRequested.connect(self._on_parse_cifs_requested)
@@ -3536,6 +3714,9 @@ class MainWindow(QMainWindow):
         )
         self.scan_tracking_panel.interpolateRequested.connect(
             self._on_interpolate_tracks_requested
+        )
+        self.scan_tracking_panel.trackDeleteRequested.connect(
+            self._on_scan_track_deleted
         )
         # Image -> table sync: selecting a fitted peak anywhere (image
         # click or Peaks-dock row) highlights its cross-frame track row
@@ -3727,33 +3908,214 @@ class MainWindow(QMainWindow):
         bundled into a single shared ``RawSession`` matching the old
         Open-raw bulk behaviour. Files that match neither classifier
         are reported in the log and skipped.
+
+        Uses Qt's widget dialog instead of the platform-native one ON
+        PURPOSE: native pickers preview/thumbnail image files, so a
+        beamtime directory holding thousands of detector TIFFs takes
+        ages to even become scrollable. The widget dialog with the
+        constant-time ``_FastFileIconProvider`` lists such directories
+        instantly (and follows the app theme). The last-visited
+        directory persists across sessions via QSettings — the static
+        native dialog used to remember it only per-run.
         """
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "Open file(s)", "", OPEN_FILTER
-        )
+        dlg = QFileDialog(self, "Open file(s)")
+        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dlg.setFileMode(QFileDialog.FileMode.ExistingFiles)
+        dlg.setNameFilter(OPEN_FILTER)
+        dlg.setIconProvider(self._file_dialog_icons)
+        last_dir = str(QSettings().value("open/last_dir", "") or "")
+        if last_dir:
+            dlg.setDirectory(last_dir)
+        if not dlg.exec():
+            return
+        paths = dlg.selectedFiles()
         if not paths:
             return
+        QSettings().setValue(
+            "open/last_dir", dlg.directory().absolutePath()
+        )
         self._open_paths([Path(p) for p in paths])
+
+    def _action_import_converted(self) -> None:
+        """File → Import images as converted scan… — explicit entry
+        point (the escape hatch when the float-dtype auto-offer guessed
+        wrong or the user starts from the menu)."""
+        dlg = QFileDialog(self, "Import images as converted scan")
+        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dlg.setFileMode(QFileDialog.FileMode.ExistingFiles)
+        dlg.setNameFilter("Detector images (*.tif *.tiff *.cbf *.edf)")
+        dlg.setIconProvider(self._file_dialog_icons)
+        last_dir = str(QSettings().value("open/last_dir", "") or "")
+        if last_dir:
+            dlg.setDirectory(last_dir)
+        if not dlg.exec():
+            return
+        paths = [Path(p) for p in dlg.selectedFiles()]
+        if not paths:
+            return
+        QSettings().setValue(
+            "open/last_dir", dlg.directory().absolutePath()
+        )
+        self._run_import_dialog(paths)
+
+    def _run_import_dialog(self, paths: list[Path]) -> None:
+        """Collect import parameters, then write the stack off-thread.
+
+        Frames are stacked in natural filename order (img_2 before
+        img_10) regardless of selection order, matching the folder-open
+        convention. The finished .h5 auto-opens through the normal open
+        queue, so it lands as a regular NeXus session with the frame
+        slider active.
+        """
+        from mlgidlab.import_dialog import ImportConvertedDialog
+
+        paths = sorted(paths, key=_natural_key)
+        dialog = ImportConvertedDialog(
+            paths, parent=self, icon_provider=self._file_dialog_icons
+        )
+        if not dialog.exec():
+            return
+        values = dialog.values()
+        if self._import_thread is not None:
+            QMessageBox.information(
+                self, "Import in progress",
+                "An image import is already running; wait for it to "
+                "finish first.",
+            )
+            return
+
+        self._import_progress = QProgressDialog(
+            "Importing images…", "", 0, len(paths), self
+        )
+        self._import_progress.setWindowTitle(APP_NAME)
+        self._import_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._import_progress.setCancelButton(None)
+        self._import_progress.setMinimumDuration(0)
+        self._import_progress.setLabelText(
+            f"Stacking {len(paths)} image(s) into "
+            f"{values['out_path'].name}…"
+        )
+        self._import_progress.show()
+
+        self._import_thread = QThread(self)
+        self._import_worker = ImportWorker(
+            paths,
+            values["out_path"],
+            values["entry_name"],
+            values["qxy_range"],
+            values["qz_range"],
+            values["ai"],
+            values["flip_vertical"],
+            values["wavelength_A"],
+        )
+        self._import_worker.moveToThread(self._import_thread)
+        self._import_thread.started.connect(self._import_worker.run)
+        self._import_worker.progress.connect(self._on_import_progress)
+        self._import_worker.finished.connect(self._on_import_finished)
+        self._import_thread.start()
+
+    def _on_import_progress(self, done: int, total: int) -> None:
+        if self._import_progress is None:
+            return
+        self._import_progress.setMaximum(max(total, 1))
+        self._import_progress.setValue(done)
+
+    def _on_import_finished(
+        self, out_path: Path | None, error: Exception | None
+    ) -> None:
+        if self._import_thread is not None:
+            self._import_thread.quit()
+            self._import_thread.wait()
+            self._import_thread.deleteLater()
+            self._import_thread = None
+        if self._import_worker is not None:
+            self._import_worker.deleteLater()
+            self._import_worker = None
+        if self._import_progress is not None:
+            self._import_progress.close()
+            self._import_progress.deleteLater()
+            self._import_progress = None
+        if error is not None:
+            self.conversion_panel.append_log(f"Import failed: {error}")
+            QMessageBox.critical(self, "Import failed", str(error))
+            return
+        if out_path is None:
+            return
+        self.conversion_panel.append_log(
+            f"Imported converted image stack → {out_path}"
+        )
+        # Same auto-open flow as a finished conversion: the file opens
+        # as a regular NeXus session (temp working copy + frame slider).
+        self._open_queue.append(Path(out_path))
+        self._process_open_queue()
+
+    def _offer_import_for_float_images(self, paths: list[Path]) -> bool:
+        """Offer the import flow when an image batch looks converted.
+
+        Raw detector frames are integer counts; interpolated q-space
+        maps are float-valued — one cheap decode of the FIRST file
+        decides. Returns True when the batch was consumed here (import
+        started or user cancelled), False to continue opening as raw.
+        A wrong guess costs one click either way; the File menu action
+        covers float-blind sources.
+        """
+        try:
+            import fabio
+
+            file_model._quiet_fabio()
+            dtype = np.asarray(fabio.open(str(paths[0])).data).dtype
+        except Exception:
+            logger.debug("suppressed dtype probe in import offer", exc_info=True)
+            return False
+        if dtype.kind != "f":
+            return False
+        box = QMessageBox(self)
+        box.setWindowTitle("Import as converted scan?")
+        box.setText(
+            f"The {len(paths)} selected image file(s) hold floating-"
+            "point pixels — typically already-converted q-space maps, "
+            "not raw detector counts.\n\nImport them as ONE scan "
+            "(N frames, saved to a new .h5 file), or open them as raw "
+            "detector images?"
+        )
+        import_btn = box.addButton(
+            "Import as one scan…", QMessageBox.ButtonRole.AcceptRole
+        )
+        raw_btn = box.addButton(
+            "Open as raw images", QMessageBox.ButtonRole.ActionRole
+        )
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is import_btn:
+            self._run_import_dialog(paths)
+            return True
+        if clicked is raw_btn:
+            return False
+        return True
 
     def _open_paths(self, paths: list[Path]) -> None:
         """Open a mixed batch of NeXus + raw files, classifying each in the
         background.
 
-        The Open click is instant: existing paths are queued and the
-        worker is started immediately (with the bottom-left loading bar).
-        Each ``CopyWorker`` classifies its file off the GUI thread and, for
-        NeXus, copies + pre-warms it. NeXus files install as they finish;
-        raw and unclassifiable files are collected and handled once the
-        queue drains (``_finalize_open_batch`` — raw bundles into one
+        The Open click is instant: existing paths are queued and
+        processed immediately (with the bottom-left loading bar).
+        Standalone images classify inline (extension check, see
+        ``_process_open_queue``); every other file gets a ``CopyWorker``
+        that classifies it off the GUI thread and, for NeXus, copies +
+        pre-warms it. NeXus files install as they finish; raw and
+        unclassifiable files are collected and handled once the queue
+        drains (``_finalize_open_batch`` — raw bundles into one
         ``RawSession`` so the Conversion panel applies one config to the
         batch). Used by both File → Open and the drag-and-drop handler.
         """
         queued = False
         for p in paths:
             if p.is_dir():
-                # A dropped/opened folder becomes ONE image stack: its fabio
-                # images in natural filename order (so img_2 precedes img_10).
-                # Folders without any image files are reported as rejected.
+                # A dropped/opened folder contributes its fabio images in
+                # natural filename order (so img_2 precedes img_10); they
+                # bundle into one raw session with one 1-frame entry per
+                # image. Folders without any image files are rejected.
                 imgs = sorted(
                     (
                         q
@@ -3799,11 +4161,22 @@ class MainWindow(QMainWindow):
     def _process_open_queue(self) -> None:
         """Kick off the next queued open if no copy is in flight.
 
+        Standalone image files (TIFF/CBF/EDF) classify right here on the
+        GUI thread: the check is the same pure extension test CopyWorker
+        would run (workers.py short-circuits them before any I/O), so
+        spinning up a QThread per image only added churn — at 1000
+        images the spawn/teardown cycles alone took over a second.
+        Everything else still classifies off the GUI thread in a
+        CopyWorker. Batch order is preserved: image runs drain inline,
+        and each worker finish re-enters this method for the next run.
+
         When the queue is exhausted the batch is finalized (raw files
         bundled, rejects logged, loading bar hidden).
         """
         if self._thread is not None:
             return
+        while self._open_queue and file_model.is_fabio_image(self._open_queue[0]):
+            self._pending_raw_paths.append(self._open_queue.pop(0))
         if not self._open_queue:
             self._finalize_open_batch()
             return
@@ -3832,19 +4205,26 @@ class MainWindow(QMainWindow):
             self._pending_raw_paths = []
             entry_cache = self._pending_raw_entry_cache
             self._pending_raw_entry_cache = {}
+            # A pure-image batch with float pixels is most likely
+            # already-converted q-space maps — offer the import-as-scan
+            # flow before committing to a raw session (user decision
+            # 2026-07-30: auto-detect via dtype with a one-click out).
+            if all(file_model.is_fabio_image(p) for p in raw_paths):
+                if self._offer_import_for_float_images(raw_paths):
+                    return
             try:
                 session = RawSession.open(raw_paths)
             except Exception as exc:
                 QMessageBox.critical(self, "Open failed", str(exc))
             else:
                 session._raw_entries_cache = entry_cache  # type: ignore[attr-defined]
-                model = self.tree.findHdf5TreeModel()
-                for raw_path in session.raw_paths:
-                    model.insertFile(str(raw_path))
+                # Chunked, not a synchronous loop: rows appear in the
+                # browser progressively while the first entry already
+                # renders (see _queue_tree_inserts).
+                self._queue_tree_inserts([str(p) for p in session.raw_paths])
                 self._sessions.append(session)
                 self._set_active_session(session)
-                for raw_path in session.raw_paths:
-                    self._add_recent_file(raw_path, "raw")
+                self._add_recent_files(session.raw_paths, "raw")
                 self._refresh_tree_raw_paths()
 
     def _show_open_progress(self, name: str) -> None:
@@ -4473,6 +4853,93 @@ class MainWindow(QMainWindow):
 
     # -- silx tree helpers --
 
+    # Per-tick bounds for chunked silx-tree inserts. The time budget
+    # covers the slow case: one ``insertFile`` costs ~13 ms for a warm
+    # ~10 MB image and is I/O-bound on cold or network storage, so a
+    # count alone could stall the GUI there. The count bound covers the
+    # fast case: display-only ``_ImageFileNode`` rows insert in
+    # microseconds, but the VIEW pays a relayout per event pass that
+    # scales with how many rows arrived — thousands in one tick caused
+    # a ~0.5 s hiccup that the insert loop itself never saw.
+    _TREE_INSERT_BUDGET_S = 0.05
+    _TREE_INSERT_MAX_PER_TICK = 250
+    # Show the "Browser: n/N files" status indicator only for batches at
+    # least this big — a handful of rows lands within one tick and the
+    # bar would just flicker.
+    _TREE_PROGRESS_MIN = 10
+
+    def _queue_tree_inserts(self, paths: list[str]) -> None:
+        """Append ``paths`` to the chunked silx-tree insert queue.
+
+        Rows appear progressively in queue order while the event loop
+        keeps breathing; see the queue's comment in ``__init__`` for why
+        a synchronous loop is not an option for image batches.
+        """
+        if not paths:
+            return
+        if not self._tree_insert_queue:
+            # Fresh fill — restart the progress accounting.
+            self._tree_insert_total = 0
+            self._tree_insert_done = 0
+        self._tree_insert_queue.extend(paths)
+        self._tree_insert_total += len(paths)
+        self._update_tree_insert_progress()
+        if not self._tree_insert_timer.isActive():
+            self._tree_insert_timer.start()
+
+    def _update_tree_insert_progress(self) -> None:
+        """Sync the status-bar browser-fill indicator with the counters."""
+        if not hasattr(self, "_sb_tree_label"):
+            # Status bar not built yet (init-order safety).
+            return
+        total = self._tree_insert_total
+        if not self._tree_insert_queue or total < self._TREE_PROGRESS_MIN:
+            self._sb_tree_label.hide()
+            self._sb_tree_bar.hide()
+            self._sb_tree_label.setText("")
+            return
+        done = self._tree_insert_done
+        self._sb_tree_label.setText(f"Browser: {done}/{total} files")
+        self._sb_tree_bar.setValue(int(done * 100 / total))
+        if not self._sb_tree_bar.isVisible():
+            self._sb_tree_label.show()
+            self._sb_tree_bar.show()
+
+    def _drain_tree_insert_queue(self) -> None:
+        """Insert queued files into the silx tree for one time budget.
+
+        Standalone images become display-only ``_ImageFileNode`` rows
+        (never decoded); everything else goes through silx's real
+        ``insertFile``. At least one file per tick (guaranteed
+        progress); each insert is independent — one unreadable file is
+        logged and skipped so it doesn't strand the rest of the batch.
+        """
+        model = self.tree.findHdf5TreeModel()
+        deadline = time.monotonic() + self._TREE_INSERT_BUDGET_S
+        inserted = 0
+        while self._tree_insert_queue:
+            p = self._tree_insert_queue.pop(0)
+            try:
+                if file_model.is_fabio_image(p):
+                    model.insertImageRow(p)
+                else:
+                    model.insertFile(p)
+            except Exception:
+                logger.debug(
+                    "suppressed insert in _drain_tree_insert_queue",
+                    exc_info=True,
+                )
+            inserted += 1
+            self._tree_insert_done += 1
+            if (
+                inserted >= self._TREE_INSERT_MAX_PER_TICK
+                or time.monotonic() >= deadline
+            ):
+                break
+        self._update_tree_insert_progress()
+        if not self._tree_insert_queue:
+            self._tree_insert_timer.stop()
+
     def _detach_silx_tree(self) -> None:
         """Release silx's read handles + the viewer's FrameSource handle.
 
@@ -4489,6 +4956,11 @@ class MainWindow(QMainWindow):
         doesn't strand the detach half-done — the next reattach
         rebuilds the model from scratch anyway.
         """
+        # Pending chunked inserts target the model being cleared; drop
+        # them (the reattach re-queues every session's files anyway).
+        self._tree_insert_queue.clear()
+        self._tree_insert_timer.stop()
+        self._update_tree_insert_progress()
         try:
             self.tree.findHdf5TreeModel().clear()
         except Exception:
@@ -4539,17 +5011,24 @@ class MainWindow(QMainWindow):
         the model. The viewer's FrameSource is reopened so subsequent
         frame reads can stream from disk again.
 
+        NeXus temp copies insert synchronously (cheap shallow h5 open,
+        and callers may select their nodes right after the reattach).
+        Raw inputs go through the chunked queue instead: ``insertFile``
+        decodes a standalone image fully on the GUI thread, so a raw
+        session holding a big image batch would otherwise freeze the
+        window on EVERY reattach (each pipeline run / save detaches).
+
         Each ``insertFile`` is independent — one bad path doesn't
         strand the rest. silx returns a node reference on success and
         raises ``OSError`` on a missing/corrupt file; either way we
         continue with the next session.
         """
         model = self.tree.findHdf5TreeModel()
+        raw_batch: list[str] = []
         for s in self._sessions:
             try:
                 if isinstance(s, RawSession):
-                    for raw_path in s.raw_paths:
-                        model.insertFile(str(raw_path))
+                    raw_batch.extend(str(p) for p in s.raw_paths)
                 else:
                     model.insertFile(str(s.temp_path))
             except Exception:
@@ -4557,6 +5036,8 @@ class MainWindow(QMainWindow):
                 # will see the missing entry; rebuild at next detach.
                 logger.debug("suppressed exception in MainWindow._reattach_silx_tree", exc_info=True)
                 pass
+        if raw_batch:
+            self._queue_tree_inserts(raw_batch)
         self._refresh_tree_raw_paths()
         self.viewer.acquire_frame_source()
 
@@ -4654,6 +5135,7 @@ class MainWindow(QMainWindow):
         # Maintain a mapping from combo label → RawEntry so the change
         # handler can resolve a click without re-walking the HDF5 file.
         self._raw_entries: dict[str, file_model.RawEntry] = {}
+        self._raw_entry_label_by_path = {}
         labels: list[str] = []
         panel_inputs: list[tuple[Path, list[file_model.RawEntry]]] = []
         # Per-file entry lists are cached on the session: CopyWorker fills
@@ -4663,8 +5145,8 @@ class MainWindow(QMainWindow):
         # file's metadata every time the user switches back to the session.
         cache: dict[str, list] = getattr(self.session, "_raw_entries_cache", None) or {}
         # Standalone image files (TIFF/CBF/EDF) are read via fabio, not the
-        # h5 detector walk; they bundle into ONE stack entry below. Keep the
-        # HDF5 raw-walk path exactly as before for the rest.
+        # h5 detector walk; they become one 1-frame entry per file below.
+        # Keep the HDF5 raw-walk path exactly as before for the rest.
         fabio_paths = [p for p in self.session.raw_paths if file_model.is_fabio_image(p)]
         h5_paths = [p for p in self.session.raw_paths if not file_model.is_fabio_image(p)]
         for raw_path in h5_paths:
@@ -4698,6 +5180,11 @@ class MainWindow(QMainWindow):
                     self._raw_entries[entry.label] = entry
                     labels.append(entry.label)
                     panel_inputs.append((entry.file_path, [entry]))
+                    # Browser click-to-view: an _ImageFileNode row
+                    # resolves to its combo label through this map.
+                    self._raw_entry_label_by_path[str(entry.file_path)] = (
+                        entry.label
+                    )
         # Push the same data into the Conversion panel for its selection
         # tree. Done before populating the combo so the panel paint
         # happens once on activation.
@@ -5333,7 +5820,49 @@ class MainWindow(QMainWindow):
             self._reattach_silx_tree()
             return []
 
+    def _selected_image_node(self) -> _ImageFileNode | None:
+        """The selected ``_ImageFileNode`` browser row, if any.
+
+        silx's ``selectedH5Nodes`` yields only real ``Hdf5Item``s, so
+        display-only image rows need this direct item-role probe.
+        """
+        try:
+            for index in self.tree.selectedIndexes():
+                if index.column() != 0:
+                    continue
+                item = self.tree.model().data(
+                    index, Hdf5TreeModel.H5PY_ITEM_ROLE
+                )
+                if isinstance(item, _ImageFileNode):
+                    return item
+        except Exception:
+            logger.debug(
+                "suppressed exception in _selected_image_node", exc_info=True
+            )
+        return None
+
+    def _activate_image_node(self, node: _ImageFileNode) -> None:
+        """Show the clicked image row's file in the viewer.
+
+        Mirrors what clicking an ``entry_*`` group does for NeXus files:
+        promote the owning session if needed, then select the image's
+        entry in the combo (the combo change triggers the async load).
+        """
+        session = self._session_for_path(node.image_path)
+        if session is not None and session is not self._active_session:
+            self._set_active_session(session)
+        label = self._raw_entry_label_by_path.get(node.image_path)
+        if label is None:
+            return
+        if self.entry_combo.currentText() != label:
+            self.entry_combo.setCurrentText(label)
+
     def _on_tree_selection_changed(self, *_: object) -> None:
+        image_node = self._selected_image_node()
+        if image_node is not None:
+            self._activate_image_node(image_node)
+            self._set_or_defer_data_node(image_node)
+            return
         nodes = self._safe_selected_h5_nodes()
         if not nodes:
             return
@@ -5363,6 +5892,12 @@ class MainWindow(QMainWindow):
         self._set_or_defer_data_node(node)
 
     def _on_tree_activated(self, *_: object) -> None:
+        image_node = self._selected_image_node()
+        if image_node is not None:
+            self._activate_image_node(image_node)
+            self.tabs.setCurrentWidget(self.data_viewer)
+            self._set_data_node(image_node)
+            return
         nodes = self._safe_selected_h5_nodes()
         if not nodes:
             return
@@ -5385,10 +5920,22 @@ class MainWindow(QMainWindow):
 
     def _set_data_node(self, node) -> None:
         """Push ``node`` into the silx Data viewer, guarded so a slow / bad
-        external-link resolve can't propagate out of a tree click."""
+        external-link resolve can't propagate out of a tree click.
+
+        Display-only image rows carry no h5 object — decode the file
+        now (one frame, on demand) and hand the array to the viewer.
+        """
         self._pending_data_node = None
         try:
-            self.data_viewer.setData(node)
+            if isinstance(node, _ImageFileNode):
+                import fabio
+
+                file_model._quiet_fabio()
+                self.data_viewer.setData(
+                    np.asarray(fabio.open(node.image_path).data)
+                )
+            else:
+                self.data_viewer.setData(node)
         except Exception:
             logger.debug(
                 "suppressed exception in MainWindow._set_data_node", exc_info=True
@@ -5544,20 +6091,28 @@ class MainWindow(QMainWindow):
             target = fname.resolve()
         except OSError:
             target = fname
+        return self._session_for_path(str(target))
+
+    def _session_for_path(self, target: str) -> BaseSession | None:
+        """Session owning the (resolved) filesystem path ``target``.
+
+        Raw sessions match through their cached ``raw_path_strs`` set —
+        a raw batch can hold thousands of files, and the previous
+        per-click loop re-resolved every one of them (thousands of
+        syscall chains per browser click). NeXus sessions own exactly
+        one file (the temp working copy), resolved here per session.
+        """
         for s in self._sessions:
-            # Raw sessions own multiple files in the tree; any of them
-            # maps back to the same RawSession. NeXus sessions own
-            # exactly one file (the temp working copy).
             if isinstance(s, RawSession):
-                candidate_paths = list(s.raw_paths)
+                if target in s.raw_path_strs:
+                    return s
             else:
-                candidate_paths = [s.temp_path]
-            for candidate in candidate_paths:
+                candidate = s.temp_path
                 try:
-                    candidate_resolved = candidate.resolve()
+                    candidate = candidate.resolve()
                 except OSError:
-                    candidate_resolved = candidate
-                if candidate_resolved == target:
+                    pass
+                if str(candidate) == target:
                     return s
         return None
 
@@ -5584,10 +6139,16 @@ class MainWindow(QMainWindow):
         the selection can't be mapped to a live session (e.g. a stale or
         orphan node), mirroring how a no-active-session Close no-ops.
         """
-        nodes = self._safe_selected_h5_nodes()
-        if not nodes:
-            return
-        session = self._session_for_node(nodes[0])
+        image_node = self._selected_image_node()
+        if image_node is not None:
+            # An image row belongs to its whole raw batch — same as
+            # deleting any other raw file row of that session.
+            session = self._session_for_path(image_node.image_path)
+        else:
+            nodes = self._safe_selected_h5_nodes()
+            if not nodes:
+                return
+            session = self._session_for_node(nodes[0])
         if session is None:
             return
         if not self._confirm_discard_changes(session):
@@ -6304,6 +6865,44 @@ class MainWindow(QMainWindow):
             self._entry_queue_pos = 0
             self._enqueue_pipeline(file_path, command)
 
+    def _entry_missing_geometry(
+        self, file_path: Path, entry: str | None
+    ) -> bool:
+        """True for an IMPORTED entry, which never has detector geometry.
+
+        Keyed on the ``process/mlgidlab`` provenance group that only
+        ``import_converted_stack`` writes, plus the actually-missing
+        ``instrument/detector/distance`` — NOT on missing geometry
+        alone: minimal or foreign mlgid files (test fixtures included)
+        may lack the detector group too, and those must keep the
+        pre-existing behavior of letting pygid report its own error.
+        With no explicit entry the first entry decides (all-entries
+        commands run on files whose entries share one provenance).
+        Unreadable files return False for the same reason.
+        """
+        import h5py
+
+        try:
+            with h5py.File(file_path, "r") as f:
+                names = (
+                    [entry] if entry else file_model.entry_group_names(f)[:1]
+                )
+                for name in names:
+                    if name not in f:
+                        continue
+                    g = f[name]
+                    if (
+                        "process/mlgidlab" in g
+                        and "instrument/detector/distance" not in g
+                    ):
+                        return True
+        except Exception:
+            logger.debug(
+                "suppressed geometry probe in _entry_missing_geometry",
+                exc_info=True,
+            )
+        return False
+
     def _enqueue_pipeline(self, file_path: Path, command: PipelineCommand) -> None:
         """Queue ``(file_path, command)`` and start it if no run is in flight."""
         self._pipeline_queue.append((file_path, command))
@@ -6351,6 +6950,24 @@ class MainWindow(QMainWindow):
 
     def _on_pipeline_run(self, file_path: Path, command: PipelineCommand) -> None:
         if self.session is None or self._pipe_thread is not None:
+            return
+
+        # Imported image scans carry no detector geometry — pygid's
+        # nexus loader hard-reads instrument/detector/* and the
+        # monochromator wavelength for EVERY op, so refuse with a clear
+        # message instead of surfacing a KeyError traceback.
+        if self._entry_missing_geometry(file_path, command.kwargs.get("entry")):
+            self.pipeline_panel.append_log(
+                f"--- {command.op_name} skipped: this scan was imported "
+                "from pre-converted images without q ranges and a "
+                "wavelength, so no usable geometry exists. Re-import "
+                "the images with both filled in (File → Import images "
+                "as converted scan…) to enable "
+                "detection/fitting/matching. ---"
+            )
+            # Continue the queue without recursing (a multi-entry batch
+            # would otherwise nest one stack frame per skipped entry).
+            QTimer.singleShot(0, self._run_next_pipeline_command)
             return
 
         # Stop frame playback if it's running — the pipeline owns the
@@ -8441,6 +9058,10 @@ class MainWindow(QMainWindow):
         entry = self.entry_combo.currentText()
         if not entry:
             return
+        # No memory pre-flight here: pipeline.execute routes oversized
+        # scans to phase_tracking.track_peaks_blocked (same result,
+        # bounded memory) instead of upstream's dense IoU, so tracking
+        # is safe at any scan size.
         self._entry_queue_total = 1
         self._entry_queue_pos = 0
         self._show_tracking_progress()
@@ -8461,17 +9082,18 @@ class MainWindow(QMainWindow):
 
         track_peaks is one opaque mlgidBASE call with no clean per-frame
         progress (its cost is the file open + IoU/graph, not the reads),
-        so a GUI-thread ``QTimer`` advances the bar asymptotically toward
-        ~95% while the worker runs; ``_close_tracking_progress`` snaps it
-        to 100% on finish. ``setMinimumDuration(0)`` + explicit ``show``
-        defeat QProgressDialog's default 4 s show delay (longer than the
-        whole run).
+        so the default mode is an indeterminate busy marquee — honest
+        motion for the whole run. (An earlier fake timer crept to 95%
+        within seconds and then sat there for the rest of the run,
+        which read as a frozen bar on long scans.)
+        ``setMinimumDuration(0)`` + explicit ``show`` defeat
+        QProgressDialog's default 4 s show delay.
 
-        ``manual=True`` skips the fake timer entirely: the caller drives
-        the bar with REAL progress values (the Interpolate-track chain
-        feeds it the workers' per-frame ``frameProgress`` ticks via
-        ``_on_pipeline_frame_progress``, so the dialog and the Pipeline
-        panel's bar agree instead of the dialog idling at ~95%)."""
+        ``manual=True`` keeps the determinate 0..100 bar: the caller
+        drives it with REAL progress values (the Interpolate-track
+        chain feeds it the workers' per-frame ``frameProgress`` ticks
+        via ``_on_pipeline_frame_progress``, so the dialog and the
+        Pipeline panel's bar agree)."""
         self._close_tracking_progress()
         dlg = QProgressDialog(self)
         dlg.setWindowTitle("Peak tracking")
@@ -8483,35 +9105,20 @@ class MainWindow(QMainWindow):
         dlg.setAutoClose(False)
         dlg.setAutoReset(False)
         dlg.setValue(0)
+        if not manual:
+            dlg.setRange(0, 0)             # 0..0 == busy marquee
         dlg.show()
         self._track_progress_dialog = dlg
-        if manual:
-            return
-
-        timer = QTimer(self)
-        timer.setInterval(80)
-
-        def _tick() -> None:
-            v = dlg.value()
-            if v < 95:
-                dlg.setValue(v + max(1, int((95 - v) * 0.06)))
-
-        timer.timeout.connect(_tick)
-        timer.start()
-        self._track_progress_timer = timer
 
     def _close_tracking_progress(self) -> None:
-        if self._track_progress_timer is not None:
-            self._track_progress_timer.stop()
-            self._track_progress_timer.deleteLater()
-            self._track_progress_timer = None
         # Detach the attribute FIRST: setValue on a window-modal
         # QProgressDialog runs processEvents(), so re-entrant handlers
         # (frameProgress, opFinished) must already see "no dialog".
         dlg = self._track_progress_dialog
         self._track_progress_dialog = None
         if dlg is not None:
-            dlg.setValue(100)
+            if dlg.maximum() > 0:
+                dlg.setValue(100)
             dlg.close()
             dlg.deleteLater()
 
@@ -8573,6 +9180,9 @@ class MainWindow(QMainWindow):
         self._scan_track_phases = phase_tracking.match_tracks_to_structures(
             payload, ids, matched_tables
         )
+        self._scan_member_phases = phase_tracking.member_matched_phases(
+            payload, ids, matched_tables
+        )
         # Pre-assign overlay colours for every matched identity (sorted,
         # so the assignment is deterministic no matter which frame is
         # rendered first).
@@ -8582,7 +9192,9 @@ class MainWindow(QMainWindow):
             for s in structs
         })
         self.viewer.seed_matched_colors(all_keys)
-        self.scan_tracking_panel.set_payload(payload, ids)
+        self.scan_tracking_panel.set_payload(
+            payload, ids, self._scan_track_phases
+        )
         # Re-apply the show-only-tracked overlay filter against the
         # fresh membership (or lift it if the box is unticked).
         self._push_tracked_filter()
@@ -8590,9 +9202,14 @@ class MainWindow(QMainWindow):
             self._phase_views_window.set_context(
                 self.session.temp_path, entry, self.viewer.n_frames
             )
+            # Colours BEFORE the phase mapping (same order as window
+            # open): the freshly seeded palette must be in place when
+            # set_track_phases builds the colour map.
+            self._push_phase_color_overrides()
             self._phase_views_window.set_payload(payload)
             self._phase_views_window.set_ring_tracks(self._scan_ring_tracks)
             self._phase_views_window.set_track_phases(self._scan_track_phases)
+            self._phase_views_window.set_member_phases(self._scan_member_phases)
 
     def _compute_ring_tracks(self, payload, ids, tables) -> set:
         """Set of track indices whose members are rings (checked via the
@@ -8676,6 +9293,7 @@ class MainWindow(QMainWindow):
         self._scan_member_ids = None
         self._scan_fitted_tables = {}
         self._scan_track_phases = {}
+        self._scan_member_phases = {}
         self._scan_ring_tracks = set()
         self._scan_track_entry = None
         # A gap-fill run in flight references the payload being dropped
@@ -8710,9 +9328,13 @@ class MainWindow(QMainWindow):
                 self._phase_views_window.set_context(
                     self.session.temp_path, entry, self.viewer.n_frames
                 )
+        # Custom structure colours land BEFORE the phase mapping so the
+        # first colour build already honours them (no palette flash).
+        self._push_phase_color_overrides()
         self._phase_views_window.set_payload(self._scan_payload)
         self._phase_views_window.set_ring_tracks(self._scan_ring_tracks)
         self._phase_views_window.set_track_phases(self._scan_track_phases)
+        self._phase_views_window.set_member_phases(self._scan_member_phases)
         self._phase_views_window.show()
         self._phase_views_window.raise_()
         self._phase_views_window.activateWindow()
@@ -9126,8 +9748,49 @@ class MainWindow(QMainWindow):
         self._scan_track_phases = phase_tracking.match_tracks_to_structures(
             payload, self._scan_member_ids, matched_tables
         )
+        self._scan_member_phases = phase_tracking.member_matched_phases(
+            payload, self._scan_member_ids, matched_tables
+        )
         self.scan_tracking_panel.set_payload(
-            payload, self._scan_member_ids
+            payload, self._scan_member_ids, self._scan_track_phases
+        )
+        self._push_tracked_filter()
+        if self._phase_views_window is not None:
+            self._phase_views_window.set_payload(payload)
+            self._phase_views_window.set_ring_tracks(self._scan_ring_tracks)
+            self._phase_views_window.set_track_phases(self._scan_track_phases)
+            self._phase_views_window.set_member_phases(self._scan_member_phases)
+        self.statusBar().showMessage(
+            f"Interpolate track: filled {appended} gap peak(s) "
+            f"(fitted + matched) across {len(affected)} frame(s).",
+            8000,
+        )
+
+    def _on_scan_track_deleted(self, track: int) -> None:
+        """Remove one track from the tracking results (Delete key).
+
+        Display-state only: the track disappears from the table, the
+        views, the only-tracked whitelist and the phase colouring —
+        no fitted peaks are deleted from the file. Track-indexed
+        derived state (ring set, phase map) is remapped since indices
+        above the removed track shift down by one; member-indexed
+        state (member_ids, fitted tables) is untouched.
+        """
+        payload = self._scan_payload
+        track = int(track)
+        if payload is None or not (0 <= track < payload.n_tracks):
+            return
+        del payload.components[track]
+        self._scan_ring_tracks = {
+            (k - 1 if k > track else k)
+            for k in self._scan_ring_tracks if k != track
+        }
+        self._scan_track_phases = {
+            (k - 1 if k > track else k): v
+            for k, v in self._scan_track_phases.items() if k != track
+        }
+        self.scan_tracking_panel.set_payload(
+            payload, self._scan_member_ids, self._scan_track_phases
         )
         self._push_tracked_filter()
         if self._phase_views_window is not None:
@@ -9135,9 +9798,9 @@ class MainWindow(QMainWindow):
             self._phase_views_window.set_ring_tracks(self._scan_ring_tracks)
             self._phase_views_window.set_track_phases(self._scan_track_phases)
         self.statusBar().showMessage(
-            f"Interpolate track: filled {appended} gap peak(s) "
-            f"(fitted + matched) across {len(affected)} frame(s).",
-            8000,
+            f"Track {track} removed from the tracking results "
+            f"(display only — no peaks were deleted from the file).",
+            6000,
         )
 
     def _on_phase_view_frame_jump(self, frame: int) -> None:
@@ -9160,6 +9823,30 @@ class MainWindow(QMainWindow):
         payload = self._scan_payload
         entry = self._scan_track_entry
         if payload is None or not entry:
+            return
+        # This path reruns UPSTREAM track_peaks (its matplotlib export
+        # is the whole point), which needs the dense 64 * N**2 IoU —
+        # no blocked equivalent exists for the figures. Refuse on
+        # scans where that would OOM-kill the app; the phase-views
+        # window's own image export covers big scans.
+        n_peaks, needed = phase_tracking.estimate_tracking_memory(
+            self.session.temp_path, entry
+        )
+        available = phase_tracking.available_memory_bytes()
+        if (
+            needed and available
+            and needed > available * phase_tracking.TRACKING_DENSE_MEM_FRACTION
+        ):
+            QMessageBox.warning(
+                self,
+                "Save figures",
+                f"The official mlgidBASE figure export reruns "
+                f"upstream's tracking, which needs an estimated "
+                f"{needed / 1e9:.0f} GB for this scan's {n_peaks:,} "
+                f"fitted peaks ({available / 1e9:.0f} GB available).\n\n"
+                f"Use the phase-views window's image export instead — "
+                f"it renders from the already-computed tracks.",
+            )
             return
         try:
             with self._detached_silx_tree():
@@ -9708,15 +10395,27 @@ class MainWindow(QMainWindow):
         """One legend row (pen swatch + visibility checkbox) for
         structure ``s``. Called once per legend; the checkbox routes
         through ``_on_matched_structure_toggled``, which keeps the
-        Display and Expected-pattern twins in sync."""
+        Display and Expected-pattern twins in sync. The swatch is a
+        button: clicking it opens the colour-grid popup to recolour
+        the structure."""
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(6)
-        swatch = QLabel()
+        swatch = QToolButton()
+        swatch.setAutoRaise(True)
         # Mirror the *exact* pen used to render the structure on the
         # image so the user can map a row to its overlay shape even
         # when colour repeats — the dashed/dotted swatch flags it.
-        swatch.setPixmap(_make_pen_swatch(pen))
+        pix = _make_pen_swatch(pen)
+        swatch.setIcon(QIcon(pix))
+        swatch.setIconSize(pix.size())
+        swatch.setFixedSize(pix.width() + 4, pix.height() + 4)
+        swatch.setCursor(Qt.CursorShape.PointingHandCursor)
+        swatch.setToolTip("Click to choose a colour for this structure")
+        swatch.clicked.connect(
+            lambda _=False, key=s.color_key, c=pen["color"], b=swatch:
+                self._open_matched_color_popup(b, key, c)
+        )
         row.addWidget(swatch)
         chk = QCheckBox(s.label)
         chk.setChecked(self.viewer.matched_visibility(frame, s.unique_id))
@@ -9728,6 +10427,42 @@ class MainWindow(QMainWindow):
         row_widget = QWidget()
         row_widget.setLayout(row)
         return row_widget, chk
+
+    def _open_matched_color_popup(
+        self, button: QToolButton, key: tuple, current: str
+    ) -> None:
+        """Colour-grid popup under a legend swatch. A grid pick or
+        "More..." choice sets the override; "Automatic" clears it."""
+        popup = ColorGridPopup(self, current=current)
+        popup.colorPicked.connect(
+            lambda c, k=key: self._on_matched_color_picked(k, c)
+        )
+        popup.resetPicked.connect(
+            lambda k=key: self._on_matched_color_picked(k, None)
+        )
+        popup.show_under(button)
+
+    def _on_matched_color_picked(
+        self, key: tuple, color: str | None
+    ) -> None:
+        """Apply a picked colour (``None`` = back to automatic) for a
+        structure identity. The viewer re-renders the overlays and
+        re-emits ``matchedStructuresChanged``, which rebuilds both
+        legends' swatches; the phase views follow via the CIF-level
+        override push."""
+        self.viewer.set_matched_color(key, color)
+        self._push_phase_color_overrides()
+
+    def _push_phase_color_overrides(self) -> None:
+        """Mirror the viewer's EFFECTIVE structure colours — the
+        automatic Display-legend palette plus any custom picks — to the
+        phase views (keyed by CIF there), so the q-map/amplitude views
+        and their legend agree with the matched-peaks legend for every
+        structure, not only hand-recoloured ones."""
+        if self._phase_views_window is not None:
+            self._phase_views_window.set_phase_color_overrides(
+                self.viewer.cif_effective_colors()
+            )
 
     def _on_unmatched_row_toggled(self, checked: bool) -> None:
         """"Unmatched fitted peaks" toggle (either legend): mirror the
@@ -10053,20 +10788,20 @@ class MainWindow(QMainWindow):
         self._populate_sim_orientations()
 
     def _populate_sim_orientations(self) -> None:
-        """Rebuild the orientation combo for the selected CIF: the
-        current frame's matched (cif, hkl) combos first (labelled with
-        their probability), then 'Powder (rings)', then every
-        symmetry-distinct orientation. Ends by (re-)applying the
+        """Rebuild the matched-orientation combo for the selected CIF
+        (the current frame's matched (cif, hkl) combos, labelled with
+        their probability), steer the auto mode default (matched when
+        matches exist, random/powder otherwise), re-validate a typed
+        hkl against the selected CIF and end by (re-)applying the
         pattern — a no-op when the effective selection is unchanged."""
         panel = getattr(self, "pipeline_panel", None)
         cache = panel.cached_cif_pattern() if panel is not None else None
-        prev = self._sim_orient_combo.currentData()
-        with QSignalBlocker(self._sim_orient_combo):
-            self._sim_orient_combo.clear()
+        prev = self._sim_matched_combo.currentData()
+        with QSignalBlocker(self._sim_matched_combo):
+            self._sim_matched_combo.clear()
             stem = self._sim_cif_combo.currentData()
             if cache is not None and stem is not None:
                 seen: set[tuple] = set()
-                first_matched: int | None = None
                 for s in self._sim_matched_structures():
                     if simulation_pattern.cif_stem(s.cif) != stem:
                         continue
@@ -10078,44 +10813,118 @@ class MainWindow(QMainWindow):
                         base = "Powder (rings)"
                     else:
                         base = f"({hkl[0]} {hkl[1]} {hkl[2]})"
-                    self._sim_orient_combo.addItem(
-                        f"{base} — matched p={float(s.probability):.2f}",
+                    self._sim_matched_combo.addItem(
+                        f"{base} — p={float(s.probability):.2f}",
                         userData=hkl,
                     )
-                    if first_matched is None:
-                        first_matched = self._sim_orient_combo.count() - 1
-                if simulation_pattern.POWDER_HKL not in seen:
-                    self._sim_orient_combo.addItem(
-                        "Powder (rings)",
-                        userData=simulation_pattern.POWDER_HKL,
-                    )
-                ci = simulation_pattern.cif_index(cache, stem)
-                if ci is not None:
-                    try:
-                        orients = simulation_pattern.list_orientations(
-                            cache, ci
-                        )
-                    except (AttributeError, IndexError, TypeError):
-                        orients = []
-                    for hkl in orients:
-                        if hkl in seen:
-                            continue
-                        self._sim_orient_combo.addItem(
-                            f"({hkl[0]} {hkl[1]} {hkl[2]})", userData=hkl
-                        )
-                # Restore the previous choice; else default to the
-                # first matched entry, else powder.
-                idx = self._combo_data_index(self._sim_orient_combo, prev)
-                if idx < 0 and first_matched is not None:
-                    idx = first_matched
-                if idx < 0:
-                    idx = self._combo_data_index(
-                        self._sim_orient_combo,
-                        simulation_pattern.POWDER_HKL,
-                    )
+                idx = self._combo_data_index(self._sim_matched_combo, prev)
                 if idx >= 0:
-                    self._sim_orient_combo.setCurrentIndex(idx)
+                    self._sim_matched_combo.setCurrentIndex(idx)
+        if self._sim_mode_auto:
+            want = (
+                "matched" if self._sim_matched_combo.count() else "random"
+            )
+            with QSignalBlocker(self._sim_orient_mode):
+                self._sim_orient_mode.setCurrentIndex(
+                    self._combo_data_index(self._sim_orient_mode, want)
+                )
+        self._validate_sim_hkl(announce=False)
+        self._update_sim_orient_visibility()
         self._apply_sim_pattern()
+
+    def _sim_selected_hkl(self) -> tuple | None:
+        """Effective orientation of the current mode: the matched
+        combo's choice, ``POWDER_HKL`` for random, or the validated
+        user-typed triple. None = nothing to render (matched mode with
+        no match on this frame / empty or invalid typed hkl)."""
+        mode = self._sim_orient_mode.currentData()
+        if mode == "random":
+            return simulation_pattern.POWDER_HKL
+        if mode == "matched":
+            data = self._sim_matched_combo.currentData()
+            return tuple(int(v) for v in data) if data is not None else None
+        return self._sim_user_hkl
+
+    def _set_sim_hint(self, text: str, error: bool = True) -> None:
+        self._sim_orient_hint.setText(text)
+        self._sim_orient_hint.setStyleSheet(
+            "color: #d05050;" if error else ""
+        )
+        self._sim_orient_hint.setVisible(bool(text))
+
+    def _update_sim_orient_visibility(self) -> None:
+        """Show the mode's input widget and the state hint: the matched
+        combo in matched mode (with a hint when the frame has no
+        matched orientation), the hkl field in user mode (its hint is
+        owned by ``_validate_sim_hkl``), nothing extra for random."""
+        mode = self._sim_orient_mode.currentData()
+        self._sim_matched_combo.setVisible(mode == "matched")
+        self._sim_hkl_edit.setVisible(mode == "user")
+        if mode == "matched" and self._sim_matched_combo.count() == 0:
+            self._set_sim_hint(
+                "No matched orientation for this structure on the "
+                "current frame — run Matching, change frame, or pick "
+                "another mode.", error=False,
+            )
+        elif mode != "user":
+            self._set_sim_hint("")
+
+    def _validate_sim_hkl(self, announce: bool = True) -> None:
+        """Parse + validate the typed hkl against the selected CIF's
+        precomputed orientations; sets ``_sim_user_hkl`` and the hint.
+        ``announce=False`` (repopulation paths) keeps the status bar
+        quiet so frame changes never spam it."""
+        self._sim_user_hkl = None
+        if self._sim_orient_mode.currentData() != "user":
+            return
+        text = self._sim_hkl_edit.text().strip()
+        if not text:
+            self._set_sim_hint("")
+            return
+        panel = getattr(self, "pipeline_panel", None)
+        cache = panel.cached_cif_pattern() if panel is not None else None
+        stem = self._sim_cif_combo.currentData()
+        if cache is None or stem is None:
+            self._set_sim_hint("")
+            return
+        try:
+            hkl = simulation_pattern.parse_hkl(text)
+        except ValueError as exc:
+            self._set_sim_hint(f"Invalid hkl: {exc}")
+            if announce:
+                self.statusBar().showMessage(
+                    f"Expected pattern: invalid hkl — {exc}", 6000
+                )
+            return
+        ci = simulation_pattern.cif_index(cache, stem)
+        resolved = (
+            simulation_pattern.resolve_orientation(cache, ci, hkl)
+            if ci is not None else None
+        )
+        if resolved is None:
+            try:
+                n = len(simulation_pattern.list_orientations(cache, ci))
+            except (AttributeError, IndexError, TypeError):
+                n = 0
+            msg = (
+                f"({hkl[0]} {hkl[1]} {hkl[2]}) is not a simulated "
+                f"orientation of {stem} ({n} precomputed)."
+            )
+            self._set_sim_hint(msg)
+            if announce:
+                self.statusBar().showMessage(
+                    f"Expected pattern: {msg}", 6000
+                )
+            return
+        self._sim_user_hkl = resolved
+        if resolved != hkl:
+            self._set_sim_hint(
+                f"Rendering the equivalent simulated orientation "
+                f"({resolved[0]} {resolved[1]} {resolved[2]}).",
+                error=False,
+            )
+        else:
+            self._set_sim_hint("")
 
     def _refresh_sim_matched_entries(self, _frame: int, _structures: list) -> None:
         """The frame's matched set changed (frame change, re-match,
@@ -10140,7 +10949,18 @@ class MainWindow(QMainWindow):
     def _on_sim_cif_changed(self, _index: int) -> None:
         self._populate_sim_orientations()
 
-    def _on_sim_orient_changed(self, _index: int) -> None:
+    def _on_sim_orient_mode_changed(self, _index: int) -> None:
+        # An explicit mode choice ends the data-driven auto default.
+        self._sim_mode_auto = False
+        self._validate_sim_hkl(announce=False)
+        self._update_sim_orient_visibility()
+        self._apply_sim_pattern()
+
+    def _on_sim_matched_changed(self, _index: int) -> None:
+        self._apply_sim_pattern()
+
+    def _on_sim_hkl_edited(self) -> None:
+        self._validate_sim_hkl()
         self._apply_sim_pattern()
 
     def _on_sim_int_spin_changed(self, value: float) -> None:
@@ -11192,7 +12012,7 @@ class MainWindow(QMainWindow):
             and self.session.kind != "raw"
         ):
             stem = self._sim_cif_combo.currentData()
-            hkl = self._sim_orient_combo.currentData()
+            hkl = self._sim_selected_hkl()
             if stem is not None and hkl is not None:
                 desired = (stem, tuple(int(v) for v in hkl))
         # No-op on an unchanged choice — but only while the viewer's
@@ -11325,6 +12145,20 @@ class MainWindow(QMainWindow):
         self._sb_open_bar.hide()
         sb.addWidget(self._sb_open_label)
         sb.addWidget(self._sb_open_bar)
+        # Separate determinate bar for the chunked file-browser fill
+        # ("Browser: n/N files"). Its OWN widget pair on purpose: the
+        # open bar above is driven concurrently by the async first-image
+        # load ("Loading <entry>…" → dismissed on arrival), so sharing
+        # it would let that dismiss hide an still-running browser fill.
+        self._sb_tree_label = QLabel("")
+        self._sb_tree_bar = QProgressBar()
+        self._sb_tree_bar.setRange(0, 100)
+        self._sb_tree_bar.setMaximumWidth(110)
+        self._sb_tree_bar.setTextVisible(False)
+        self._sb_tree_label.hide()
+        self._sb_tree_bar.hide()
+        sb.addWidget(self._sb_tree_label)
+        sb.addWidget(self._sb_tree_bar)
 
     def _update_status_file(self) -> None:
         if self.session is None:

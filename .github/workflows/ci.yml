@@ -16,6 +16,11 @@ name: CI
 on:
   push:
   pull_request:
+  # Manual escape hatch: GitHub Actions incidents can swallow push
+  # events entirely (observed 2026-08-06 — a pushed commit produced no
+  # run at all). workflow_dispatch lets `gh workflow run ci.yml
+  # --ref <branch>` start CI for the branch head by hand.
+  workflow_dispatch:
 
 # A newer push supersedes any still-running CI for the same ref —
 # without this, runs pile up (and a hung run blocks nothing but
