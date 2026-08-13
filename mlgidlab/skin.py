@@ -42,6 +42,9 @@ DANGER = "danger"
 #: objectName for the CollapsibleSection header button.
 SECTION_HEADER = "SectionHeader"
 
+#: ``role`` value on a non-collapsible Card's title label.
+CARD_TITLE = "card-title"
+
 #: The one descendant-scoped rule, kept in a constant so the guard test
 #: and the sheet cannot disagree about what is allowed.
 TABLE_SELECTOR = 'QTableView[mlgid="table"]'
@@ -126,6 +129,16 @@ QToolButton#{SECTION_HEADER}:hover {{
     border-bottom: 1px solid {t['accent']};
 }}
 QToolButton#{SECTION_HEADER}:checked {{
+    color: {t['text']};
+}}
+
+/* --- card title (a section header without a chevron) ------------------
+   Same weight, padding and hairline as the collapsible header above, so
+   a fixed section and a collapsible one read as the same furniture. */
+QLabel[role="{CARD_TITLE}"] {{
+    border-bottom: 1px solid {t['divider']};
+    padding: 6px 2px 5px 2px;
+    font-weight: bold;
     color: {t['text']};
 }}
 

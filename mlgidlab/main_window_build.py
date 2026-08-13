@@ -52,6 +52,7 @@ from mlgidlab.widgets import (
     PRIMARY,
     make_debounced_timer,
     make_pen_swatch as _make_pen_swatch,
+    section_label,
     set_variant,
     skin_progress,
 )
@@ -270,7 +271,7 @@ class BuildMixin:
         # Start hidden — only useful once a multi-frame stack is loaded.
         self._set_frame_slider_visible(False)
 
-        layout.addWidget(QLabel("Overlays"))
+        layout.addWidget(section_label("Overlays"))
         # Manual peaks intentionally omitted: the GUI now keeps at most
         # one manual box per frame (drawn → replaced → committed via
         # Add-to-fitted/detected, removed via Esc / Delete), so a

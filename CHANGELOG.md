@@ -31,6 +31,11 @@ pre-releases.
   the CIF parse bar, both status-bar bars and every progress dialog now
   fill in the theme's accent instead of the default blue, so a run in
   flight is the one moving, coloured thing on screen.
+- **Every section now has the same shape.** Sections were built three
+  ways (a hand-bolded label, a collapsible header, a group box), so the
+  Display, Pipeline and Conversion docks each read like a different
+  program. They share one card now: title, hairline, body. "Selected
+  peak" loses its box and joins the column it lives in.
 - **Section headers, tables and the status bar were restyled.**
   Collapsible sections get a chevron and a hairline rule instead of
   Qt's stock triangle; the peaks, scan-tracking and conversion tables

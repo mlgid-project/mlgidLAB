@@ -9,19 +9,16 @@ Delete shortcut.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal, Slot
-from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
     QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QRadioButton,
     QStackedWidget,
-    QVBoxLayout,
     QWidget,
 )
 
@@ -29,7 +26,13 @@ from mlgidlab.fit import GaussianFit
 from mlgidlab.image_viewer import SelectedPeak
 from mlgidlab.pipeline import is_mlgidbase_available
 from mlgidlab import theme_tokens
-from mlgidlab.widgets import DANGER as _DANGER, set_variant as _set_variant
+from mlgidlab.widgets import (
+    Card,
+    DANGER as _DANGER,
+    GAP,
+    section_label,
+    set_variant as _set_variant,
+)
 
 EMPTY = "—"
 
@@ -41,7 +44,7 @@ _SOURCE_LABEL = {
 }
 
 
-class ParameterPanel(QGroupBox):
+class ParameterPanel(Card):
     # Mode tokens for the Add-to-fitted dispatch. ``"scipy_1d"`` runs
     # the legacy 1D scipy + zero-fill code path that pre-dated the F-06
     # work; ``"pygidfit_2d"`` routes through ``manual_fit.fit_one_peak``
@@ -78,10 +81,14 @@ class ParameterPanel(QGroupBox):
     deletePeakRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__("Selected peak", parent)
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(8, 8, 8, 8)
-        outer.setSpacing(6)
+        # A Card rather than the QGroupBox this used to be: it is one
+        # section of the Display dock among several, and a box drawn
+        # around only this one made it read as a different kind of thing.
+        # The Card supplies the layout, so the panel fills ``body_layout``
+        # instead of installing one of its own.
+        super().__init__("Selected peak", parent=parent)
+        outer = self.body_layout
+        outer.setSpacing(GAP)
 
         form_widget = QWidget()
         form = QFormLayout(form_widget)
@@ -293,10 +300,12 @@ class ParameterPanel(QGroupBox):
 
     @staticmethod
     def _make_section_label(text: str) -> QLabel:
-        lbl = QLabel(text)
-        font = QFont(lbl.font())
-        font.setBold(True)
-        lbl.setFont(font)
+        """A heading for one block of form rows.
+
+        Weight and colour come from the skin (``role="section"``) rather
+        than a bold ``QFont`` set here, so it follows a theme flip.
+        """
+        lbl = section_label(text)
         lbl.setContentsMargins(0, 4, 0, 0)
         return lbl
 

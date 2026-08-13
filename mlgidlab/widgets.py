@@ -22,13 +22,22 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QHBoxLayout,
+    QLabel,
     QProgressBar,
     QProgressDialog,
+    QSizePolicy,
     QSpinBox,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
+
+#: Density scale. One set of numbers for panel padding, the gap between
+#: sibling controls, and the indent a card's body carries under its
+#: header — so panels built in different files still line up.
+PAD = 8
+GAP = 6
+BODY_INSET = (16, 0, 4, 6)
 
 
 def set_variant(widget: QWidget, variant: str = "") -> QWidget:
@@ -104,46 +113,125 @@ def make_form(parent: QWidget | None = None) -> QFormLayout:
     return form
 
 
-class CollapsibleSection(QWidget):
-    """Section header (clickable) + body widget that hides on collapse.
+def section_label(text: str, parent: QWidget | None = None) -> QLabel:
+    """A heading for a group of rows *inside* a form or column.
 
-    Qt has no built-in expander, so this is a small QToolButton + QFrame
-    combo. Hosts add controls to ``body_layout``. ``expandedChanged`` lets
-    a coordinator (e.g. an accordion group) react when the user opens or
-    closes the section.
+    The lighter of the two heading weights: no rule under it, no
+    collapse. Use it where a ``Card`` would be too much furniture — a
+    couple of related rows in a form the surrounding card already owns.
+    Colour and weight come from the skin's ``role="section"`` rule, so
+    it follows the theme; the bold ``QFont`` and ``<b>…</b>`` markup it
+    replaced did not.
+    """
+    label = QLabel(text, parent)
+    label.setProperty("role", "section")
+    return label
+
+
+class Card(QWidget):
+    """One shape for every titled section this application draws.
+
+    A header (title, optional chevron, optional right-aligned status)
+    over a body that hosts fill through ``body_layout``. Sections used to
+    be built three different ways — a bold ``QLabel``, a
+    ``CollapsibleSection``, a ``QGroupBox`` — so the Display, Pipeline
+    and Conversion docks each read like a different program.
+
+    Deliberately chrome-free: a hairline under the title, no box. A dock
+    holds up to six of these, and six nested rectangles read as clutter,
+    which is why the round-1 skin gave section headers a rule rather than
+    a border.
     """
 
     expandedChanged = Signal(bool)
 
-    def __init__(self, title: str, *, expanded: bool = True, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        title: str,
+        *,
+        collapsible: bool = False,
+        expanded: bool = True,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        self._toggle = QToolButton(self)
-        self._toggle.setObjectName("SectionHeader")
-        self._toggle.setText(title)
-        self._toggle.setCheckable(True)
-        self._toggle.setChecked(expanded)
-        self._toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self._toggle.setIconSize(QSize(14, 14))
-        # Look comes from the skin's QToolButton#SectionHeader rules
-        # (transparent ground, hairline rule, accent on hover). It has to
-        # restate background and border explicitly, because qdarkstyle
-        # ships 19 QToolButton rules that would otherwise give all 13
-        # headers full button chrome.
-        self._set_marker(expanded)
-        self._toggle.toggled.connect(self._on_toggled)
-        outer.addWidget(self._toggle)
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(GAP)
+        if collapsible:
+            self._toggle = QToolButton(self)
+            self._toggle.setObjectName("SectionHeader")
+            self._toggle.setText(title)
+            self._toggle.setCheckable(True)
+            self._toggle.setChecked(expanded)
+            self._toggle.setToolButtonStyle(
+                Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            self._toggle.setIconSize(QSize(14, 14))
+            # Span the header row. A QToolButton is horizontally Fixed by
+            # default, and in a QHBoxLayout that leaves it at its text
+            # width, centred in the space the stretch hands it — so the
+            # title floats and the skin's hairline rule (the button's
+            # border-bottom) stops short of the panel edge.
+            self._toggle.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                       QSizePolicy.Policy.Fixed)
+            # Look comes from the skin's QToolButton#SectionHeader rules
+            # (transparent ground, hairline rule, accent on hover). It has
+            # to restate background and border explicitly, because
+            # qdarkstyle ships 19 QToolButton rules that would otherwise
+            # give every header full button chrome.
+            self._set_marker(expanded)
+            self._toggle.toggled.connect(self._on_toggled)
+            header.addWidget(self._toggle, 1)
+            self._title_label = None
+        else:
+            self._toggle = None
+            self._title_label = QLabel(title, self)
+            self._title_label.setProperty("role", "card-title")
+            header.addWidget(self._title_label, 1)
+        # Right-aligned slot for a short state line ("12 CIFs cached",
+        # "3 peaks"). Hidden until set, so the header rule stays full
+        # width in the common case.
+        self._status = QLabel("", self)
+        self._status.setProperty("status", "muted")
+        self._status.hide()
+        header.addWidget(self._status, 0)
+        outer.addLayout(header)
 
         self._body = QFrame(self)
         self._body.setFrameShape(QFrame.Shape.NoFrame)
         self.body_layout = QVBoxLayout(self._body)
-        self.body_layout.setContentsMargins(16, 0, 4, 6)
+        self.body_layout.setContentsMargins(*BODY_INSET)
         self.body_layout.setSpacing(4)
-        self._body.setVisible(expanded)
+        self._body.setVisible(expanded or not collapsible)
         outer.addWidget(self._body)
+
+    def title(self) -> str:
+        return (self._toggle.text() if self._toggle is not None
+                else self._title_label.text())
+
+    def set_status(self, text: str, level: str = "muted") -> None:
+        """Show a short state line at the right of the header.
+
+        ``level`` is one of the skin's semantic states (``muted``,
+        ``ok``, ``warn``, ``error``, ``info``). Empty text hides the
+        slot again.
+        """
+        self._status.setText(text)
+        self._status.setProperty("status", level)
+        style = self._status.style()
+        style.unpolish(self._status)
+        style.polish(self._status)
+        self._status.setVisible(bool(text))
+
+    def is_expanded(self) -> bool:
+        # ``isHidden`` rather than ``isVisible``: the question is whether
+        # this section is open, which is true even while the whole dock
+        # is closed (``isVisible`` is False for every widget whose parent
+        # chain is not shown).
+        return not self._body.isHidden()
 
     def _set_marker(self, expanded: bool) -> None:
         """Point the chevron down (open) or right (closed).
@@ -175,6 +263,20 @@ class CollapsibleSection(QWidget):
     def _apply_state(self, expanded: bool) -> None:
         self._body.setVisible(expanded)
         self._set_marker(expanded)
+
+
+class CollapsibleSection(Card):
+    """A ``Card`` whose header is a clickable chevron.
+
+    Kept as its own name because 13 call sites and their tests say
+    ``CollapsibleSection("Detection", expanded=True)``; it is now one
+    line over ``Card``.
+    """
+
+    def __init__(self, title: str, *, expanded: bool = True,
+                 parent: QWidget | None = None) -> None:
+        super().__init__(title, collapsible=True, expanded=expanded,
+                         parent=parent)
 
 
 def make_debounced_timer(parent: QWidget, ms: int, slot: Callable[[], None]) -> QTimer:
