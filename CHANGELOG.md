@@ -16,8 +16,8 @@ pre-releases.
   uses — recoloured to the detector colormap.
 - **Icons in the menus and on the controls.** 43 monochrome SVG glyphs,
   recoloured to the live theme at load time, on the File / Edit / Tools
-  / View / Settings / Help entries, the dock toggles, the playback
-  transport and the file-browser Refresh button.
+  / View / Settings / Help entries, the dock toggles, the dock tabs,
+  the playback transport and the file-browser Refresh button.
 
 ### Changed
 

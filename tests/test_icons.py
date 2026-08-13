@@ -172,6 +172,53 @@ def test_every_mapped_glyph_actually_ships(main_window):
     assert mapped <= shipped, f"missing glyphs: {mapped - shipped}"
 
 
+def _dock_tab_bars(window):
+    """Every QTabBar carrying a dock title, keyed by tab text.
+
+    Qt owns these bars (they are built by QMainWindow when docks are
+    tabified), so there is no handle to ask for directly.
+    """
+    from PySide6.QtWidgets import QTabBar
+
+    titles = {getattr(window, attr).windowTitle(): attr
+              for attr in window._DOCK_ICONS
+              if getattr(window, attr, None) is not None}
+    found = {}
+    for bar in window.findChildren(QTabBar):
+        for index in range(bar.count()):
+            if bar.tabText(index) in titles:
+                found[bar.tabText(index)] = (bar, index)
+    return found
+
+
+def test_the_tabified_docks_carry_their_glyph(main_window):
+    """Both tab rows are text-only without this, which is what makes the
+    docks easy to miss in the first place."""
+    tabs = _dock_tab_bars(main_window)
+    assert len(tabs) >= 6, f"expected both tab rows, found {sorted(tabs)}"
+    for title, (bar, index) in tabs.items():
+        assert not bar.tabIcon(index).isNull(), f"{title} tab has no icon"
+
+
+def test_dock_tab_icons_follow_a_theme_switch(main_window):
+    """Qt copies the dock's windowIcon onto its tab only when the tab is
+    created, so a flip has to re-push them explicitly."""
+    bar, index = _dock_tab_bars(main_window)["Display"]
+    main_window._set_theme("dark")
+    dark = bar.tabIcon(index).pixmap(16, 16).toImage()
+    main_window._set_theme("light")
+    light = bar.tabIcon(index).pixmap(16, 16).toImage()
+    assert dark != light
+
+
+def test_a_mode_switch_keeps_the_tab_glyphs(main_window):
+    """``_apply_session_mode`` re-tabifies the right-hand chain, and a
+    rebuilt tab comes up bare."""
+    main_window._apply_session_mode(None)
+    for title, (bar, index) in _dock_tab_bars(main_window).items():
+        assert not bar.tabIcon(index).isNull(), f"{title} lost its icon"
+
+
 def test_menu_icons_follow_a_theme_switch(main_window):
     main_window._set_theme("dark")
     dark = main_window.action_open.icon().pixmap(20, 20).toImage()

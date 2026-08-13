@@ -935,6 +935,10 @@ class FilesMixin:
             if kind_menu is not None:
                 kind_menu.menuAction().setEnabled(not is_raw)
         self._hide_stale_dock_tab_bars()
+        # Re-tabifying above rebuilds the tab entries, and a fresh tab
+        # comes up without an icon (Qt reads the dock's windowIcon only
+        # when it creates the tab), so the glyphs go back on here.
+        self._apply_dock_tab_icons()
 
     def _confirm_discard_changes(self, session: BaseSession | None = None) -> bool:
         target = session if session is not None else self._active_session

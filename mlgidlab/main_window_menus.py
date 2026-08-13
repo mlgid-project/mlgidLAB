@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QMessageBox,
     QSpinBox,
+    QTabBar,
 )
 from mlgidlab import file_model
 from mlgidlab.image_viewer import SelectedPeak
@@ -767,6 +768,10 @@ class MenusMixin:
         try:
             from mlgidlab import icons
             icons.retheme(theme)
+            # Dock tab icons are not in that registry: Qt owns those
+            # QTabBars and only reads a dock's windowIcon when it builds
+            # the tab, so they have to be re-pushed by hand.
+            self._apply_dock_tab_icons()
         except Exception:
             logger.debug("suppressed exception rethemeing icons", exc_info=True)
         # Recolour the live pyqtgraph plots (config options only affect
@@ -1061,6 +1066,45 @@ class MenusMixin:
             dock = getattr(self, attr, None)
             if dock is not None:
                 icons.bind(dock.toggleViewAction(), glyph)
+        self._apply_dock_tab_icons()
+
+    def _apply_dock_tab_icons(self) -> None:
+        """Put each dock's glyph on its tab in the tabified rows.
+
+        Both tab rows ("Display | Pipeline | Expected pattern | Logs" and
+        "Profiles | Peaks | Scan tracking") are text-only otherwise, which
+        makes the docks easy to miss.
+
+        Qt copies a ``QDockWidget``'s ``windowIcon`` onto its tab only
+        when that tab is *created*, so a later ``setWindowIcon`` — from a
+        theme flip, or from this call, which runs long after the docks
+        are built — never reaches an existing tab. The glyph is therefore
+        pushed onto the ``QTabBar`` directly, keyed by tab text (which is
+        the dock's ``windowTitle``). Widgets whose tab text is not a dock
+        title, notably the central Image/Data pair, are left alone.
+
+        Cheap and idempotent, so it is safe to re-run whenever the tab
+        set changes: a mode switch re-tabifies, and ``restoreState``
+        rebuilds the bars outright.
+        """
+        from mlgidlab import icons
+
+        wanted = {}
+        for attr, glyph in self._DOCK_ICONS.items():
+            dock = getattr(self, attr, None)
+            if dock is None:
+                continue
+            glyph_icon = icons.icon(glyph)
+            if glyph_icon.isNull():
+                continue
+            # Also on the dock itself, for when it is floated out.
+            dock.setWindowIcon(glyph_icon)
+            wanted[dock.windowTitle()] = glyph_icon
+        for bar in self.findChildren(QTabBar):
+            for index in range(bar.count()):
+                glyph_icon = wanted.get(bar.tabText(index))
+                if glyph_icon is not None:
+                    bar.setTabIcon(index, glyph_icon)
 
     def _build_file_menu(self, file_menu) -> None:
 
