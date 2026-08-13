@@ -45,12 +45,16 @@ def test_the_dirty_dot_replaces_the_asterisk(main_window, synthetic_nexus):
     assert main_window._sb_dirty.isHidden()
 
 
-def test_the_dot_is_a_real_pixmap_in_the_accent(main_window):
+@pytest.mark.parametrize("theme", ["dark", "light"])
+def test_the_dot_is_a_real_disc_in_the_live_accent(main_window, theme):
+    """It is a painted pixmap, not a styled widget, so a theme flip has
+    to repaint it — a stylesheet swap cannot reach inside a QPixmap."""
+    main_window._set_theme(theme)
     pixmap = main_window._sb_dirty.pixmap()
     assert not pixmap.isNull()
     image = pixmap.toImage()
     centre = image.pixelColor(image.width() // 2, image.height() // 2)
-    assert centre.name().lower() == theme_tokens.color("accent", "dark")
+    assert centre.name().lower() == theme_tokens.color("accent", theme)
     corner = image.pixelColor(0, 0)
     assert corner.alpha() == 0, "a disc, not a square"
 

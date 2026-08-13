@@ -60,6 +60,7 @@ from mlgidlab.profile_viewer import ProfileViewer
 from mlgidlab.scan_tracking_panel import ScanTrackingPanel
 from mlgidlab.update_ui import _UpdateBanner
 from mlgidlab.welcome_view import WelcomeView
+from mlgidlab.workflow_rail import WorkflowRail
 from mlgidlab import file_model, theme_tokens
 from mlgidlab.widgets import (
     PRIMARY,
@@ -125,6 +126,13 @@ class BuildMixin:
             self._on_install_update_requested
         )
         col.addWidget(self._update_banner)
+        # The workflow spine, between the banner and the view. Hidden
+        # with no session — the welcome page owns that state.
+        self.workflow_rail = WorkflowRail(central)
+        self.workflow_rail.stageActivated.connect(self._on_rail_stage_activated)
+        self.workflow_rail.stageRunRequested.connect(self._on_rail_stage_run)
+        self.workflow_rail.hide()
+        col.addWidget(self.workflow_rail)
         # The tabs share the column with a welcome page, shown whenever
         # no session is open (``_apply_session_mode``). A stack rather
         # than show/hide on the tabs so the two can never both be up, and
@@ -1363,6 +1371,94 @@ class BuildMixin:
             logger.debug("suppressed exception in MainWindow._active_raw_frame_for_calibration", exc_info=True)
             return None
 
+    # -- Workflow rail -------------------------------------------------
+
+    #: stage key -> (dock attribute, attribute path of the panel's own
+    #: Run button). The rail never builds a command: it clicks the
+    #: button the panel already owns, so the kwargs, the enablement and
+    #: the queueing all stay in one place.
+    _RAIL_TARGETS = {
+        "convert": ("_conversion_dock", ("conversion_panel", "btn_convert")),
+        "detect": ("_pipeline_dock", ("pipeline_panel", "btn_detect")),
+        "fit": ("_pipeline_dock", ("pipeline_panel", "btn_fit")),
+        "match": ("_pipeline_dock", ("pipeline_panel", "btn_match")),
+        "track": ("_scan_tracking_dock", ("scan_tracking_panel", "btn_track")),
+    }
+
+    def _rail_run_button(self, key: str):
+        target = self._RAIL_TARGETS.get(key)
+        if target is None:
+            return None
+        panel_attr, button_attr = target[1]
+        panel = getattr(self, panel_attr, None)
+        return getattr(panel, button_attr, None) if panel is not None else None
+
+    def _on_rail_stage_activated(self, key: str) -> None:
+        """Bring the dock that owns ``key`` forward."""
+        target = self._RAIL_TARGETS.get(key)
+        if target is None:
+            return
+        dock = getattr(self, target[0], None)
+        if dock is not None:
+            dock.show()
+            dock.raise_()
+
+    def _on_rail_stage_run(self, key: str) -> None:
+        button = self._rail_run_button(key)
+        if button is not None and button.isEnabled():
+            button.click()
+
+    def _refresh_workflow_rail(self) -> None:
+        """Re-read the current frame's tables and retag the stages.
+
+        Counts are per frame, from what the overlays already hold — no
+        extra I/O, and no claim about the rest of the scan.
+        """
+        rail = getattr(self, "workflow_rail", None)
+        if rail is None:
+            return
+        session = self.session
+        rail.setVisible(session is not None)
+        if session is None:
+            return
+        rail.set_mode(session.kind)
+
+        running = self._pipe_thread is not None
+        for key in self._RAIL_TARGETS:
+            button = self._rail_run_button(key)
+            rail.set_runnable(
+                key, bool(button is not None and button.isEnabled()))
+
+        if session.kind == "raw":
+            rail.set_state("convert", "ready" if not running else "running…",
+                           "run" if running else "muted")
+            for key in ("detect", "fit", "match", "track"):
+                rail.set_state(key, "after conversion", "muted")
+            return
+
+        rail.set_state("convert", "done", "ok")
+        frame = int(getattr(self.viewer, "current_frame", 0))
+        peaks = getattr(self.viewer, "_frame_peaks", {}).get(frame) or {}
+        counts = {
+            kind: (0 if table is None else int(len(table.ids)))
+            for kind, table in peaks.items()
+        }
+        matched = len(self.viewer.matched_structures(frame))
+        payload = getattr(self, "_scan_payload", None)
+        tracks = len(getattr(payload, "components", None) or []) if payload else 0
+
+        for key, count, empty in (
+            ("detect", counts.get("detected", 0), "not run"),
+            ("fit", counts.get("fitted", 0), "not run"),
+            ("match", matched, "not run"),
+        ):
+            if count:
+                rail.set_state(key, f"{count} this frame", "ok")
+            else:
+                rail.set_state(key, empty, "muted")
+        rail.set_state("track", f"{tracks} tracks" if tracks else "not run",
+                       "ok" if tracks else "muted")
+
     def _refresh_welcome_view(self) -> None:
         """Re-seed the welcome page's theme-dependent and live content."""
         view = getattr(self, "welcome_view", None)
@@ -1391,6 +1487,8 @@ class BuildMixin:
             self._sb_frame.setText(f"frame {cur}")
         else:
             self._sb_frame.setText(f"frame {cur} / {n - 1}")
+        # The rail's counts are per frame, so they move with this.
+        self._refresh_workflow_rail()
 
     def _set_pipeline_running(self, running: bool) -> None:
         """Colour the pipeline cell and show/hide its bar.
@@ -1411,6 +1509,9 @@ class BuildMixin:
 
     def _update_status_pipeline(self, command=None, *, running: bool) -> None:
         self._set_pipeline_running(running)
+        # A finished run changes what the stages can report, and a
+        # started one disables their run glyphs.
+        self._refresh_workflow_rail()
         if not running:
             self._sb_pipeline.setText("idle")
             # Drop any progress tail from the previous run so a stale

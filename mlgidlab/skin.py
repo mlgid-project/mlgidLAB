@@ -198,6 +198,46 @@ QToolButton[variant="toggle"]:disabled {{
     border-color: {t['divider']};
 }}
 
+/* --- workflow rail ---------------------------------------------------
+   Each stage is a flat chip; the one that has produced something for
+   this frame carries the accent, so the strip reads as a progress line
+   rather than five identical buttons. */
+QWidget[mlgid="rail"] {{
+    background-color: {t['surface_raised']};
+    border-bottom: 1px solid {t['divider']};
+}}
+QToolButton[stage="chip"] {{
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 3px 8px;
+    color: {t['text']};
+}}
+QToolButton[stage="chip"]:hover {{
+    background-color: {t['accent_soft']};
+    color: {t['accent_hover']};
+}}
+QToolButton[stage="chip"][state="ok"] {{
+    color: {t['accent']};
+    font-weight: bold;
+}}
+QToolButton[stage="chip"][state="run"] {{
+    color: {t['accent']};
+    font-weight: bold;
+}}
+QToolButton[stage="chip"]:disabled {{
+    color: {t['text_disabled']};
+}}
+QToolButton[stage="run"] {{
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 2px;
+}}
+QToolButton[stage="run"]:hover {{
+    background-color: {t['accent_soft']};
+}}
+
 /* --- semantic status text -------------------------------------------
    Replaces the hardcoded per-state hexes scattered through the panels,
    which never followed a theme flip. */

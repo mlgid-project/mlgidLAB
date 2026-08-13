@@ -25,6 +25,7 @@ from mlgidlab.main_window_dialogs import (
     _ExportPeaksDialog,
     _SettingsDialog,
 )
+from mlgidlab.main_window_build import _dirty_dot
 from mlgidlab.session import NexusSession
 from pathlib import Path
 
@@ -774,6 +775,12 @@ class MenusMixin:
             view = getattr(self, "welcome_view", None)
             if view is not None:
                 view.set_theme(theme)
+            # Same for the status bar's unsaved-changes dot: it is a
+            # pixmap painted in the accent, so it has to be repainted
+            # rather than restyled.
+            dot = getattr(self, "_sb_dirty", None)
+            if dot is not None:
+                dot.setPixmap(_dirty_dot())
             # Dock tab icons are not in that registry: Qt owns those
             # QTabBars and only reads a dock's windowIcon when it builds
             # the tab, so they have to be re-pushed by hand.

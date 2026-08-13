@@ -8,6 +8,17 @@ pre-releases.
 
 ### Added
 
+- **A workflow rail.** A strip above the image showing the five stages
+  in order — Convert, Detect, Fit, Match, Track — with what each has
+  produced for the current frame. Clicking a stage brings its dock
+  forward; the run glyph presses that dock's own Run button, so nothing
+  about how a run is configured or queued changes.
+- **A welcome page.** With no file open the window used to be empty
+  axes and an empty tree. It now shows the mark, Open and Import, the
+  recent files, a reminder that files can be dropped anywhere on the
+  window, and — when the analysis backend is not installed — one line
+  saying so, which previously only surfaced when a run failed. The
+  empty Peaks and Scan-tracking tables say what would fill them.
 - **An application icon.** mlgidLAB now has a window / taskbar / Alt-Tab
   icon, and a family-consistent `mlgidLAB` wordmark in the README and
   the About dialog. Both are drawn from one description of the mlgid
