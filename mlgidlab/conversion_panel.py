@@ -9,7 +9,6 @@ hand off to the worker. Wiring of the emit path lives in Step 5.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -48,260 +47,318 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-# Conversion-type identifiers — kept as plain strings so ``ConversionConfig``
-# stays pickleable and can pass through Qt signals without custom marshalling.
-CONV_DET2Q_GID = "det2q_gid"
-CONV_DET2Q = "det2q"
-CONV_DET2POL_GID = "det2pol_gid"
-CONV_DET2POL = "det2pol"
+# Shared vocabulary + widgets: canonical homes moved in the 2026 source
+# split (conversion_config.py, widgets.py); re-imported here so panel
+# internals, tests and older references resolve unchanged.
+from mlgidlab.conversion_config import (
+    CONV_DET2POL,
+    CONV_DET2POL_GID,
+    CONV_DET2Q,
+    CONV_DET2Q_GID,
+    FRAME_ALL,
+    FRAME_LIST,
+    FRAME_SINGLE,
+    GEOM_GID,
+    GEOM_TRANSMISSION,
+    OUTPUT_SEPARATE_DATASETS,
+    OUTPUT_SEPARATE_FILES,
+    OUTPUT_SINGLE_ENTRY,
+    ConversionConfig,
+    RawScan,
+    _expand_fabio_scans,
+    parse_poni_overrides,
+)
+from mlgidlab.widgets import CollapsibleSection as _CollapsibleSection
+from mlgidlab.widgets import make_form as _make_form
 
-GEOM_GID = "GID"
-GEOM_TRANSMISSION = "Transmission"
-
-# Frame-selection modes for the Selection section.
-FRAME_ALL = "All"
-FRAME_SINGLE = "Single"
-FRAME_LIST = "List"
-
-OUTPUT_SEPARATE_FILES = "Separate files"
-OUTPUT_SEPARATE_DATASETS = "Separate datasets in single file"
-# All selected scans land as FRAMES of one entry in one (new) output
-# file — the converted result browses with the frame slider and can be
-# peak-tracked as a scan, unlike N separate entry_NNNN groups.
-OUTPUT_SINGLE_ENTRY = "Single entry in single file"
 
 
-def _make_form(parent: QWidget | None = None) -> QFormLayout:
-    """Build a QFormLayout configured to wrap long rows.
+# -------------- module-level helpers --------------
 
-    ``WrapLongRows`` keeps labels next to their fields when there's
-    horizontal space and stacks the label above the field when the
-    panel is narrow. This stops form rows from forcing the panel
-    wider than the dock and is what makes the parent QScrollArea's
-    ``ScrollBarAlwaysOff`` horizontal policy work in practice.
 
-    Deliberate copy of ``pipeline_panel._make_form`` — same rationale
-    as the local ``_CollapsibleSection`` below: importing
-    pipeline_panel would pull its mlgidbase-heavy import chain into
-    the conversion path.
+def _row(*widgets: QWidget) -> QWidget:
+    """Pack widgets in a horizontal row with no margins. Convenience for
+    QFormLayout entries that combine a line edit + side buttons.
     """
-    form = QFormLayout(parent) if parent is not None else QFormLayout()
-    form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-    return form
+    w = QWidget()
+    h = QHBoxLayout(w)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(4)
+    for i, child in enumerate(widgets):
+        # Stretch the first widget (typically the line edit) so the
+        # buttons stay at their natural width.
+        h.addWidget(child, 1 if i == 0 else 0)
+    return w
 
 
-@dataclass
-class RawScan:
-    """One (file, entry, frames) triple selected for conversion.
+def _spin_or_none(spin: QDoubleSpinBox) -> float | None:
+    """Read a value from an ``_opt_spin`` box, returning None for "(unset)".
 
-    ``frame_num`` follows the pygid convention:
-    - ``None`` → all frames in the dataset
-    - ``int`` → a single frame index
-    - ``list[int]`` → an explicit subset
+    Mirrors the special-value sentinel used in ``_opt_spin``: a value at
+    or below the minimum (-1.0 by construction) means the user left the
+    field unset, so we return None and let pygid pick its default.
     """
+    v = spin.value()
+    if v <= spin.minimum() + 1e-12:
+        return None
+    return float(v)
 
-    file_path: Path
-    entry: str
-    frame_num: int | list[int] | None = None
 
+def _range_or_none(
+    lo: QDoubleSpinBox, hi: QDoubleSpinBox
+) -> tuple[float, float] | None:
+    """Read a (min, max) pair from two ``_opt_spin`` boxes.
 
-def _expand_fabio_scans(
-    entry: RawEntry, frame_num: int | list[int] | None
-) -> list[RawScan]:
-    """Turn a selected fabio stack entry into one ``RawScan`` per frame-file.
-
-    pygid reads a fabio image via ``fabio.open(path).data`` (frame 0 only)
-    and ignores both ``dataset`` and ``frame_num``, so each converted frame
-    must be its OWN single-file scan (``entry=""``, ``frame_num=None``).
-    Here ``frame_num`` selects WHICH stack frames to convert (and therefore
-    which files), following the panel's frame mode: ``None`` → every file,
-    ``int`` → one, ``list`` → a subset. Out-of-range indices are dropped.
+    Returns None when either bound is "(unset)" — both ends of a range
+    have to be specified for pygid to honour it; partial ranges revert
+    to the default (auto).
     """
-    fmap = entry.frame_map or []
-    n = len(fmap)
-    if frame_num is None:
-        idxs: list[int] = list(range(n))
-    elif isinstance(frame_num, int):
-        idxs = [frame_num] if 0 <= frame_num < n else []
-    else:
-        idxs = [i for i in frame_num if 0 <= i < n]
-    return [
-        RawScan(file_path=fmap[i][0], entry="", frame_num=None) for i in idxs
-    ]
+    lo_v = _spin_or_none(lo)
+    hi_v = _spin_or_none(hi)
+    if lo_v is None or hi_v is None:
+        return None
+    return (lo_v, hi_v)
 
 
-@dataclass
-class ConversionConfig:
-    """Everything the conversion engine needs except the scan list."""
+class _AutoSelectDoubleSpinBox(QDoubleSpinBox):
+    """A QDoubleSpinBox that selects all of its text on focus-in.
 
-    geometry: str = GEOM_GID
-    conv_type: str = CONV_DET2Q_GID
-    # Orientation flags — passed to pygid.CoordMaps. Default True to
-    # match the pygid example notebook's recommended workflow: with
-    # both off (pygid's library default), the converted q ranges can
-    # extend into negative quadrants depending on detector flips +
-    # beam center, which is rarely what the user wants when reviewing
-    # a single GIWAXS frame. Users who want the full quadrant range
-    # can uncheck either box in the Conversion panel.
-    vert_positive: bool = True
-    hor_positive: bool = True
-    # Reciprocal-space ranges. Empty (None) means "auto" (pygid's default).
-    dq: float | None = None
-    dang: float | None = None
-    q_xy_range: tuple[float, float] | None = None
-    q_z_range: tuple[float, float] | None = None
-    q_x_range: tuple[float, float] | None = None
-    q_y_range: tuple[float, float] | None = None
-    radial_range: tuple[float, float] | None = None
-    angular_range: tuple[float, float] | None = None
-    # Experimental params.
-    poni_path: Path | None = None
-    mask_path: Path | None = None
-    ai: float | None = None
-    # Per-field manual overrides (centerX, centerY, SDD, wavelength,
-    # fliplr, flipud, transp). Filled by the panel when the user changes
-    # the corresponding field; otherwise pygid reads the value from the
-    # PONI file.
-    expmeta_overrides: dict = field(default_factory=dict)
-    # Sample metadata YAML text (parsed by the engine via yaml.safe_load).
-    smplmeta_yaml: str = ""
-    # Experimental metadata key/value pairs from the metadata table.
-    expmeta_kv: dict[str, str] = field(default_factory=dict)
-    # Output config.
-    output_mode: str = OUTPUT_SEPARATE_FILES
-    output_dir: Path | None = None
-    # Optional custom output filename. Behaviour depends on output_mode:
-    #   - separate-datasets: this becomes the single output filename
-    #     (defaults to "converted.h5").
-    #   - separate-files: with one raw file, used verbatim; with multiple,
-    #     used as a prefix (the raw stem is appended).
-    # Empty string falls through to the per-mode defaults.
-    output_filename: str = ""
-    overwrite_file: bool = True
-    overwrite_dataset: bool = False
-    # Append mode: instead of creating a new entry_NNNN, append the
-    # converted frames to ``append_entry`` (an existing entry group) of
-    # the existing output file. Implies no file/group overwrite.
-    append_frames: bool = False
-    append_entry: str = ""
+    Without this, focusing a spinbox showing ``setSpecialValueText``
+    placeholder ("(none)" / "(unset)") parks the caret inside the
+    placeholder and the user has to manually select + delete the
+    string before they can type a real number. Selecting on focus
+    means the next keystroke replaces the placeholder so the user
+    can just click → type.
 
-
-def parse_poni_overrides(path: Path) -> dict[str, float]:
-    """Parse a pyFAI ``.poni`` file into override-field values.
-
-    Returns a subset of ``{"SDD", "wavelength", "centerX", "centerY"}``
-    in the panel's units (SDD in m, wavelength in Å, centers in px) —
-    whatever the file allows to be derived. The math mirrors
-    ``pygid.ExpParams`` exactly (``read_from_dict`` + ``_calc_center_``,
-    rotation-aware, single square ``px_size`` from ``pixel1``), so the
-    pre-filled values equal what pygid would compute internally from the
-    same PONI — sending them back as overrides is a no-op until edited.
-
-    Pure text parsing — no pyFAI/pygid import (their import chains take
-    seconds and the pipeline extra may be absent). Pixel size comes from
-    a ``pixel1`` / ``pixelsize1`` key or the ``Detector_config`` JSON;
-    a named detector without explicit pixel size yields only SDD +
-    wavelength. Raises ``OSError`` if the file can't be read; malformed
-    values just drop the affected outputs.
-    """
-    import json
-    import math
-
-    data: dict[str, str] = {}
-    with open(path) as f:
-        for line in f:
-            if line.startswith("#") or ":" not in line:
-                continue
-            key, value = line.split(":", 1)
-            data[key.strip().lower()] = value.strip()
-
-    def _float(key: str) -> float | None:
-        if key not in data:
-            return None
-        try:
-            return float(data[key])
-        except ValueError:
-            return None
-
-    out: dict[str, float] = {}
-    sdd = _float("distance")
-    if sdd is None:
-        sdd = _float("dist")
-    if sdd is not None:
-        out["SDD"] = sdd
-    wl = _float("wavelength")
-    if wl is not None:
-        out["wavelength"] = wl * 1e10  # m → Å (pygid's internal unit)
-
-    px = _float("pixel1")
-    if px is None:
-        px = _float("pixelsize1")
-    if px is None and "detector_config" in data:
-        try:
-            px = float(json.loads(data["detector_config"]).get("pixel1"))
-        except (ValueError, TypeError):
-            px = None
-    poni1, poni2 = _float("poni1"), _float("poni2")
-    rot1 = _float("rot1") or 0.0
-    rot2 = _float("rot2") or 0.0
-    if None not in (sdd, poni1, poni2, px) and px > 0:
-        # pygid.ExpParams._calc_center_ (no flips at this stage — flips
-        # are applied by pygid later, on top of these values).
-        out["centerY"] = (sdd * math.tan(rot2) / math.cos(rot1) + poni1) / px
-        out["centerX"] = (-sdd * math.tan(rot1) + poni2) / px
-    return out
-
-
-class _CollapsibleSection(QWidget):
-    """Section header (clickable) + body widget that hides on collapse.
-
-    Same pattern as ``pipeline_panel._CollapsibleSection``. Duplicated
-    here rather than imported because pipeline_panel pulls in mlgidbase
-    at module level (lazy but still imports the panel UI), which we
-    don't want for raw-only sessions.
+    The select-all is wrapped in ``QTimer.singleShot(0, …)`` so it
+    runs *after* Qt's default focus handling — otherwise Qt's own
+    cursor placement runs after our selectAll and wipes it out.
     """
 
-    expandedChanged = Signal(bool)
+    def focusInEvent(self, event) -> None:  # type: ignore[override]
+        super().focusInEvent(event)
+        line = self.lineEdit()
+        if line is not None:
+            QTimer.singleShot(0, line.selectAll)
+
+
+def _opt_spin(
+    *,
+    decimals: int = 2,
+    max_v: float = 1e6,
+    suffix: str = "",
+) -> QDoubleSpinBox:
+    """A QDoubleSpinBox configured for "leave blank → use PONI default".
+
+    The minimum is set to a sentinel just below 0 and the special value
+    text is shown there so the user can dial down to "(unset)" without
+    typing 0.
+    """
+    box = _AutoSelectDoubleSpinBox()
+    # Sentinel below 0 acts as "unset"; pygid never sees a negative SDD
+    # / wavelength in practice so this is safe.
+    box.setMinimum(-1.0)
+    box.setMaximum(max_v)
+    box.setDecimals(decimals)
+    box.setSingleStep(10 ** (-decimals))
+    box.setSpecialValueText("(unset)")
+    box.setSuffix(suffix)
+    box.setValue(-1.0)
+    return box
+
+
+def _build_q_gid_params(panel: ConversionPanel) -> QWidget:
+    """Sub-form for ``det2q_gid``: dq, q_xy_range, q_z_range."""
+    w = QWidget()
+    form = _make_form(w)
+    form.setContentsMargins(0, 0, 0, 0)
+    panel.dq_q_gid = _opt_spin(decimals=4, max_v=10.0, suffix=" Å⁻¹")
+    panel.q_xy_min = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
+    panel.q_xy_max = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
+    panel.q_z_min = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
+    panel.q_z_max = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
+    form.addRow("dq:", panel.dq_q_gid)
+    form.addRow("q_xy min:", panel.q_xy_min)
+    form.addRow("q_xy max:", panel.q_xy_max)
+    form.addRow("q_z min:", panel.q_z_min)
+    form.addRow("q_z max:", panel.q_z_max)
+    return w
+
+
+def _build_q_trans_params(panel: ConversionPanel) -> QWidget:
+    """Sub-form for transmission ``det2q``: dq, q_x_range, q_y_range."""
+    w = QWidget()
+    form = _make_form(w)
+    form.setContentsMargins(0, 0, 0, 0)
+    panel.dq_q_trans = _opt_spin(decimals=4, max_v=10.0, suffix=" Å⁻¹")
+    panel.q_x_min = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
+    panel.q_x_max = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
+    panel.q_y_min = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
+    panel.q_y_max = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
+    form.addRow("dq:", panel.dq_q_trans)
+    form.addRow("q_x min:", panel.q_x_min)
+    form.addRow("q_x max:", panel.q_x_max)
+    form.addRow("q_y min:", panel.q_y_min)
+    form.addRow("q_y max:", panel.q_y_max)
+    return w
+
+
+class _Hdf5MetaPicker(QDialog):
+    """Modal silx tree picker for adding HDF5 datasets as metadata.
+
+    Used by the Conversion panel's "Add from HDF5…" button. Returns a
+    tuple ``(suggested_key, value, source_path)`` on accept, where:
+
+    - ``suggested_key`` is the basename of the dataset (e.g. ``temperature``
+      for ``measurement/temperature``) — the user can edit it after the
+      row is added.
+    - ``value`` is the first element of the dataset coerced to a string.
+    - ``source_path`` is ``filename:/path/inside/file`` so the metadata
+      row carries provenance for the value.
+    """
 
     def __init__(
-        self, title: str, *, expanded: bool = True, parent: QWidget | None = None
+        self, parent: QWidget | None, files: list[Path]
     ) -> None:
         super().__init__(parent)
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+        self.setWindowTitle("Pick HDF5 dataset")
+        self.setMinimumSize(640, 480)
+        self._files = list(files)
+        self._result: tuple[str, str, str] | None = None
+        self._build_ui()
 
-        self._toggle = QToolButton(self)
-        self._toggle.setText(title)
-        self._toggle.setCheckable(True)
-        self._toggle.setChecked(expanded)
-        self._toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self._toggle.setArrowType(
-            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "<i>Select an HDF5 dataset to add as a metadata key. The "
+            "value is read once at this moment and stored verbatim.</i>"
         )
-        self._toggle.setStyleSheet(
-            "QToolButton { border: none; padding: 4px 0px; font-weight: bold; }"
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        # silx tree — same widget the main browser uses, just in a
+        # modal dialog scope. Importing inside the constructor keeps
+        # silx out of the import path when this dialog isn't reached.
+        from silx.gui.hdf5 import Hdf5TreeView
+
+        self._tree = Hdf5TreeView(self)
+        self._tree.setSortingEnabled(True)
+        for fp in self._files:
+            self._tree.findHdf5TreeModel().insertFile(str(fp))
+        self._tree.activated.connect(self._on_activated)
+        self._tree.selectionModel().selectionChanged.connect(self._on_selection)
+        layout.addWidget(self._tree, 1)
+
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        self._toggle.toggled.connect(self._on_toggled)
-        outer.addWidget(self._toggle)
+        self._buttons.button(
+            QDialogButtonBox.StandardButton.Ok
+        ).setEnabled(False)
+        self._buttons.accepted.connect(self._on_accept)
+        self._buttons.rejected.connect(self.reject)
+        layout.addWidget(self._buttons)
 
-        self._body = QFrame(self)
-        self._body.setFrameShape(QFrame.Shape.NoFrame)
-        self.body_layout = QVBoxLayout(self._body)
-        self.body_layout.setContentsMargins(16, 0, 4, 6)
-        self.body_layout.setSpacing(4)
-        self._body.setVisible(expanded)
-        outer.addWidget(self._body)
+    def _on_selection(self, *_: object) -> None:
+        nodes = list(self._tree.selectedH5Nodes())
+        ok = bool(nodes) and self._is_dataset(nodes[0])
+        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(ok)
 
-    def _on_toggled(self, checked: bool) -> None:
-        self._apply_state(checked)
-        self.expandedChanged.emit(checked)
+    def _on_activated(self, *_: object) -> None:
+        # Double-click on a dataset accepts the dialog directly.
+        nodes = list(self._tree.selectedH5Nodes())
+        if nodes and self._is_dataset(nodes[0]):
+            self._on_accept()
 
-    def _apply_state(self, expanded: bool) -> None:
-        self._body.setVisible(expanded)
-        self._toggle.setArrowType(
-            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
-        )
+    @staticmethod
+    def _is_dataset(node) -> bool:
+        try:
+            import h5py
+            return isinstance(node.h5py_object, h5py.Dataset)
+        except Exception:
+            logger.debug("suppressed exception in _Hdf5MetaPicker._is_dataset", exc_info=True)
+            return False
+
+    def _on_accept(self) -> None:
+        nodes = list(self._tree.selectedH5Nodes())
+        if not nodes or not self._is_dataset(nodes[0]):
+            return
+        node = nodes[0]
+        try:
+            ds_path = node.h5py_object.name
+            file_name = Path(node.h5py_object.file.filename).name
+            data = node.h5py_object[()]
+        except Exception as exc:
+            logger.debug("suppressed exception in _Hdf5MetaPicker._on_accept", exc_info=True)
+            self._result = (str(node.local_name or "value"),
+                            f"<read error: {exc}>", "")
+            self.accept()
+            return
+        # Coerce to a single string value. Prefer the scalar form if the
+        # dataset is 0D; otherwise show the first element with a hint.
+        value = self._coerce_scalar(data)
+        suggested_key = ds_path.rsplit("/", 1)[-1] or "value"
+        source = f"{file_name}:{ds_path}"
+        self._result = (suggested_key, value, source)
+        self.accept()
+
+    @staticmethod
+    def _coerce_scalar(data) -> str:
+        try:
+            import numpy as np
+        except ImportError:
+            return repr(data)
+        arr = np.asarray(data)
+        if arr.ndim == 0:
+            v = arr[()]
+        elif arr.size == 1:
+            v = arr.flat[0]
+        else:
+            v = arr.flat[0]
+        if isinstance(v, bytes):
+            v = v.decode("utf-8", errors="replace")
+        if arr.size > 1:
+            return f"{v} (first of {arr.size}; full array not stored)"
+        return str(v)
+
+    @classmethod
+    def pick(
+        cls, parent: QWidget | None, files: list[Path]
+    ) -> tuple[str, str, str] | None:
+        dlg = cls(parent, files)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            return dlg._result
+        return None
+
+
+def _build_pol_params(panel: ConversionPanel, *, gid: bool) -> QWidget:
+    """Sub-form shared by ``det2pol`` and ``det2pol_gid``: dang, dq,
+    radial_range, angular_range. The two variants share the same
+    parameter set; ``gid`` only affects the suffix label.
+    """
+    w = QWidget()
+    form = _make_form(w)
+    form.setContentsMargins(0, 0, 0, 0)
+    suffix = "_gid" if gid else ""
+    dang_attr = f"dang_pol{suffix}"
+    dq_attr = f"dq_pol{suffix}"
+    rad_min_attr = f"radial_min{suffix}"
+    rad_max_attr = f"radial_max{suffix}"
+    ang_min_attr = f"angular_min{suffix}"
+    ang_max_attr = f"angular_max{suffix}"
+    setattr(panel, dang_attr, _opt_spin(decimals=3, max_v=180.0, suffix=" °"))
+    setattr(panel, dq_attr, _opt_spin(decimals=4, max_v=10.0, suffix=" Å⁻¹"))
+    setattr(panel, rad_min_attr, _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹"))
+    setattr(panel, rad_max_attr, _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹"))
+    setattr(panel, ang_min_attr, _opt_spin(decimals=2, max_v=360.0, suffix=" °"))
+    setattr(panel, ang_max_attr, _opt_spin(decimals=2, max_v=360.0, suffix=" °"))
+    form.addRow("dang:", getattr(panel, dang_attr))
+    form.addRow("dq:", getattr(panel, dq_attr))
+    form.addRow("radial min:", getattr(panel, rad_min_attr))
+    form.addRow("radial max:", getattr(panel, rad_max_attr))
+    form.addRow("angular min:", getattr(panel, ang_min_attr))
+    form.addRow("angular max:", getattr(panel, ang_max_attr))
+    return w
 
 
 class ConversionPanel(QWidget):
@@ -1256,7 +1313,7 @@ class ConversionPanel(QWidget):
         out_text = self.output_dir.text().strip()
         if not out_text:
             return None
-        from mlgidlab import conversion  # lazy: conversion imports this module
+        from mlgidlab import conversion  # lazy: defer the engine module until a run is configured
 
         cfg = ConversionConfig()
         cfg.output_mode = self.output_mode_combo.currentText()
@@ -1535,291 +1592,3 @@ class ConversionPanel(QWidget):
             cfg.overwrite_dataset = False
 
         return cfg
-
-
-# -------------- module-level helpers --------------
-
-
-def _row(*widgets: QWidget) -> QWidget:
-    """Pack widgets in a horizontal row with no margins. Convenience for
-    QFormLayout entries that combine a line edit + side buttons.
-    """
-    w = QWidget()
-    h = QHBoxLayout(w)
-    h.setContentsMargins(0, 0, 0, 0)
-    h.setSpacing(4)
-    for i, child in enumerate(widgets):
-        # Stretch the first widget (typically the line edit) so the
-        # buttons stay at their natural width.
-        h.addWidget(child, 1 if i == 0 else 0)
-    return w
-
-
-def _spin_or_none(spin: QDoubleSpinBox) -> float | None:
-    """Read a value from an ``_opt_spin`` box, returning None for "(unset)".
-
-    Mirrors the special-value sentinel used in ``_opt_spin``: a value at
-    or below the minimum (-1.0 by construction) means the user left the
-    field unset, so we return None and let pygid pick its default.
-    """
-    v = spin.value()
-    if v <= spin.minimum() + 1e-12:
-        return None
-    return float(v)
-
-
-def _range_or_none(
-    lo: QDoubleSpinBox, hi: QDoubleSpinBox
-) -> tuple[float, float] | None:
-    """Read a (min, max) pair from two ``_opt_spin`` boxes.
-
-    Returns None when either bound is "(unset)" — both ends of a range
-    have to be specified for pygid to honour it; partial ranges revert
-    to the default (auto).
-    """
-    lo_v = _spin_or_none(lo)
-    hi_v = _spin_or_none(hi)
-    if lo_v is None or hi_v is None:
-        return None
-    return (lo_v, hi_v)
-
-
-class _AutoSelectDoubleSpinBox(QDoubleSpinBox):
-    """A QDoubleSpinBox that selects all of its text on focus-in.
-
-    Without this, focusing a spinbox showing ``setSpecialValueText``
-    placeholder ("(none)" / "(unset)") parks the caret inside the
-    placeholder and the user has to manually select + delete the
-    string before they can type a real number. Selecting on focus
-    means the next keystroke replaces the placeholder so the user
-    can just click → type.
-
-    The select-all is wrapped in ``QTimer.singleShot(0, …)`` so it
-    runs *after* Qt's default focus handling — otherwise Qt's own
-    cursor placement runs after our selectAll and wipes it out.
-    """
-
-    def focusInEvent(self, event) -> None:  # type: ignore[override]
-        super().focusInEvent(event)
-        line = self.lineEdit()
-        if line is not None:
-            QTimer.singleShot(0, line.selectAll)
-
-
-def _opt_spin(
-    *,
-    decimals: int = 2,
-    max_v: float = 1e6,
-    suffix: str = "",
-) -> QDoubleSpinBox:
-    """A QDoubleSpinBox configured for "leave blank → use PONI default".
-
-    The minimum is set to a sentinel just below 0 and the special value
-    text is shown there so the user can dial down to "(unset)" without
-    typing 0.
-    """
-    box = _AutoSelectDoubleSpinBox()
-    # Sentinel below 0 acts as "unset"; pygid never sees a negative SDD
-    # / wavelength in practice so this is safe.
-    box.setMinimum(-1.0)
-    box.setMaximum(max_v)
-    box.setDecimals(decimals)
-    box.setSingleStep(10 ** (-decimals))
-    box.setSpecialValueText("(unset)")
-    box.setSuffix(suffix)
-    box.setValue(-1.0)
-    return box
-
-
-def _build_q_gid_params(panel: ConversionPanel) -> QWidget:
-    """Sub-form for ``det2q_gid``: dq, q_xy_range, q_z_range."""
-    w = QWidget()
-    form = _make_form(w)
-    form.setContentsMargins(0, 0, 0, 0)
-    panel.dq_q_gid = _opt_spin(decimals=4, max_v=10.0, suffix=" Å⁻¹")
-    panel.q_xy_min = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
-    panel.q_xy_max = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
-    panel.q_z_min = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
-    panel.q_z_max = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
-    form.addRow("dq:", panel.dq_q_gid)
-    form.addRow("q_xy min:", panel.q_xy_min)
-    form.addRow("q_xy max:", panel.q_xy_max)
-    form.addRow("q_z min:", panel.q_z_min)
-    form.addRow("q_z max:", panel.q_z_max)
-    return w
-
-
-def _build_q_trans_params(panel: ConversionPanel) -> QWidget:
-    """Sub-form for transmission ``det2q``: dq, q_x_range, q_y_range."""
-    w = QWidget()
-    form = _make_form(w)
-    form.setContentsMargins(0, 0, 0, 0)
-    panel.dq_q_trans = _opt_spin(decimals=4, max_v=10.0, suffix=" Å⁻¹")
-    panel.q_x_min = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
-    panel.q_x_max = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
-    panel.q_y_min = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
-    panel.q_y_max = _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹")
-    form.addRow("dq:", panel.dq_q_trans)
-    form.addRow("q_x min:", panel.q_x_min)
-    form.addRow("q_x max:", panel.q_x_max)
-    form.addRow("q_y min:", panel.q_y_min)
-    form.addRow("q_y max:", panel.q_y_max)
-    return w
-
-
-class _Hdf5MetaPicker(QDialog):
-    """Modal silx tree picker for adding HDF5 datasets as metadata.
-
-    Used by the Conversion panel's "Add from HDF5…" button. Returns a
-    tuple ``(suggested_key, value, source_path)`` on accept, where:
-
-    - ``suggested_key`` is the basename of the dataset (e.g. ``temperature``
-      for ``measurement/temperature``) — the user can edit it after the
-      row is added.
-    - ``value`` is the first element of the dataset coerced to a string.
-    - ``source_path`` is ``filename:/path/inside/file`` so the metadata
-      row carries provenance for the value.
-    """
-
-    def __init__(
-        self, parent: QWidget | None, files: list[Path]
-    ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Pick HDF5 dataset")
-        self.setMinimumSize(640, 480)
-        self._files = list(files)
-        self._result: tuple[str, str, str] | None = None
-        self._build_ui()
-
-    def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        hint = QLabel(
-            "<i>Select an HDF5 dataset to add as a metadata key. The "
-            "value is read once at this moment and stored verbatim.</i>"
-        )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        # silx tree — same widget the main browser uses, just in a
-        # modal dialog scope. Importing inside the constructor keeps
-        # silx out of the import path when this dialog isn't reached.
-        from silx.gui.hdf5 import Hdf5TreeView
-
-        self._tree = Hdf5TreeView(self)
-        self._tree.setSortingEnabled(True)
-        for fp in self._files:
-            self._tree.findHdf5TreeModel().insertFile(str(fp))
-        self._tree.activated.connect(self._on_activated)
-        self._tree.selectionModel().selectionChanged.connect(self._on_selection)
-        layout.addWidget(self._tree, 1)
-
-        self._buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        self._buttons.button(
-            QDialogButtonBox.StandardButton.Ok
-        ).setEnabled(False)
-        self._buttons.accepted.connect(self._on_accept)
-        self._buttons.rejected.connect(self.reject)
-        layout.addWidget(self._buttons)
-
-    def _on_selection(self, *_: object) -> None:
-        nodes = list(self._tree.selectedH5Nodes())
-        ok = bool(nodes) and self._is_dataset(nodes[0])
-        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(ok)
-
-    def _on_activated(self, *_: object) -> None:
-        # Double-click on a dataset accepts the dialog directly.
-        nodes = list(self._tree.selectedH5Nodes())
-        if nodes and self._is_dataset(nodes[0]):
-            self._on_accept()
-
-    @staticmethod
-    def _is_dataset(node) -> bool:
-        try:
-            import h5py
-            return isinstance(node.h5py_object, h5py.Dataset)
-        except Exception:
-            logger.debug("suppressed exception in _Hdf5MetaPicker._is_dataset", exc_info=True)
-            return False
-
-    def _on_accept(self) -> None:
-        nodes = list(self._tree.selectedH5Nodes())
-        if not nodes or not self._is_dataset(nodes[0]):
-            return
-        node = nodes[0]
-        try:
-            ds_path = node.h5py_object.name
-            file_name = Path(node.h5py_object.file.filename).name
-            data = node.h5py_object[()]
-        except Exception as exc:
-            logger.debug("suppressed exception in _Hdf5MetaPicker._on_accept", exc_info=True)
-            self._result = (str(node.local_name or "value"),
-                            f"<read error: {exc}>", "")
-            self.accept()
-            return
-        # Coerce to a single string value. Prefer the scalar form if the
-        # dataset is 0D; otherwise show the first element with a hint.
-        value = self._coerce_scalar(data)
-        suggested_key = ds_path.rsplit("/", 1)[-1] or "value"
-        source = f"{file_name}:{ds_path}"
-        self._result = (suggested_key, value, source)
-        self.accept()
-
-    @staticmethod
-    def _coerce_scalar(data) -> str:
-        try:
-            import numpy as np
-        except ImportError:
-            return repr(data)
-        arr = np.asarray(data)
-        if arr.ndim == 0:
-            v = arr[()]
-        elif arr.size == 1:
-            v = arr.flat[0]
-        else:
-            v = arr.flat[0]
-        if isinstance(v, bytes):
-            v = v.decode("utf-8", errors="replace")
-        if arr.size > 1:
-            return f"{v} (first of {arr.size}; full array not stored)"
-        return str(v)
-
-    @classmethod
-    def pick(
-        cls, parent: QWidget | None, files: list[Path]
-    ) -> tuple[str, str, str] | None:
-        dlg = cls(parent, files)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            return dlg._result
-        return None
-
-
-def _build_pol_params(panel: ConversionPanel, *, gid: bool) -> QWidget:
-    """Sub-form shared by ``det2pol`` and ``det2pol_gid``: dang, dq,
-    radial_range, angular_range. The two variants share the same
-    parameter set; ``gid`` only affects the suffix label.
-    """
-    w = QWidget()
-    form = _make_form(w)
-    form.setContentsMargins(0, 0, 0, 0)
-    suffix = "_gid" if gid else ""
-    dang_attr = f"dang_pol{suffix}"
-    dq_attr = f"dq_pol{suffix}"
-    rad_min_attr = f"radial_min{suffix}"
-    rad_max_attr = f"radial_max{suffix}"
-    ang_min_attr = f"angular_min{suffix}"
-    ang_max_attr = f"angular_max{suffix}"
-    setattr(panel, dang_attr, _opt_spin(decimals=3, max_v=180.0, suffix=" °"))
-    setattr(panel, dq_attr, _opt_spin(decimals=4, max_v=10.0, suffix=" Å⁻¹"))
-    setattr(panel, rad_min_attr, _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹"))
-    setattr(panel, rad_max_attr, _opt_spin(decimals=3, max_v=10.0, suffix=" Å⁻¹"))
-    setattr(panel, ang_min_attr, _opt_spin(decimals=2, max_v=360.0, suffix=" °"))
-    setattr(panel, ang_max_attr, _opt_spin(decimals=2, max_v=360.0, suffix=" °"))
-    form.addRow("dang:", getattr(panel, dang_attr))
-    form.addRow("dq:", getattr(panel, dq_attr))
-    form.addRow("radial min:", getattr(panel, rad_min_attr))
-    form.addRow("radial max:", getattr(panel, rad_max_attr))
-    form.addRow("angular min:", getattr(panel, ang_min_attr))
-    form.addRow("angular max:", getattr(panel, ang_max_attr))
-    return w

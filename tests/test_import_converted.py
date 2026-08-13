@@ -215,6 +215,7 @@ def test_float_batch_offers_import_integer_opens_raw(
     from PySide6.QtWidgets import QMessageBox as _RealBox
 
     from mlgidlab import main_window as mw_mod
+    from mlgidlab import main_window_files as mwf_mod
 
     offered: dict = {}
 
@@ -243,7 +244,9 @@ def test_float_batch_offers_import_integer_opens_raw(
             # First added button = "Import as one scan…".
             return self._buttons[0]
 
-    monkeypatch.setattr(mw_mod, "QMessageBox", _StubBox)
+    # _offer_import_for_float_images resolves QMessageBox from the
+    # files-mixin module since the 2026 source split.
+    monkeypatch.setattr(mwf_mod, "QMessageBox", _StubBox)
     monkeypatch.setattr(
         mw_mod.MainWindow,
         "_run_import_dialog",

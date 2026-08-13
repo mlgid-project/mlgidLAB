@@ -21,7 +21,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from mlgidlab.conversion_panel import (
+from mlgidlab.conversion_config import (
     CONV_DET2POL,
     CONV_DET2POL_GID,
     CONV_DET2Q,
@@ -347,7 +347,7 @@ def import_converted_stack(
         analysis = data.create_group("analysis")
         analysis.attrs["NX_class"] = "NXparameters"
         for i in range(n):
-            g = analysis.create_group(f"frame{i:05d}")
+            g = analysis.create_group(file_model.FRAME_KEY_FMT.format(i))
             g.attrs["NX_class"] = "NXparameters"
 
         instrument = entry.create_group("instrument")

@@ -4,6 +4,21 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## 0.1.0a16 — sixteenth alpha (2026-08-13)
+
+### Changed
+
+- **Internal: source layout split into focused modules.** No
+  user-visible changes. ``main_window.py`` (12,500 lines) and
+  ``image_viewer.py`` (4,700 lines) are now assembled from plain mixin
+  modules (``main_window_*.py``, ``image_viewer_*.py``,
+  ``viewer_*.py``); the conversion vocabulary moved to a Qt-free
+  ``conversion_config.py`` (removing the package's only import cycle);
+  small shared widgets live in ``widgets.py``; duplicated h5py, undo,
+  teardown and progress-dialog idioms were collapsed into single
+  helpers. Every previously importable name still resolves from its
+  old module via re-export shims.
+
 ## 0.1.0a15 — fifteenth alpha (2026-08-11)
 
 ### Added

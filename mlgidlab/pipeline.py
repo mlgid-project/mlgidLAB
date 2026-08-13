@@ -736,7 +736,7 @@ def _backfill_fitted_peaks_polar_to_cartesian(
     import h5py
 
     from mlgidlab import polar
-    from mlgidlab.file_model import entry_group_names
+    from mlgidlab.file_model import FRAME_KEY_FMT, entry_group_names
 
     if entry is not None:
         entries = [entry]
@@ -753,9 +753,9 @@ def _backfill_fitted_peaks_polar_to_cartesian(
             if frame_num is None:
                 frame_keys = list(analysis_grp.keys())
             elif isinstance(frame_num, (list, tuple)):
-                frame_keys = [f"frame{int(n):05d}" for n in frame_num]
+                frame_keys = [FRAME_KEY_FMT.format(int(n)) for n in frame_num]
             else:
-                frame_keys = [f"frame{int(frame_num):05d}"]
+                frame_keys = [FRAME_KEY_FMT.format(int(frame_num))]
 
             for fk in frame_keys:
                 ds_path = f"{ent}/data/analysis/{fk}/fitted_peaks"
@@ -833,7 +833,7 @@ def _dedupe_matched_groups(
     import h5py
     import numpy as np
 
-    from mlgidlab.file_model import entry_group_names
+    from mlgidlab.file_model import FRAME_KEY_FMT, entry_group_names
 
     prefix = f"matched_{peaks_type}_"
 
@@ -852,9 +852,9 @@ def _dedupe_matched_groups(
             if frame_num is None:
                 frame_keys = list(analysis_grp.keys())
             elif isinstance(frame_num, (list, tuple)):
-                frame_keys = [f"frame{int(n):05d}" for n in frame_num]
+                frame_keys = [FRAME_KEY_FMT.format(int(n)) for n in frame_num]
             else:
-                frame_keys = [f"frame{int(frame_num):05d}"]
+                frame_keys = [FRAME_KEY_FMT.format(int(frame_num))]
 
             for fk in frame_keys:
                 frame_grp = analysis_grp.get(fk)

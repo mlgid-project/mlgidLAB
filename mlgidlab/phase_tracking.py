@@ -37,6 +37,8 @@ import h5py
 import numpy as np
 from scipy.ndimage import median_filter
 
+from mlgidlab.file_model import ANALYSIS_REL, FRAME_KEY_FMT, IMG_REL
+
 logger = logging.getLogger(__name__)
 
 # Axis names offered to the user. "radius" follows upstream's meaning:
@@ -217,11 +219,11 @@ def track_peaks_blocked(
         "amplitude": [], "q_xy": [], "q_z": [], "frame": [],
     }
     with h5py.File(file_path, "r") as f:
-        sig = f.get(f"{entry}/data/img_gid_q")
+        sig = f.get(f"{entry}/{IMG_REL}")
         n_frames = int(sig.shape[0]) if isinstance(sig, h5py.Dataset) else 0
-        ana = f.get(f"{entry}/data/analysis")
+        ana = f.get(f"{entry}/{ANALYSIS_REL}")
         for frame in range(n_frames):
-            grp = ana.get(f"frame{frame:05d}") if ana is not None else None
+            grp = ana.get(FRAME_KEY_FMT.format(frame)) if ana is not None else None
             ds = grp.get("fitted_peaks") if grp is not None else None
             if not isinstance(ds, h5py.Dataset):
                 continue

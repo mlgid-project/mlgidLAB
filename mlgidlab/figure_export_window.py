@@ -21,7 +21,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -30,7 +30,6 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
-    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -41,7 +40,6 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStatusBar,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -126,68 +124,14 @@ _LINE_STYLES = ["-", "--", "-.", ":"]
 _MARKERS = ["o", "s", "^", "v", "D", "x", "+", "*"]
 
 
-# ---------------- collapsible-section ----------------
+# ---------------- shared widgets ----------------
+# Canonical homes moved to widgets.py in the 2026 source split; the
+# underscore aliases keep this file's internals working unchanged.
 
-class _CollapsibleSection(QWidget):
-    """Header + body, hides on collapse.
-
-    Local copy of ``pipeline_panel._CollapsibleSection`` so this file
-    doesn't depend on the pipeline-panel module's import chain.
-    """
-
-    expandedChanged = Signal(bool)
-
-    def __init__(self, title: str, *, expanded: bool = True, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-        self._toggle = QToolButton(self)
-        self._toggle.setText(title)
-        self._toggle.setCheckable(True)
-        self._toggle.setChecked(expanded)
-        self._toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self._toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
-        self._toggle.setStyleSheet(
-            "QToolButton { border: none; padding: 4px 0px; font-weight: bold; }"
-        )
-        self._toggle.toggled.connect(self._on_toggled)
-        outer.addWidget(self._toggle)
-        self._body = QFrame(self)
-        self._body.setFrameShape(QFrame.Shape.NoFrame)
-        self.body_layout = QVBoxLayout(self._body)
-        self.body_layout.setContentsMargins(16, 0, 4, 6)
-        self.body_layout.setSpacing(4)
-        self._body.setVisible(expanded)
-        outer.addWidget(self._body)
-
-    def _on_toggled(self, checked: bool) -> None:
-        self._body.setVisible(checked)
-        self._toggle.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow)
-        self.expandedChanged.emit(checked)
-
-
-# ---------------- small widget builders ----------------
-
-def _spin_double(lo: float, hi: float, default: float, decimals: int = 3) -> QDoubleSpinBox:
-    s = QDoubleSpinBox()
-    s.setDecimals(decimals)
-    s.setRange(lo, hi)
-    s.setValue(default)
-    return s
-
-
-def _spin_int(default: int, *, lo: int = 0, hi: int = 144) -> QSpinBox:
-    s = QSpinBox()
-    s.setRange(lo, hi)
-    s.setValue(default)
-    return s
-
-
-def _row_wrap(layout: QHBoxLayout) -> QWidget:
-    w = QWidget()
-    w.setLayout(layout)
-    return w
+from mlgidlab.widgets import CollapsibleSection as _CollapsibleSection
+from mlgidlab.widgets import row_wrap as _row_wrap
+from mlgidlab.widgets import spin_double as _spin_double
+from mlgidlab.widgets import spin_int as _spin_int
 
 
 def _modified_save_paths(base: str, entry: str, frame_num: int) -> list[Path]:

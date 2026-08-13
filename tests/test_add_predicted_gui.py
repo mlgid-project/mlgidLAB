@@ -78,8 +78,8 @@ def harness(main_window, synthetic_nexus_with_peaks, tmp_path, monkeypatch):
     # backend (`_update_sim_section_state`); stub availability BEFORE
     # the session/cache installs below re-evaluate it, so the widget
     # enable-state assertions hold on backend-less boxes (CI) too.
-    from mlgidlab import main_window as _mw_mod
-    monkeypatch.setattr(_mw_mod, "is_mlgidbase_available", lambda: True)
+    from mlgidlab import pipeline as _pipeline_mod
+    monkeypatch.setattr(_pipeline_mod, "is_mlgidbase_available", lambda: True)
     mw._set_active_session(NexusSession.open(synthetic_nexus_with_peaks))
     mw.pipeline_panel.set_cif_pattern(_fake_cifpattern(), None)
     mw._sim_master_check.setChecked(True)

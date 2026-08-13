@@ -88,6 +88,26 @@ QZ_REL = "data/q_z"
 PeakKind = str  # "detected" | "fitted"
 
 
+def read_signal_attr(data_group: h5py.Group) -> object:
+    """``data_group``'s ``signal`` attribute, HDF5 bytes decoded to str.
+
+    Returns the attribute value as-is otherwise (``None`` when absent).
+    Callers keep their own validation and indexing so error behaviour on
+    malformed files is unchanged.
+    """
+    signal = data_group.attrs.get("signal")
+    if isinstance(signal, bytes):
+        signal = signal.decode("utf-8", errors="replace")
+    return signal
+
+
+def read_q_axes(data_group: h5py.Group) -> tuple[np.ndarray, np.ndarray]:
+    """The ``q_xy``/``q_z`` axis datasets of ``data_group`` as float arrays."""
+    q_xy = np.asarray(data_group["q_xy"], dtype=float)
+    q_z = np.asarray(data_group["q_z"], dtype=float)
+    return q_xy, q_z
+
+
 @dataclass
 class PeakTable:
     """Centers, widths, and ids for a set of peaks at one frame.
@@ -275,9 +295,7 @@ def count_frames(file_path: Path, entry: str) -> int:
             data = f[entry].get("data")
             if not isinstance(data, h5py.Group):
                 return 0
-            signal = data.attrs.get("signal")
-            if isinstance(signal, bytes):
-                signal = signal.decode("utf-8", errors="replace")
+            signal = read_signal_attr(data)
             if not isinstance(signal, str) or signal not in data:
                 return 0
             ds = data[signal]
@@ -326,11 +344,9 @@ def classify_entry_data(file_path: Path, entry: str) -> str:
             data = obj.get("data") if isinstance(obj, h5py.Group) else None
             if not isinstance(data, h5py.Group):
                 return "foreign"
-            signal = data.attrs.get("signal")
+            signal = read_signal_attr(data)
     except OSError:
         return "unreadable"
-    if isinstance(signal, bytes):
-        signal = signal.decode("utf-8", errors="replace")
     return "mlgid" if signal in MLGID_SIGNALS else "foreign"
 
 
@@ -359,9 +375,7 @@ def list_entry_signals(file_path: Path) -> dict[str, str | None]:
             if data is None:
                 out[name] = None
                 continue
-            signal = data.attrs.get("signal")
-            if isinstance(signal, bytes):
-                signal = signal.decode("utf-8", errors="replace")
+            signal = read_signal_attr(data)
             out[name] = signal if isinstance(signal, str) else None
     return out
 
@@ -399,9 +413,7 @@ def list_pygid_incompatible_top_level(file_path: Path) -> list[str]:
             if not isinstance(data, h5py.Group):
                 bad.append(name)
                 continue
-            signal = data.attrs.get("signal")
-            if isinstance(signal, bytes):
-                signal = signal.decode("utf-8", errors="replace")
+            signal = read_signal_attr(data)
             if not isinstance(signal, str) or signal not in data:
                 bad.append(name)
     return bad

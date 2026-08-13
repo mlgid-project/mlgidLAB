@@ -1062,9 +1062,9 @@ def test_structure_column_shows_matched_phases(
 def test_track_button_gated_without_backend(
     main_window, synthetic_fitted_scan, monkeypatch,
 ):
-    import mlgidlab.main_window as mw
+    import mlgidlab.pipeline as pipeline_mod
 
-    monkeypatch.setattr(mw, "is_mlgidbase_available", lambda: False)
+    monkeypatch.setattr(pipeline_mod, "is_mlgidbase_available", lambda: False)
     _open(main_window, synthetic_fitted_scan)
     panel = main_window.scan_tracking_panel
     assert not panel.btn_track.isEnabled()

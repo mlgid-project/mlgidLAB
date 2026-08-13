@@ -9,7 +9,7 @@ from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 from mlgidlab.conversion import execute as conversion_execute
 from mlgidlab.conversion import import_converted_stack
-from mlgidlab.conversion_panel import ConversionConfig, RawScan
+from mlgidlab.conversion_config import ConversionConfig, RawScan
 from mlgidlab.pipeline import (
     PipelineCommand,
     execute,
@@ -52,6 +52,24 @@ def _trigger_conversion_imports() -> None:
     except Exception:
         logger.debug("suppressed exception in _trigger_conversion_imports", exc_info=True)
         pass
+
+
+def stop_worker_thread(thread, worker):
+    """Tear down a finished one-shot worker/thread pair.
+
+    quit + wait + deleteLater on the thread, deleteLater on the worker;
+    either may already be None. Returns ``(None, None)`` so callers can
+    null their references in one line. Persistent workers (prefetch,
+    entry load) and the update workers' signal-chain teardown keep their
+    bespoke code.
+    """
+    if thread is not None:
+        thread.quit()
+        thread.wait()
+        thread.deleteLater()
+    if worker is not None:
+        worker.deleteLater()
+    return None, None
 
 
 class CifParseWorker(QObject):
@@ -136,7 +154,7 @@ class CopyWorker(QObject):
             "error": None,
         }
         try:
-            from mlgidlab import file_model  # lazy: avoid import cycle at load
+            from mlgidlab import file_model  # lazy: defer h5py until a worker actually runs
             from mlgidlab.session import NexusSession
 
             # Standalone image files (TIFF/CBF/EDF) are read via fabio, not
@@ -330,7 +348,7 @@ class EntryLoadWorker(QObject):
 
     @Slot(str, str, int)
     def load(self, file_path: str, entry: str, request_id: int) -> None:
-        from mlgidlab import file_model  # lazy: avoid import cycle at load
+        from mlgidlab import file_model  # lazy: defer h5py until a worker actually runs
 
         source = None
         overlays = None
@@ -372,7 +390,7 @@ class EntryLoadWorker(QObject):
         full-stack ``load_raw_dataset`` this replaces froze the window
         for the duration of a whole-dataset read.
         """
-        from mlgidlab import file_model  # lazy: avoid import cycle at load
+        from mlgidlab import file_model  # lazy: defer h5py until a worker actually runs
 
         stack = None
         try:
@@ -833,16 +851,14 @@ class ScanProfileWorker(QObject):
 
             import h5py
 
+            from mlgidlab import file_model
             from mlgidlab.polar import cartesian_to_polar
 
             with h5py.File(self._file_path, "r") as f:
                 data = f[self._entry]["data"]
-                signal = data.attrs.get("signal")
-                if isinstance(signal, bytes):
-                    signal = signal.decode("utf-8", errors="replace")
+                signal = file_model.read_signal_attr(data)
                 ds = data[signal]
-                q_xy = np.asarray(data["q_xy"], dtype=float)
-                q_z = np.asarray(data["q_z"], dtype=float)
+                q_xy, q_z = file_model.read_q_axes(data)
                 n = int(ds.shape[0])
 
                 if self._mode == "waterfall":
@@ -957,16 +973,14 @@ class RoiTraceWorker(QObject):
         try:
             import h5py
 
+            from mlgidlab import file_model
             from mlgidlab.roi_intensity import integrate_roi
 
             with h5py.File(self._file_path, "r") as f:
                 data = f[self._entry]["data"]
-                signal = data.attrs.get("signal")
-                if isinstance(signal, bytes):
-                    signal = signal.decode("utf-8", errors="replace")
+                signal = file_model.read_signal_attr(data)
                 ds = data[signal or "img_gid_q"]
-                q_xy = np.asarray(data["q_xy"], dtype=float)
-                q_z = np.asarray(data["q_z"], dtype=float)
+                q_xy, q_z = file_model.read_q_axes(data)
                 # integrate_roi needs increasing axes; flip once here
                 # (and mirror each frame to match) if a file ever
                 # stores them descending.
