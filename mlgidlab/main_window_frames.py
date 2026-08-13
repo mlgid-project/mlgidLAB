@@ -19,6 +19,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import QApplication, QMessageBox
 from mlgidlab import file_model
+from mlgidlab import icons
 from mlgidlab.browser_widgets import _ImageFileNode
 from mlgidlab.image_viewer import OVERLAY_KINDS
 from mlgidlab.main_window_constants import (
@@ -378,7 +379,7 @@ class FramesMixin:
             interval, step = self._compute_play_schedule()
             self._play_timer.setInterval(interval)
             self._play_step = step
-            self.play_button.setIcon(self._icon_pause)
+            self.play_button.setIcon(icons.icon("pause"))
             self.play_button.setToolTip("Pause playback")
             self._play_timer.start()
             # Activate the background prefetch worker — it'll start
@@ -392,7 +393,7 @@ class FramesMixin:
         else:
             self._play_timer.stop()
             self._play_step = 1
-            self.play_button.setIcon(self._icon_play)
+            self.play_button.setIcon(icons.icon("play"))
             self.play_button.setToolTip(
                 "Play frames from the current position to the end.\n"
                 "Stops at the last frame; click again to pause."

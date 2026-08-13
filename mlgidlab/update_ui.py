@@ -9,6 +9,7 @@ from PySide6.QtCore import QObject, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QToolButton
 from mlgidlab import update_check
+from mlgidlab import icons, theme_tokens
 
 import logging
 
@@ -116,7 +117,10 @@ class _UpdateBanner(QFrame):
         )
         row.addWidget(view_btn)
         close_btn = QToolButton(self)
-        close_btn.setText("✕")
+        # The banner sits on its own accent ground, so its glyph
+        # takes the banner's foreground rather than the panel text token.
+        close_btn.setIcon(icons.icon(
+            "close", color=theme_tokens.color("banner_fg")))
         close_btn.setToolTip("Dismiss")
         close_btn.clicked.connect(self.hide)
         row.addWidget(close_btn)

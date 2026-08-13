@@ -117,3 +117,10 @@ markers = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["mlgidlab*"]
+
+# `packages.find` finds packages, it does not ship data files. Without
+# this stanza the SVG glyphs are missing from the wheel and every icon
+# silently falls back to nothing — tests/test_icons.py checks the assets
+# are importable so a broken wheel fails CI rather than a user's install.
+[tool.setuptools.package-data]
+mlgidlab = ["assets/icons/*.svg"]

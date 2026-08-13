@@ -760,6 +760,15 @@ class MenusMixin:
                     w.update()
                 except Exception:
                     logger.debug("suppressed exception repolishing widget", exc_info=True)
+        # Repaint the SVG icons. A QIcon is a value, so the widgets
+        # holding one keep the old colour until it is re-set; icons.bind
+        # recorded them, and this walks that registry rather than every
+        # widget in the app.
+        try:
+            from mlgidlab import icons
+            icons.retheme(theme)
+        except Exception:
+            logger.debug("suppressed exception rethemeing icons", exc_info=True)
         # Recolour the live pyqtgraph plots (config options only affect
         # newly-created items, so existing axes/backgrounds need an
         # explicit push).

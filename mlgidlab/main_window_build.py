@@ -26,7 +26,6 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSlider,
     QSpinBox,
-    QStyle,
     QTabWidget,
     QToolButton,
     QVBoxLayout,
@@ -56,6 +55,7 @@ from mlgidlab.widgets import (
     set_variant,
 )
 from silx.gui.data.DataViewerFrame import DataViewerFrame
+from mlgidlab import icons
 
 import logging
 
@@ -138,7 +138,10 @@ class BuildMixin:
         # re-sync every open session with the filesystem (close deleted
         # originals, reload changed ones). Also on F5.
         self._tree_refresh_btn = QToolButton()
-        self._tree_refresh_btn.setText("⟳ Refresh")
+        self._tree_refresh_btn.setText("Refresh")
+        self._tree_refresh_btn.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        icons.bind(self._tree_refresh_btn, "refresh")
         self._tree_refresh_btn.setAutoRaise(True)
         self._tree_refresh_btn.setToolTip(
             "Re-check every open file on disk (F5): close files whose "
@@ -217,13 +220,7 @@ class BuildMixin:
         # picks up the right colour automatically.
         self.play_button = QToolButton()
         self.play_button.setCheckable(True)
-        self._icon_play = self.style().standardIcon(
-            QStyle.StandardPixmap.SP_MediaPlay
-        )
-        self._icon_pause = self.style().standardIcon(
-            QStyle.StandardPixmap.SP_MediaPause
-        )
-        self.play_button.setIcon(self._icon_play)
+        self.play_button.setIcon(icons.icon("play"))
         self.play_button.setToolTip(
             "Play frames from the current position to the end.\n"
             "Stops at the last frame; click again to pause."
@@ -233,18 +230,14 @@ class BuildMixin:
         # clamp at boundaries (the buttons disable themselves at
         # frame 0 / last via ``_refresh_frame_nav_enabled``).
         self.prev_frame_button = QToolButton()
-        self.prev_frame_button.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowBack)
-        )
+        icons.bind(self.prev_frame_button, "prev")
         self.prev_frame_button.setToolTip("Previous frame")
         self.prev_frame_button.setAutoRepeat(True)
         self.prev_frame_button.setAutoRepeatDelay(300)
         self.prev_frame_button.setAutoRepeatInterval(80)
         self.prev_frame_button.clicked.connect(self._on_prev_frame_clicked)
         self.next_frame_button = QToolButton()
-        self.next_frame_button.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowForward)
-        )
+        icons.bind(self.next_frame_button, "next")
         self.next_frame_button.setToolTip("Next frame")
         self.next_frame_button.setAutoRepeat(True)
         self.next_frame_button.setAutoRepeatDelay(300)
