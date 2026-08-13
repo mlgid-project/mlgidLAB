@@ -41,6 +41,7 @@ from mlgidlab.peaks_table_panel import (
     _text_item,
 )
 from mlgidlab.phase_tracking import TrackingPayload, member_ids  # noqa: F401 (member_ids re-exported for the host)
+from mlgidlab.widgets import PRIMARY as _PRIMARY, set_variant as _set_variant
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,8 @@ class ScanTrackingPanel(QWidget):
         controls = QHBoxLayout()
         controls.setSpacing(6)
 
-        self.btn_track = QPushButton("Track peaks (mlgidBASE)", self)
+        self.btn_track = _set_variant(
+            QPushButton("Track peaks (mlgidBASE)", self), _PRIMARY)
         self.btn_track.setToolTip(
             "Run mlgidBASE's peak tracking on the active entry: fitted "
             "peaks of every frame are linked into tracks by IoU graph "

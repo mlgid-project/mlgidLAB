@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 from mlgidlab.fit import GaussianFit
 from mlgidlab.image_viewer import SelectedPeak
 from mlgidlab.pipeline import is_mlgidbase_available
+from mlgidlab.widgets import DANGER as _DANGER, set_variant as _set_variant
 
 EMPTY = "—"
 
@@ -271,7 +272,7 @@ class ParameterPanel(QGroupBox):
         # already exposed in the Pipeline dock with their full kwarg
         # surface — duplicating them in the per-peak panel just confused
         # the user about what each call would do. Removed.
-        self.btn_delete_peak = QPushButton("Delete peak")
+        self.btn_delete_peak = _set_variant(QPushButton("Delete peak"), _DANGER)
         self.btn_delete_peak.clicked.connect(self.deletePeakRequested)
         outer.addWidget(self.btn_delete_peak)
 

@@ -65,6 +65,7 @@ _OP_TITLES: dict[str, str] = {
 # underscore aliases keep panel internals and older references working.
 from mlgidlab.widgets import CollapsibleSection as _CollapsibleSection
 from mlgidlab.widgets import make_form as _make_form
+from mlgidlab.widgets import PRIMARY as _PRIMARY, set_variant as _set_variant
 
 
 class PipelinePanel(QWidget):
@@ -341,7 +342,7 @@ class PipelinePanel(QWidget):
         # construction) reaches for self.btn_run_all to set its gated
         # state. The widget is added to the layout further down so it
         # sits pinned to the bottom of the dock.
-        self.btn_run_all = QPushButton("Run full pipeline")
+        self.btn_run_all = _set_variant(QPushButton("Run full pipeline"), _PRIMARY)
         self.btn_run_all.setToolTip(
             "Run Detection, Fitting, and Matching back-to-back using the "
             "current section kwargs.\n\n"
@@ -421,7 +422,7 @@ class PipelinePanel(QWidget):
         form.addRow("Model:", self.det_model_type)
 
         section.body_layout.addLayout(form)
-        self.btn_detect = QPushButton("Run detection")
+        self.btn_detect = _set_variant(QPushButton("Run detection"), _PRIMARY)
         self.btn_detect.clicked.connect(self._on_run_detection)
         section.body_layout.addWidget(self.btn_detect)
         return section
@@ -502,7 +503,7 @@ class PipelinePanel(QWidget):
         form.addRow("Debug:", self.fit_debug)
 
         section.body_layout.addLayout(form)
-        self.btn_fit = QPushButton("Run fitting")
+        self.btn_fit = _set_variant(QPushButton("Run fitting"), _PRIMARY)
         self.btn_fit.clicked.connect(self._on_run_fitting)
         section.body_layout.addWidget(self.btn_fit)
         return section
@@ -671,7 +672,7 @@ class PipelinePanel(QWidget):
 
         section.body_layout.addLayout(form)
 
-        self.btn_match = QPushButton("Run matching")
+        self.btn_match = _set_variant(QPushButton("Run matching"), _PRIMARY)
         self.btn_match.setEnabled(False)
         self.btn_match.clicked.connect(self._on_run_matching)
         # Gate run button on the active source having text — matching

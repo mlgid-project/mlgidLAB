@@ -42,6 +42,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mlgidlab.widgets import PRIMARY as _PRIMARY, set_variant as _set_variant
+
 # These imports trigger a large Qt + matplotlib + silx chain. Done
 # at module level (not inside the class) because the module itself
 # is import-deferred by the host — so the chain only fires when the
@@ -287,27 +289,10 @@ class CalibrationDialog(QDialog):
         hint.setStyleSheet("color: #9aa5b1; font-style: italic;")
         btn_row.addWidget(hint, 1)
 
-        # Common style for the two "Add to conversion" call-to-
-        # action buttons. Bold + padded so they read as the
-        # primary final-step controls.
-        cta_style = (
-            "QPushButton {"
-            " font-weight: bold;"
-            " padding: 8px 16px;"
-            " border: 1px solid #3d8bfd;"
-            " border-radius: 4px;"
-            " background-color: #1f6feb;"
-            " color: white;"
-            "}"
-            "QPushButton:hover { background-color: #388bfd; }"
-            "QPushButton:pressed { background-color: #1158c7; }"
-            "QPushButton:disabled {"
-            " background-color: #2a2f36;"
-            " color: #6a737d;"
-            " border: 1px solid #444c56;"
-            "}"
-        )
-
+        # The two "Add to conversion" buttons are the final step of the
+        # calibration flow, so they carry the primary variant. They used
+        # to hardcode an 18-line blue button skin here, which stayed blue
+        # on a light theme and matched nothing else in the app.
         self._btn_save_mask = QPushButton("Save mask…")
         self._btn_save_mask.setToolTip(
             "Write the mask drawn in the Mask task to a .npy / "
@@ -317,24 +302,24 @@ class CalibrationDialog(QDialog):
         self._btn_save_mask.clicked.connect(self._on_save_mask)
         btn_row.addWidget(self._btn_save_mask)
 
-        self._btn_apply_poni = QPushButton("Add PONI to conversion")
+        self._btn_apply_poni = _set_variant(
+            QPushButton("Add PONI to conversion"), _PRIMARY)
         self._btn_apply_poni.setToolTip(
             "Push the saved PONI path into the Conversion dock's "
             "PONI field. Enabled once you've used the Integration "
             "task's 'Save as PONI' button."
         )
-        self._btn_apply_poni.setStyleSheet(cta_style)
         self._btn_apply_poni.setEnabled(False)
         self._btn_apply_poni.clicked.connect(self._on_apply_poni)
         btn_row.addWidget(self._btn_apply_poni)
 
-        self._btn_apply_mask = QPushButton("Add mask to conversion")
+        self._btn_apply_mask = _set_variant(
+            QPushButton("Add mask to conversion"), _PRIMARY)
         self._btn_apply_mask.setToolTip(
             "Push the saved mask path into the Conversion dock's "
             "Mask field. Enabled once you've saved a mask via "
             "'Save mask…'."
         )
-        self._btn_apply_mask.setStyleSheet(cta_style)
         self._btn_apply_mask.setEnabled(False)
         self._btn_apply_mask.clicked.connect(self._on_apply_mask)
         btn_row.addWidget(self._btn_apply_mask)

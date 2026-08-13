@@ -1,14 +1,18 @@
 """Small shared Qt widgets and builders used across panels.
 
-PySide6-only on purpose: the conversion panel and the figure-export
-window used to carry verbatim copies of these because importing them
-from ``pipeline_panel`` would have pulled its mlgidbase-heavy import
-chain along. Keeping this module free of any mlgidlab import lets every
-panel share one copy.
+Deliberately light on imports: the conversion panel and the figure-export
+window used to carry verbatim copies of these because importing them from
+``pipeline_panel`` would have pulled its mlgidbase-heavy import chain
+along. The refined rule is *no import that reaches the analysis backend*
+— ``skin`` and ``theme_tokens`` are stdlib/Qt-free and therefore fine,
+and importing the variant names from ``skin`` keeps one definition
+instead of two that can drift.
 """
 from __future__ import annotations
 
 from typing import Callable
+
+from mlgidlab.skin import DANGER, PRIMARY  # noqa: F401  (re-exported)
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
@@ -24,6 +28,25 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+def set_variant(widget: QWidget, variant: str = "") -> QWidget:
+    """Tag ``widget`` so the skin paints it as a primary/destructive action.
+
+    Returns the widget, so a construction line stays a single statement::
+
+        self.btn_run = set_variant(QPushButton("Run"), PRIMARY)
+
+    The re-polish matters when the variant changes *after* the widget was
+    first polished (e.g. an emphasis that comes and goes): Qt caches the
+    resolved style, so an attribute selector is not re-evaluated on its
+    own. Passing ``""`` clears the tag.
+    """
+    widget.setProperty("variant", variant)
+    style = widget.style()
+    style.unpolish(widget)
+    style.polish(widget)
+    return widget
 
 
 def make_form(parent: QWidget | None = None) -> QFormLayout:

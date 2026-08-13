@@ -50,8 +50,10 @@ from mlgidlab.profile_viewer import ProfileViewer
 from mlgidlab.scan_tracking_panel import ScanTrackingPanel
 from mlgidlab.update_ui import _UpdateBanner
 from mlgidlab.widgets import (
+    PRIMARY,
     make_debounced_timer,
     make_pen_swatch as _make_pen_swatch,
+    set_variant,
 )
 from silx.gui.data.DataViewerFrame import DataViewerFrame
 
@@ -686,7 +688,8 @@ class BuildMixin:
         sim_add_row = QHBoxLayout()
         sim_add_row.setContentsMargins(20, 0, 0, 0)
         sim_add_row.setSpacing(6)
-        self._sim_add_btn = QPushButton("Add selected peaks (fit + match)")
+        self._sim_add_btn = set_variant(
+            QPushButton("Add selected peaks (fit + match)"), PRIMARY)
         self._sim_add_btn.setEnabled(False)
         self._sim_add_btn.clicked.connect(self._on_add_predicted_peaks)
         sim_add_row.addWidget(self._sim_add_btn)

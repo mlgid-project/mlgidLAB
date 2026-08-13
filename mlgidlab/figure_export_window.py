@@ -132,6 +132,7 @@ from mlgidlab.widgets import CollapsibleSection as _CollapsibleSection
 from mlgidlab.widgets import row_wrap as _row_wrap
 from mlgidlab.widgets import spin_double as _spin_double
 from mlgidlab.widgets import spin_int as _spin_int
+from mlgidlab.widgets import PRIMARY as _PRIMARY, set_variant as _set_variant
 
 
 def _modified_save_paths(base: str, entry: str, frame_num: int) -> list[Path]:
@@ -468,7 +469,7 @@ class FigureExportWindow(QMainWindow):
         path_row.addWidget(browse)
         form.addRow("File:", _row_wrap(path_row))
 
-        self.btn_save = QPushButton("Save figure")
+        self.btn_save = _set_variant(QPushButton("Save figure"), _PRIMARY)
         self.btn_save.setToolTip(
             "Write the figure using the current settings. The format "
             "follows the file extension (.png raster or .svg vector). "
