@@ -286,7 +286,7 @@ class CalibrationDialog(QDialog):
             "Conversion dock with the buttons on the right →"
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #9aa5b1; font-style: italic;")
+        hint.setProperty("role", "hint")
         btn_row.addWidget(hint, 1)
 
         # The two "Add to conversion" buttons are the final step of the

@@ -91,15 +91,14 @@ class _UpdateBanner(QFrame):
         super().__init__(parent)
         self.setObjectName("UpdateBanner")
         self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setStyleSheet(
-            "#UpdateBanner { background: #2d5a88; }"
-            "#UpdateBanner QLabel { color: #f5f7fa; }"
-        )
         self._url = update_check.RELEASES_PAGE
         row = QHBoxLayout(self)
         row.setContentsMargins(12, 6, 8, 6)
         row.setSpacing(10)
         self._label = QLabel(self)
+        # Named so the skin can colour it; the banner sits on its own
+        # accent ground, so its text cannot use the panel text token.
+        self._label.setObjectName("UpdateBannerText")
         self._label.setWordWrap(True)
         row.addWidget(self._label, 1)
         self._update_btn = QToolButton(self)

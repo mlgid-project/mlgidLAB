@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 from mlgidlab.fit import GaussianFit
 from mlgidlab.image_viewer import SelectedPeak
 from mlgidlab.pipeline import is_mlgidbase_available
+from mlgidlab import theme_tokens
 from mlgidlab.widgets import DANGER as _DANGER, set_variant as _set_variant
 
 EMPTY = "—"
@@ -349,9 +350,11 @@ class ParameterPanel(QGroupBox):
             if tag:
                 source = f"{source} ({tag})"
             if peak.structure_color:
+                # The fill is data (the matched structure's colour);
+                # only the border follows the theme.
                 self._source_swatch.setStyleSheet(
                     f"background-color: {peak.structure_color};"
-                    " border: 1px solid #444;"
+                    f" border: 1px solid {theme_tokens.color('border')};"
                 )
                 self._source_swatch.setVisible(True)
             else:

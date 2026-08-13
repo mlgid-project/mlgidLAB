@@ -490,9 +490,10 @@ class FigureExportWindow(QMainWindow):
         v.setSpacing(8)
         self._preview = QLabel("Preview will render here.")
         self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._preview.setStyleSheet(
-            "QLabel { background-color: #19232d; color: #888; }"
-        )
+        # A plot ground, not a panel: it must match the exported
+        # figure's background in either theme (it used to be a hardcoded
+        # dark rectangle sitting inside a light window).
+        self._preview.setProperty("role", "preview-canvas")
         self._preview.setMinimumSize(400, 300)
         v.addWidget(self._preview, 1)
 

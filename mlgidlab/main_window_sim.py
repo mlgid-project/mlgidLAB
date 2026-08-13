@@ -173,9 +173,10 @@ class SimOverlayMixin:
 
     def _set_sim_hint(self, text: str, error: bool = True) -> None:
         self._sim_orient_hint.setText(text)
-        self._sim_orient_hint.setStyleSheet(
-            "color: #d05050;" if error else ""
-        )
+        self._sim_orient_hint.setProperty("status", "error" if error else "")
+        style = self._sim_orient_hint.style()
+        style.unpolish(self._sim_orient_hint)
+        style.polish(self._sim_orient_hint)
         self._sim_orient_hint.setVisible(bool(text))
 
     def _update_sim_orient_visibility(self) -> None:

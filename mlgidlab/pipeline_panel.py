@@ -298,7 +298,7 @@ class PipelinePanel(QWidget):
         # Both rows hide on idle and on single-{frame,entry} runs so the
         # progress region collapses to zero pixels in the steady state.
         self._entry_progress_label = QLabel("")
-        self._entry_progress_label.setStyleSheet("color: #aaa;")
+        self._entry_progress_label.setProperty("status", "muted")
         self._entry_progress_label.hide()
         self._entry_progress_bar = QProgressBar()
         self._entry_progress_bar.setRange(0, 1)
@@ -312,7 +312,7 @@ class PipelinePanel(QWidget):
         inner.addWidget(self._entry_progress_bar)
 
         self._progress_label = QLabel("")
-        self._progress_label.setStyleSheet("color: #aaa;")
+        self._progress_label.setProperty("status", "muted")
         self._progress_label.hide()
         self._progress_bar = QProgressBar()
         self._progress_bar.setRange(0, 1)
@@ -602,7 +602,7 @@ class PipelinePanel(QWidget):
         self.cif_parse_bar.setFixedHeight(14)
         self.cif_parse_bar.hide()
         self.cif_cache_label = QLabel("Not parsed")
-        self.cif_cache_label.setStyleSheet("color: #aaa; font-style: italic;")
+        self.cif_cache_label.setProperty("status", "muted")
         cif_parse_row = QWidget()
         cif_parse_h = QHBoxLayout(cif_parse_row)
         cif_parse_h.setContentsMargins(0, 0, 0, 0)
@@ -866,8 +866,7 @@ class PipelinePanel(QWidget):
         self.btn_parse_cifs.setEnabled(False)
         self.btn_parse_cifs.setText("Parsing…")
         self.cif_parse_bar.show()
-        self.cif_cache_label.setText("Parsing…")
-        self.cif_cache_label.setStyleSheet("color: #ffeb3b; font-style: italic;")
+        self._set_cache_status("Parsing…", "warn")
         self.parseCifsRequested.emit(text)
 
     def _on_cif_input_changed(self, text: str) -> None:
@@ -879,16 +878,10 @@ class PipelinePanel(QWidget):
         if self._cached_cif_input is not None and text != self._cached_cif_input:
             self._cached_cif_obj = None
             self._cached_cif_input = None
-            self.cif_cache_label.setText("Input changed; re-parse")
-            self.cif_cache_label.setStyleSheet(
-                "color: #ff6b6b; font-style: italic;"
-            )
+            self._set_cache_status("Input changed; re-parse", "error")
             self.cifCacheChanged.emit(None)
         elif self._cached_cif_input is None:
-            self.cif_cache_label.setText("Not parsed")
-            self.cif_cache_label.setStyleSheet(
-                "color: #aaa; font-style: italic;"
-            )
+            self._set_cache_status("Not parsed", "muted")
         self.btn_parse_cifs.setText("Parse CIFs")
         self.btn_parse_cifs.setEnabled(bool(text))
 
@@ -907,10 +900,7 @@ class PipelinePanel(QWidget):
         # Widget updates only when the matching UI was built (backend
         # present) — the cache fields themselves exist either way.
         if self._available:
-            self.cif_cache_label.setText("Not parsed (active file changed)")
-            self.cif_cache_label.setStyleSheet(
-                "color: #aaa; font-style: italic;"
-            )
+            self._set_cache_status("Not parsed (active file changed)", "muted")
             self.btn_parse_cifs.setText("Parse CIFs")
             self.btn_parse_cifs.setEnabled(bool(self.cif_path.text().strip()))
         self.cifCacheChanged.emit(None)
@@ -936,10 +926,7 @@ class PipelinePanel(QWidget):
             # Keep the user's input alone so they can retry from the same
             # text; just flag the cache as failed.
             if self._available:
-                self.cif_cache_label.setText(f"Parse failed — {msg[:60]}")
-                self.cif_cache_label.setStyleSheet(
-                    "color: #ff6b6b; font-style: italic;"
-                )
+                self._set_cache_status(f"Parse failed — {msg[:60]}", "error")
             self.cifCacheChanged.emit(None)
             return
         self._cached_cif_input = (
@@ -950,11 +937,23 @@ class PipelinePanel(QWidget):
         # what's been cached (CifPattern exposes ``cifs``).
         if self._available:
             n = len(getattr(obj, "cifs", []) or [])
-            self.cif_cache_label.setText(f"Parsed: {n} CIF(s) cached")
-            self.cif_cache_label.setStyleSheet(
-                "color: #4ade80; font-style: italic;"
-            )
+            self._set_cache_status(f"Parsed: {n} CIF(s) cached", "ok")
         self.cifCacheChanged.emit(obj)
+
+    def _set_cache_status(self, text: str, level: str = "muted") -> None:
+        """Set the CIF-cache line's text and semantic state.
+
+        The state colours used to be six hardcoded hexes at six call
+        sites, all tuned for the dark theme; ``level`` maps to a
+        ``QLabel[status=...]`` rule in the skin instead, so the line is
+        correct in both themes. Qt only re-evaluates an attribute
+        selector when the widget is re-polished, hence the repolish.
+        """
+        self.cif_cache_label.setText(text)
+        self.cif_cache_label.setProperty("status", level)
+        style = self.cif_cache_label.style()
+        style.unpolish(self.cif_cache_label)
+        style.polish(self.cif_cache_label)
 
     def cached_cif_pattern(self) -> object | None:
         """The parsed CifPattern cache (None when nothing is parsed).

@@ -1180,8 +1180,14 @@ class BuildMixin:
         self._sb_cursor = QLabel("")
         for w in (self._sb_file, self._sb_entry, self._sb_frame,
                   self._sb_pipeline, self._sb_cursor):
-            # Light separation so the eye can scan the row.
-            w.setStyleSheet("padding: 0 8px; border-left: 1px solid #444;")
+            # Light separation so the eye can scan the row. The divider
+            # colour and padding come from the skin, which is why this
+            # is a role tag rather than a stylesheet: the old hardcoded
+            # #444 stayed dark-grey in the light theme. The file name is
+            # the one field that says *what you are looking at*, so it
+            # keeps the full text colour while the rest read as context.
+            w.setProperty(
+                "role", "sb-cell-active" if w is self._sb_file else "sb-cell")
             sb.addPermanentWidget(w)
         # The cursor readout is the chattiest widget; let it stretch
         # so values don't truncate, others stay tight.
