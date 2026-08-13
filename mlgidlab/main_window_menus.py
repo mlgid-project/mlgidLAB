@@ -768,6 +768,12 @@ class MenusMixin:
         try:
             from mlgidlab import icons
             icons.retheme(theme)
+            # The wordmark is a coloured asset with a per-theme variant,
+            # not a recolourable glyph, so it is swapped rather than
+            # retinted.
+            view = getattr(self, "welcome_view", None)
+            if view is not None:
+                view.set_theme(theme)
             # Dock tab icons are not in that registry: Qt owns those
             # QTabBars and only reads a dock's windowIcon when it builds
             # the tab, so they have to be re-pushed by hand.

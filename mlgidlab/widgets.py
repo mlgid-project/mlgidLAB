@@ -75,6 +75,36 @@ def skin_item_view(view: QWidget) -> QWidget:
     return view
 
 
+def attach_empty_hint(view: QWidget, text: str) -> QLabel:
+    """Show ``text`` centred over an item view while it has no rows.
+
+    An empty table is indistinguishable from a broken one: the same grey
+    rectangle appears whether nothing has been detected yet, nothing is
+    loaded, or the panel failed to populate. Qt has no placeholder for
+    item views, so the hint is a child of the viewport, kept in step with
+    the model's row count.
+    """
+    hint = QLabel(text, view.viewport())
+    hint.setProperty("role", "hint")
+    hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    hint.setWordWrap(True)
+    layout = QVBoxLayout(view.viewport())
+    layout.setContentsMargins(GAP, GAP, GAP, GAP)
+    layout.addWidget(hint)
+
+    def sync() -> None:
+        model = view.model()
+        hint.setVisible(model is None or model.rowCount() == 0)
+
+    model = view.model()
+    if model is not None:
+        for signal in (model.rowsInserted, model.rowsRemoved,
+                       model.modelReset, model.layoutChanged):
+            signal.connect(sync)
+    sync()
+    return hint
+
+
 def skin_progress(widget: QWidget) -> QWidget:
     """Tag a progress bar so the skin fills it with the accent.
 

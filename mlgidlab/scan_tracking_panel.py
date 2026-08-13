@@ -43,6 +43,7 @@ from mlgidlab.peaks_table_panel import (
 from mlgidlab.phase_tracking import TrackingPayload, member_ids  # noqa: F401 (member_ids re-exported for the host)
 from mlgidlab.widgets import PRIMARY as _PRIMARY, set_variant as _set_variant
 from mlgidlab.widgets import skin_item_view as _skin_item_view
+from mlgidlab.widgets import attach_empty_hint as _attach_empty_hint
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +204,11 @@ class ScanTrackingPanel(QWidget):
         )
         self._table.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
         _skin_item_view(self._table)
+        _attach_empty_hint(
+            self._table,
+            "No tracks yet.\nRun \"Track peaks\" to follow peaks across "
+            "the frames of this scan."
+        )
         self._table.verticalHeader().setVisible(False)
         self._table.horizontalHeader().setStretchLastSection(False)
         self._table.horizontalHeader().setMinimumSectionSize(18)

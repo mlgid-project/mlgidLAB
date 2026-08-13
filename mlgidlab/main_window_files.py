@@ -891,6 +891,17 @@ class FilesMixin:
         Clear-peaks submenu. The user gets a clean canvas focused on
         the conversion workflow.
         """
+        # Central area: the welcome page whenever nothing is loaded, the
+        # Image / Data tabs otherwise. Refreshed on the way in so the
+        # recent list reflects the file that was just closed.
+        stack = getattr(self, "_central_stack", None)
+        if stack is not None:
+            if session is None:
+                self._refresh_welcome_view()
+                stack.setCurrentWidget(self.welcome_view)
+            else:
+                stack.setCurrentWidget(self.tabs)
+
         is_raw = session is not None and session.kind == "raw"
         self._pipeline_dock.setVisible(not is_raw)
         self._conversion_dock.setVisible(is_raw)

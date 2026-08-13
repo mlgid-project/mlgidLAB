@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
 from mlgidlab.file_model import MatchedStructure, PeakTable
 from mlgidlab.image_viewer import SelectedPeak
 from mlgidlab.widgets import skin_item_view as _skin_item_view
+from mlgidlab.widgets import attach_empty_hint as _attach_empty_hint
 
 
 # Tab index constants. Order matches the order tabs are added in
@@ -388,6 +389,12 @@ class PeaksTablePanel(QWidget):
         # Compact cell + header padding (~6 px reclaimed per column in
         # a narrow dock) now comes from the skin's QTableView[mlgid]
         # rules, applied by _skin_item_view above.
+        _attach_empty_hint(
+            table,
+            "No peaks on this frame.\n"
+            "Run detection from the Pipeline dock, or draw a box on the "
+            "image and add it."
+        )
         return table, proxy
 
     # Per-column upper bound on width after pack. Long string

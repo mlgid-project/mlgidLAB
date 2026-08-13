@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSlider,
     QSpinBox,
+    QStackedWidget,
     QTabWidget,
     QToolButton,
     QVBoxLayout,
@@ -53,10 +54,12 @@ from mlgidlab.main_window_constants import (
 )
 from mlgidlab.parameter_panel import ParameterPanel
 from mlgidlab.peaks_table_panel import PeaksTablePanel
+from mlgidlab.pipeline import is_mlgidbase_available
 from mlgidlab.pipeline_panel import PipelinePanel
 from mlgidlab.profile_viewer import ProfileViewer
 from mlgidlab.scan_tracking_panel import ScanTrackingPanel
 from mlgidlab.update_ui import _UpdateBanner
+from mlgidlab.welcome_view import WelcomeView
 from mlgidlab import file_model, theme_tokens
 from mlgidlab.widgets import (
     PRIMARY,
@@ -122,7 +125,19 @@ class BuildMixin:
             self._on_install_update_requested
         )
         col.addWidget(self._update_banner)
-        col.addWidget(self.tabs)
+        # The tabs share the column with a welcome page, shown whenever
+        # no session is open (``_apply_session_mode``). A stack rather
+        # than show/hide on the tabs so the two can never both be up, and
+        # so the docks' own visibility logic is untouched — nothing in
+        # the dock layout lives in the central widget.
+        self.welcome_view = WelcomeView(central)
+        self.welcome_view.openRequested.connect(self._action_open)
+        self.welcome_view.importRequested.connect(self._action_import_converted)
+        self.welcome_view.recentRequested.connect(self._open_recent)
+        self._central_stack = QStackedWidget(central)
+        self._central_stack.addWidget(self.welcome_view)   # index 0
+        self._central_stack.addWidget(self.tabs)           # index 1
+        col.addWidget(self._central_stack)
         self.setCentralWidget(central)
 
     def _build_docks(self) -> None:
@@ -1347,6 +1362,15 @@ class BuildMixin:
         except Exception:
             logger.debug("suppressed exception in MainWindow._active_raw_frame_for_calibration", exc_info=True)
             return None
+
+    def _refresh_welcome_view(self) -> None:
+        """Re-seed the welcome page's theme-dependent and live content."""
+        view = getattr(self, "welcome_view", None)
+        if view is None:
+            return
+        view.set_theme(getattr(self, "_current_theme", "dark"))
+        view.set_recent(self._load_recent_files())
+        view.set_backend_available(is_mlgidbase_available())
 
     def _update_status_entry(self) -> None:
         entry = self.entry_combo.currentText() if hasattr(self, "entry_combo") else ""
