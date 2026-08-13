@@ -53,6 +53,7 @@ from mlgidlab.widgets import (
     make_debounced_timer,
     make_pen_swatch as _make_pen_swatch,
     set_variant,
+    skin_progress,
 )
 from silx.gui.data.DataViewerFrame import DataViewerFrame
 from mlgidlab import icons
@@ -1201,7 +1202,7 @@ class BuildMixin:
         # (_on_open_finished). addWidget puts these on the left, before the
         # transient showMessage text.
         self._sb_open_label = QLabel("")
-        self._sb_open_bar = QProgressBar()
+        self._sb_open_bar = skin_progress(QProgressBar())
         self._sb_open_bar.setRange(0, 0)          # indeterminate "busy" march
         self._sb_open_bar.setMaximumWidth(110)
         self._sb_open_bar.setTextVisible(False)
@@ -1215,7 +1216,7 @@ class BuildMixin:
         # load ("Loading <entry>…" → dismissed on arrival), so sharing
         # it would let that dismiss hide an still-running browser fill.
         self._sb_tree_label = QLabel("")
-        self._sb_tree_bar = QProgressBar()
+        self._sb_tree_bar = skin_progress(QProgressBar())
         self._sb_tree_bar.setRange(0, 100)
         self._sb_tree_bar.setMaximumWidth(110)
         self._sb_tree_bar.setTextVisible(False)

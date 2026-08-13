@@ -46,6 +46,9 @@ SECTION_HEADER = "SectionHeader"
 #: and the sheet cannot disagree about what is allowed.
 TABLE_SELECTOR = 'QTableView[mlgid="table"]'
 
+#: Progress bars this application owns (``widgets.skin_progress``).
+PROGRESS_SELECTOR = 'QProgressBar[mlgid="progress"]'
+
 
 def marker(theme: str) -> str:
     """The comment stamped at the top of the sheet, so a test (or a bug
@@ -155,6 +158,31 @@ QLabel[role="hint"] {{ color: {t['text_muted']}; font-style: italic; }}
     border-bottom: 1px solid {t['divider']};
     padding: 3px 4px;
     font-weight: bold;
+}}
+
+/* --- progress bars ---------------------------------------------------
+   The accent, so a run in flight is the one moving, coloured thing in a
+   panel of grey controls. Only the chunk and the groove are restated:
+   qdarkstyle's own QProgressBar rule stays in force for everything else,
+   including the label colour of the bars that show a percentage.
+   ``::chunk`` is a sub-control of the tagged widget, not a descendant, so
+   it cannot reach into anything third-party. */
+{PROGRESS_SELECTOR} {{
+    background-color: {t['surface']};
+    border: 1px solid {t['border']};
+    border-radius: 4px;
+    text-align: center;
+}}
+{PROGRESS_SELECTOR}::chunk {{
+    background-color: {t['accent']};
+    border-radius: 3px;
+}}
+{PROGRESS_SELECTOR}:disabled {{
+    border-color: {t['divider']};
+    color: {t['text_disabled']};
+}}
+{PROGRESS_SELECTOR}::chunk:disabled {{
+    background-color: {t['border']};
 }}
 
 /* --- status bar cells ------------------------------------------------ */

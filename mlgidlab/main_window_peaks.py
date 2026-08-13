@@ -23,6 +23,7 @@ from mlgidlab import (
 from mlgidlab.image_viewer import SelectedPeak
 from mlgidlab.parameter_panel import ParameterPanel
 from mlgidlab.pipeline import PipelineCommand
+from mlgidlab.widgets import skin_progress
 
 
 class _CallbackAction:
@@ -828,10 +829,10 @@ class PeaksMixin:
             return
 
         n_frames_to_write = len(valid)
-        dialog = QProgressDialog(
+        dialog = skin_progress(QProgressDialog(
             f"Pasting to {n_frames_to_write} frame(s)…",
             "Cancel", 0, n_frames_to_write, self,
-        )
+        ))
         dialog.setWindowTitle("Paste to frames")
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
         dialog.setMinimumDuration(0)
@@ -1079,9 +1080,9 @@ class PeaksMixin:
         if not entry:
             return
         n = len(sels)
-        dialog = QProgressDialog(
+        dialog = skin_progress(QProgressDialog(
             f"Fitting {n} peak(s) (2D)…", "Cancel", 0, n, self,
-        )
+        ))
         dialog.setWindowTitle("Fit selected (2D)")
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
         dialog.setMinimumDuration(0)

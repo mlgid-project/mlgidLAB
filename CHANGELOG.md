@@ -27,6 +27,10 @@ pre-releases.
   carry an accent border and label; Delete peak and the metadata Remove
   read as destructive. The six "Clear" buttons deliberately stay
   neutral - they clear a path field, not analysis results.
+- **Progress bars fill with the accent.** The pipeline's two run bars,
+  the CIF parse bar, both status-bar bars and every progress dialog now
+  fill in the theme's accent instead of the default blue, so a run in
+  flight is the one moving, coloured thing on screen.
 - **Section headers, tables and the status bar were restyled.**
   Collapsible sections get a chevron and a hairline rule instead of
   Qt's stock triangle; the peaks, scan-tracking and conversion tables

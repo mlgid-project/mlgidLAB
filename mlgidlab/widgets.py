@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QHBoxLayout,
+    QProgressBar,
     QProgressDialog,
     QSpinBox,
     QToolButton,
@@ -63,6 +64,30 @@ def skin_item_view(view: QWidget) -> QWidget:
     view.setProperty("mlgid", "table")
     view.setAlternatingRowColors(True)
     return view
+
+
+def skin_progress(widget: QWidget) -> QWidget:
+    """Tag a progress bar so the skin fills it with the accent.
+
+    Accepts a ``QProgressDialog`` too and tags the bar Qt builds inside
+    it, which is otherwise unreachable: the dialog's own objectName
+    would not match a ``QProgressBar`` selector, and an ancestor-scoped
+    rule is exactly what the skin's scoping rule forbids.
+
+    Opt-in rather than a blanket ``QProgressBar`` rule because silx and
+    pyFAI have progress bars of their own, and a bare element selector
+    would repaint them (see the module docstring in ``skin``).
+    """
+    bar = widget
+    if isinstance(widget, QProgressDialog):
+        bar = widget.findChild(QProgressBar)
+        if bar is None:                       # pragma: no cover - defensive
+            return widget
+    bar.setProperty("mlgid", "progress")
+    style = bar.style()
+    style.unpolish(bar)
+    style.polish(bar)
+    return widget
 
 
 def make_form(parent: QWidget | None = None) -> QFormLayout:
@@ -179,6 +204,7 @@ def make_progress_dialog(parent, label, *, title, maximum=0):
     dlg.setWindowModality(Qt.WindowModality.WindowModal)
     dlg.setCancelButton(None)
     dlg.setMinimumDuration(0)
+    skin_progress(dlg)
     dlg.show()
     return dlg
 

@@ -66,6 +66,7 @@ _OP_TITLES: dict[str, str] = {
 from mlgidlab.widgets import CollapsibleSection as _CollapsibleSection
 from mlgidlab.widgets import make_form as _make_form
 from mlgidlab.widgets import PRIMARY as _PRIMARY, set_variant as _set_variant
+from mlgidlab.widgets import skin_progress
 
 
 class PipelinePanel(QWidget):
@@ -300,7 +301,7 @@ class PipelinePanel(QWidget):
         self._entry_progress_label = QLabel("")
         self._entry_progress_label.setProperty("status", "muted")
         self._entry_progress_label.hide()
-        self._entry_progress_bar = QProgressBar()
+        self._entry_progress_bar = skin_progress(QProgressBar())
         self._entry_progress_bar.setRange(0, 1)
         self._entry_progress_bar.setValue(0)
         self._entry_progress_bar.setTextVisible(False)
@@ -314,7 +315,7 @@ class PipelinePanel(QWidget):
         self._progress_label = QLabel("")
         self._progress_label.setProperty("status", "muted")
         self._progress_label.hide()
-        self._progress_bar = QProgressBar()
+        self._progress_bar = skin_progress(QProgressBar())
         self._progress_bar.setRange(0, 1)
         self._progress_bar.setValue(0)
         self._progress_bar.setTextVisible(False)
@@ -595,7 +596,7 @@ class PipelinePanel(QWidget):
         # simulates every CIF in one opaque call (no per-CIF callback to
         # hook), so the bar is indeterminate — but it moves, which the
         # static "Parsing…" text alone does not.
-        self.cif_parse_bar = QProgressBar()
+        self.cif_parse_bar = skin_progress(QProgressBar())
         self.cif_parse_bar.setRange(0, 0)
         self.cif_parse_bar.setTextVisible(False)
         self.cif_parse_bar.setFixedWidth(110)
