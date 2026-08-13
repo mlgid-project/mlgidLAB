@@ -101,13 +101,33 @@ def test_bind_then_retheme_repaints_the_target(qapp):
     assert not action.icon().isNull()
 
 
-def test_bindings_do_not_keep_widgets_alive(qapp):
-    """The registry is weak: a closed window must not be pinned in
-    memory by its icons."""
+def test_unbind_stops_a_widget_being_repainted(qapp):
+    """After unbind, a theme switch must leave that widget alone.
+
+    Asserted per widget rather than by the registry's size: the registry
+    is global, so any other live window contributes to the count and the
+    test would only pass in isolation.
+    """
     button = QToolButton()
     icons.bind(button, "play")
+    icons.retheme("dark")
+    before = button.icon().pixmap(24, 24).toImage()
+
     icons.unbind(button)
-    assert icons.retheme("dark") == 0
+    icons.retheme("light")
+    after = button.icon().pixmap(24, 24).toImage()
+    assert before == after
+
+
+def test_the_registry_holds_widgets_weakly(qapp):
+    """A closed window must not be pinned in memory by its icons."""
+    import weakref
+
+    button = QToolButton()
+    icons.bind(button, "play")
+    ref = weakref.ref(button)
+    del button
+    assert ref() is None
 
 
 def test_a_theme_switch_repaints_the_transport_icons(main_window):

@@ -71,30 +71,38 @@ def test_the_tag_survives_a_live_theme_flip(qtbot, main_window):
     assert _text_colour(button) == theme_tokens.color("accent", "dark")
 
 
-def test_pipeline_and_conversion_actions_are_tagged(main_window, monkeypatch):
-    from mlgidlab import pipeline
-    from mlgidlab.conversion_panel import ConversionPanel
-    from mlgidlab.pipeline_panel import PipelinePanel
+@pytest.fixture
+def pipeline_panel(monkeypatch):
+    """A PipelinePanel with its full widget set.
 
-    monkeypatch.setattr(pipeline, "is_mlgidbase_available", lambda: True)
-    panel = PipelinePanel()
+    Backend-less (CI), the panel builds a stub without the run buttons.
+    ``pipeline_panel`` binds ``is_mlgidbase_available`` by name at import,
+    so the patch has to target the panel module — patching
+    ``mlgidlab.pipeline`` leaves the already-bound name untouched.
+    """
+    from mlgidlab import pipeline_panel as panel_mod
+
+    monkeypatch.setattr(panel_mod, "is_mlgidbase_available", lambda: True)
+    return panel_mod.PipelinePanel()
+
+
+def test_pipeline_and_conversion_actions_are_tagged(main_window, pipeline_panel):
+    from mlgidlab.conversion_panel import ConversionPanel
+
     for name in ("btn_run_all", "btn_detect", "btn_fit", "btn_match"):
-        assert _variant(getattr(panel, name)) == "primary", name
+        assert _variant(getattr(pipeline_panel, name)) == "primary", name
 
     conversion = ConversionPanel()
     assert _variant(conversion.btn_convert) == "primary"
 
 
-def test_the_destructive_actions_are_tagged(main_window):
+def test_the_destructive_actions_are_tagged(main_window, pipeline_panel):
     """Reserved for operations that lose data: deleting a peak. The six
     "Clear" buttons stay neutral on purpose — they clear a path field."""
-    from mlgidlab.pipeline_panel import PipelinePanel
-
     assert _variant(main_window.parameter_panel.btn_delete_peak) == "danger"
 
-    panel = PipelinePanel()
     for name in ("_cif_browse_btn", "_pickle_clear_btn"):
-        assert _variant(getattr(panel, name)) in (None, "")
+        assert _variant(getattr(pipeline_panel, name)) in (None, "")
 
 
 def test_tracking_and_export_actions_are_tagged(main_window):
