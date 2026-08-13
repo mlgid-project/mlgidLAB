@@ -1008,6 +1008,7 @@ class MenusMixin:
         "action_save": "save",
         "action_save_as": "save-as",
         "action_close_file": "file-close",
+        "action_exit": "exit",
         "action_undo": "undo",
         "action_redo": "redo",
         "action_copy_peaks": "export-csv",
@@ -1036,6 +1037,8 @@ class MenusMixin:
         "_logs_dock": "dock-logs",
         "_profile_dock": "dock-profiles",
         "_peaks_dock": "dock-peaks",
+        "_sim_dock": "dock-expected",
+        "_scan_tracking_dock": "dock-tracking",
     }
 
     def _apply_menu_icons(self) -> None:
@@ -1051,6 +1054,9 @@ class MenusMixin:
             action = getattr(self, attr, None)
             if action is not None:
                 icons.bind(action, glyph)
+        recent = getattr(self, "_recent_menu", None)
+        if recent is not None:
+            icons.bind(recent.menuAction(), "file-recent")
         for attr, glyph in self._DOCK_ICONS.items():
             dock = getattr(self, attr, None)
             if dock is not None:
@@ -1107,7 +1113,7 @@ class MenusMixin:
 
         file_menu.addSeparator()
 
-        action_exit = QAction("E&xit", self)
+        self.action_exit = action_exit = QAction("E&xit", self)
         action_exit.setShortcut(QKeySequence.StandardKey.Quit)
         action_exit.triggered.connect(self.close)
         file_menu.addAction(action_exit)
