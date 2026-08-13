@@ -6,9 +6,18 @@ source split.
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QAction, QFont, QKeySequence, QPixmap
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QFont,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QCheckBox,
@@ -48,6 +57,7 @@ from mlgidlab.pipeline_panel import PipelinePanel
 from mlgidlab.profile_viewer import ProfileViewer
 from mlgidlab.scan_tracking_panel import ScanTrackingPanel
 from mlgidlab.update_ui import _UpdateBanner
+from mlgidlab import file_model, theme_tokens
 from mlgidlab.widgets import (
     PRIMARY,
     make_debounced_timer,
@@ -62,6 +72,19 @@ from mlgidlab import icons
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _dirty_dot(diameter: int = 8) -> QPixmap:
+    """A filled accent disc marking unsaved changes."""
+    pix = QPixmap(diameter + 4, diameter + 4)
+    pix.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(theme_tokens.color("accent")))
+    painter.drawEllipse(2, 2, diameter, diameter)
+    painter.end()
+    return pix
 
 
 class BuildMixin:
@@ -1168,25 +1191,53 @@ class BuildMixin:
         message after its timeout but leaves the permanent labels alone.
         """
         sb = self.statusBar()
+        # Unsaved-changes dot, in front of the file name. It replaces the
+        # "*" the name used to carry: a marker glued to the end of a
+        # filename is easy to read as part of the name, and it moved with
+        # the text. (The window title keeps its "*" — that is the
+        # platform convention for a modified document.)
+        self._sb_dirty = QLabel()
+        self._sb_dirty.setPixmap(_dirty_dot())
+        self._sb_dirty.setToolTip("Unsaved changes")
+        self._sb_dirty.hide()
         self._sb_file = QLabel("no file")
         self._sb_entry = QLabel("")
         self._sb_frame = QLabel("")
         self._sb_pipeline = QLabel("idle")
         self._sb_cursor = QLabel("")
+        # A run in flight gets its own bar in the row, right after the
+        # pipeline cell. Indeterminate until a frame count arrives, which
+        # is honest: several ops are one opaque backend call.
+        self._sb_pipe_bar = skin_progress(QProgressBar())
+        self._sb_pipe_bar.setRange(0, 0)
+        self._sb_pipe_bar.setFixedWidth(70)
+        self._sb_pipe_bar.setFixedHeight(12)
+        self._sb_pipe_bar.setTextVisible(False)
+        self._sb_pipe_bar.hide()
+        sb.addPermanentWidget(self._sb_dirty)
         for w in (self._sb_file, self._sb_entry, self._sb_frame,
-                  self._sb_pipeline, self._sb_cursor):
+                  self._sb_pipeline, self._sb_pipe_bar, self._sb_cursor):
             # Light separation so the eye can scan the row. The divider
             # colour and padding come from the skin, which is why this
             # is a role tag rather than a stylesheet: the old hardcoded
             # #444 stayed dark-grey in the light theme. The file name is
             # the one field that says *what you are looking at*, so it
             # keeps the full text colour while the rest read as context.
-            w.setProperty(
-                "role", "sb-cell-active" if w is self._sb_file else "sb-cell")
+            if isinstance(w, QLabel):
+                w.setProperty(
+                    "role",
+                    "sb-cell-active" if w is self._sb_file else "sb-cell")
             sb.addPermanentWidget(w)
+        # The pipeline cell is the one place a run reports from, so make
+        # it the way into the log of that run.
+        self._sb_pipeline.setToolTip("Pipeline activity — click to open the Logs dock")
+        self._sb_pipeline.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._sb_pipeline.installEventFilter(self)
         # The cursor readout is the chattiest widget; let it stretch
-        # so values don't truncate, others stay tight.
-        self._sb_cursor.setMinimumWidth(360)
+        # so values don't truncate, others stay tight. Monospace so the
+        # numbers stop jittering sideways as the cursor moves.
+        self._sb_cursor.setProperty("role", "sb-cell-mono")
+        self._sb_cursor.setMinimumWidth(430)
         self.viewer.cursorMoved.connect(self._on_status_cursor_moved)
         self._status_cursor_visible = True
         # Bottom-left, non-modal open-progress: a small busy (indeterminate)
@@ -1229,11 +1280,10 @@ class BuildMixin:
     def _update_status_file(self) -> None:
         if self.session is None:
             self._sb_file.setText("no file")
+            self._sb_dirty.hide()
             return
-        marker = "*" if self.session.dirty else ""
-        self._sb_file.setText(
-            f"{self.session.original_path.name}{marker}"
-        )
+        self._sb_file.setText(self.session.original_path.name)
+        self._sb_dirty.setVisible(bool(self.session.dirty))
 
     def _active_raw_frame_for_calibration(self):
         """Return a 2D ndarray to seed the pyFAI calibration dialog.
@@ -1318,7 +1368,25 @@ class BuildMixin:
         else:
             self._sb_frame.setText(f"frame {cur} / {n - 1}")
 
+    def _set_pipeline_running(self, running: bool) -> None:
+        """Colour the pipeline cell and show/hide its bar.
+
+        The ``status`` tag rides alongside the cell's ``role`` tag; the
+        skin pairs the two so a running cell is accented while an idle
+        one keeps the muted context colour.
+        """
+        self._sb_pipeline.setProperty("status", "run" if running else "")
+        style = self._sb_pipeline.style()
+        style.unpolish(self._sb_pipeline)
+        style.polish(self._sb_pipeline)
+        self._sb_pipe_bar.setVisible(running)
+        if not running:
+            # Back to the busy marquee for the next run, whose frame
+            # count is not known until its first progress tick.
+            self._sb_pipe_bar.setRange(0, 0)
+
     def _update_status_pipeline(self, command=None, *, running: bool) -> None:
+        self._set_pipeline_running(running)
         if not running:
             self._sb_pipeline.setText("idle")
             # Drop any progress tail from the previous run so a stale
@@ -1404,6 +1472,13 @@ class BuildMixin:
             new_tail = ""
         else:
             new_tail = f" · {done}/{total} frames"
+        # Mirror the same ticks onto the status-bar bar. Setting the
+        # range on every tick is what promotes it from the busy marquee
+        # to a real 0..total bar the first time a count arrives.
+        if total > 1 and op_name != "track_peaks":
+            if self._sb_pipe_bar.maximum() != total:
+                self._sb_pipe_bar.setRange(0, int(total))
+            self._sb_pipe_bar.setValue(int(done))
         if getattr(self, "_pipe_progress_tail", "") == new_tail:
             return
         self._pipe_progress_tail = new_tail
@@ -1412,6 +1487,50 @@ class BuildMixin:
         # command rather than rebuilding here.
         cmd = getattr(self, "_pipe_command", None)
         self._update_status_pipeline(cmd, running=True)
+
+    def _entry_wavelength(self) -> float | None:
+        """λ in Å for the active entry, cached; None when unknown.
+
+        Resolved lazily on the first cursor move after an entry change
+        rather than during the switch itself: the switch path is the one
+        the big-scan work made I/O-free, and a readout is not worth
+        putting a file open back into it.
+        """
+        session = self.session
+        entry = self.entry_combo.currentText() if hasattr(self, "entry_combo") else ""
+        if session is None or not entry:
+            return None
+        key = (str(getattr(session, "temp_path", "")), entry)
+        if getattr(self, "_wavelength_key", None) == key:
+            return self._wavelength_value
+        value = None
+        try:
+            geom = file_model.read_geometry_for_entry(session.temp_path, entry)
+            if geom:
+                wl = float(geom.get("wavelength_angstrom") or 0.0)
+                value = wl if wl > 0 else None
+        except Exception:
+            logger.debug("suppressed exception reading wavelength", exc_info=True)
+        self._wavelength_key = key
+        self._wavelength_value = value
+        return value
+
+    def _q_derived_tail(self, q: float) -> str:
+        """`d` and `2θ` for a |q|, as far as the entry's metadata allows.
+
+        d = 2π/|q| needs nothing but the cursor; 2θ = 2·asin(λ|q|/4π)
+        needs the entry's wavelength, so it appears only when the file
+        carries one.
+        """
+        if not q or q <= 0:
+            return ""
+        tail = f"  d={2 * math.pi / q:.3f} Å"
+        wl = self._entry_wavelength()
+        if wl:
+            arg = wl * q / (4 * math.pi)
+            if arg <= 1.0:
+                tail += f"  2θ={2 * math.degrees(math.asin(arg)):.2f}°"
+        return tail
 
     def _on_status_cursor_moved(self, info) -> None:
         if not self._status_cursor_visible:
@@ -1424,16 +1543,23 @@ class BuildMixin:
         inten = info.get("intensity", float("nan"))
         inten_str = "—" if inten != inten else f"{inten:.3g}"  # NaN check
         if mode == "pixel":
+            # Raw detector frames have no q-axes, so no d / 2θ either.
             self._sb_cursor.setText(
                 f"row={info['row']}, col={info['col']}, I={inten_str}"
             )
         elif mode == "cartesian":
+            q = math.hypot(info["q_xy"], info["q_z"])
             self._sb_cursor.setText(
-                f"q_xy={info['q_xy']:.3f}, q_z={info['q_z']:.3f}, I={inten_str}"
+                f"q_xy={info['q_xy']:.3f}, q_z={info['q_z']:.3f}, "
+                f"I={inten_str}{self._q_derived_tail(q)}"
             )
         elif mode == "polar":
+            # ``theta`` here is the azimuth of the polar map, written χ
+            # so it cannot be misread as the scattering angle 2θ now
+            # standing next to it.
             self._sb_cursor.setText(
-                f"r={info['r']:.3f}, θ={info['theta']:.1f}°, I={inten_str}"
+                f"r={info['r']:.3f}, χ={info['theta']:.1f}°, "
+                f"I={inten_str}{self._q_derived_tail(float(info['r']))}"
             )
         else:
             self._sb_cursor.setText("")

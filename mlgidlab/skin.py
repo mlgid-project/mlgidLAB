@@ -265,6 +265,20 @@ QLabel[role="sb-cell-active"] {{
     border-left: 1px solid {t['divider']};
     color: {t['text']};
 }}
+/* The cursor readout: monospace so the digits stop jittering sideways
+   as the cursor moves. */
+QLabel[role="sb-cell-mono"] {{
+    padding: 0 8px;
+    border-left: 1px solid {t['divider']};
+    color: {t['text_muted']};
+    font-family: monospace;
+}}
+/* A run in flight. Chained attribute selectors, so this beats the plain
+   sb-cell rule above without either one having to know about the other. */
+QLabel[role="sb-cell"][status="run"] {{
+    color: {t['accent']};
+    font-weight: bold;
+}}
 
 /* --- figure-export preview pane (a plot ground, not a panel) -------- */
 QLabel[role="preview-canvas"] {{

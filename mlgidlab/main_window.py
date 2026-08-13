@@ -528,6 +528,15 @@ class MainWindow(
         if getattr(self, "_closed", False):
             return super().eventFilter(obj, ev)
         et = ev.type()
+        # Status-bar pipeline cell: clicking it opens the log of the run
+        # it is reporting on.
+        if (et == QEvent.Type.MouseButtonPress
+                and obj is getattr(self, "_sb_pipeline", None)):
+            dock = getattr(self, "_logs_dock", None)
+            if dock is not None:
+                dock.show()
+                dock.raise_()
+            return True
         if et not in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress):
             return super().eventFilter(obj, ev)
         fw = QApplication.focusWidget()

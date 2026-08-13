@@ -31,6 +31,13 @@ pre-releases.
   the CIF parse bar, both status-bar bars and every progress dialog now
   fill in the theme's accent instead of the default blue, so a run in
   flight is the one moving, coloured thing on screen.
+- **The status bar reports activity, not just state.** Unsaved changes
+  show as a dot in front of the file name instead of a `*` glued to it;
+  a pipeline run in flight colours its cell and gets a live bar, and
+  clicking that cell opens the Logs dock; the cursor readout is
+  monospace and now carries `d` and, where the entry has a wavelength,
+  the scattering angle `2θ`. The polar map's azimuth is written `χ` so
+  it cannot be misread as `2θ` beside it.
 - **The viewer's control strip reads as controls.** Cartesian / Polar is
   a segmented toggle instead of two radios, Log scale is an on/off
   button, and the colormap dropdown shows each ramp as a colour chip
