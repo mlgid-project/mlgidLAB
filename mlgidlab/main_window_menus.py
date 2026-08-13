@@ -997,6 +997,65 @@ class MenusMixin:
         )
         self.viewer._set_selected(sel)
 
+    # Menu action -> shipped glyph. Applied in one pass after the menus
+    # are built rather than at each construction site: the actions live
+    # in three modules, and a single table is what makes it obvious which
+    # entries deliberately have no icon (the clear/reset scope submenus,
+    # where an icon per scope would be noise).
+    _MENU_ICONS = {
+        "action_open": "file-open",
+        "action_import_converted": "file-open",
+        "action_save": "save",
+        "action_save_as": "save-as",
+        "action_close_file": "file-close",
+        "action_undo": "undo",
+        "action_redo": "redo",
+        "action_copy_peaks": "export-csv",
+        "action_find_peak": "find-peak",
+        "action_reset_all": "reset-peaks",
+        "action_export_figure": "export-figure",
+        "action_export_csv": "export-csv",
+        "action_toggle_cursor_readout": "cursor-readout",
+        "action_reset_layout": "reset-layout",
+        "action_fullscreen": "fullscreen",
+        "action_theme_dark": "theme-dark",
+        "action_theme_light": "theme-light",
+        "action_playback_settings": "playback-settings",
+        "action_controls": "help-controls",
+        "action_about": "about",
+        "action_copy_diagnostics": "copy-diagnostics",
+    }
+
+    #: Dock toggle actions carry the dock's own glyph, so the View menu
+    #: reads as a list of places rather than a list of checkboxes.
+    _DOCK_ICONS = {
+        "_tree_dock": "dock-tree",
+        "_display_dock": "dock-display",
+        "_pipeline_dock": "dock-pipeline",
+        "_conversion_dock": "dock-conversion",
+        "_logs_dock": "dock-logs",
+        "_profile_dock": "dock-profiles",
+        "_peaks_dock": "dock-peaks",
+    }
+
+    def _apply_menu_icons(self) -> None:
+        """Give every mapped menu action its glyph.
+
+        ``icons.bind`` registers each action, so View -> Theme repaints
+        them all; an unmapped or missing glyph simply leaves the entry
+        text-only.
+        """
+        from mlgidlab import icons
+
+        for attr, glyph in self._MENU_ICONS.items():
+            action = getattr(self, attr, None)
+            if action is not None:
+                icons.bind(action, glyph)
+        for attr, glyph in self._DOCK_ICONS.items():
+            dock = getattr(self, attr, None)
+            if dock is not None:
+                icons.bind(dock.toggleViewAction(), glyph)
+
     def _build_file_menu(self, file_menu) -> None:
 
         # Single Open action — file content is auto-classified as

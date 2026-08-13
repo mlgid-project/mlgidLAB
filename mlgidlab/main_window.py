@@ -457,6 +457,8 @@ class MainWindow(
         self._build_view_menu()
         self._build_settings_menu()
         self._build_help_menu()
+        # Menu glyphs in one pass, now that every action exists.
+        self._apply_menu_icons()
         # Frame-navigation shortcuts. Installed last so the viewer +
         # entry combo exist. Window-context QActions; text inputs
         # (QLineEdit, QSpinBox) consume Left/Right/Home/End for

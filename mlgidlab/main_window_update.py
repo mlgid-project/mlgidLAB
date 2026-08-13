@@ -7,7 +7,7 @@ source split.
 from __future__ import annotations
 
 from PySide6.QtCore import QProcess, QSettings, QThread, Qt, Slot
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -193,7 +193,28 @@ class UpdateMixin:
             "reports.</p>"
             f"<table>{rows}</table>"
         )
-        QMessageBox.about(self, "About mlgidLAB", body)
+        box = QMessageBox(self)
+        box.setWindowTitle("About mlgidLAB")
+        box.setText(body)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        # The family wordmark instead of Qt's stock information glyph.
+        # Two variants ship: the dark one has a transparent ground and
+        # lightened arcs, so the mark does not sit in a white box.
+        try:
+            from importlib import resources
+
+            variant = ("mlgid_logo_mlgidlab_dark.png"
+                       if getattr(self, "_current_theme", "dark") == "dark"
+                       else "mlgid_logo_mlgidlab.png")
+            path = resources.files("mlgidlab").joinpath(f"assets/app/{variant}")
+            with resources.as_file(path) as real:
+                pixmap = QPixmap(str(real))
+            if not pixmap.isNull():
+                box.setIconPixmap(pixmap.scaledToWidth(
+                    320, Qt.TransformationMode.SmoothTransformation))
+        except Exception:
+            logger.debug("no wordmark for the About dialog", exc_info=True)
+        box.exec()
 
     def _copy_diagnostics(self) -> None:
         """Build a plain-text diagnostics blob and put it on the

@@ -106,6 +106,25 @@ def icon(name: str, *, color: str | None = None, theme: str | None = None) -> QI
     return result
 
 
+def app_icon() -> QIcon:
+    """The window / taskbar icon, assembled from the shipped PNGs.
+
+    Pre-rendered rather than rasterised at startup: the mark is a
+    coloured drawing, and pre-rendering keeps it identical across Qt
+    versions while costing nothing on the cold path.
+    """
+    result = QIcon()
+    for size in (16, 24, 32, 48, 64, 128, 256):
+        try:
+            path = resources.files("mlgidlab").joinpath(
+                f"assets/app/mlgidlab_{size}.png")
+            with resources.as_file(path) as real:
+                result.addFile(str(real))
+        except (FileNotFoundError, ModuleNotFoundError, OSError, AttributeError):
+            logger.debug("app icon missing at %d px", size, exc_info=True)
+    return result
+
+
 def bind(target, name: str) -> None:
     """Set ``target``'s icon and re-apply it on every later theme change.
 

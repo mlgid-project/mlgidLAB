@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
 
@@ -43,6 +44,28 @@ def main() -> int:
     # persisted preferences over time).
     app.setOrganizationName("mlgidLAB")
     app.setApplicationName("mlgidLAB")
+    # Window, taskbar and Alt-Tab icon. Set on the application so every
+    # window inherits it (main window, figure export, phase views, the
+    # dialogs). Guarded: a packaging slip should cost an icon, not a
+    # startup.
+    try:
+        from mlgidlab.icons import app_icon
+        app.setWindowIcon(app_icon())
+    except Exception:
+        logging.getLogger("mlgidlab").debug(
+            "could not set the application icon", exc_info=True)
+    if sys.platform == "win32":
+        # Without an explicit AppUserModelID, Windows groups the app
+        # under python.exe's icon in the taskbar no matter what
+        # setWindowIcon says.
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "mlgidLAB.mlgidLAB")
+        except Exception:
+            logging.getLogger("mlgidlab").debug(
+                "could not set the Windows AppUserModelID", exc_info=True)
     # Honor the persisted theme choice (View → Theme). Defaults to
     # dark; the menu sync inside MainWindow reads the same key.
     theme = str(QSettings().value("theme", "dark")).lower()

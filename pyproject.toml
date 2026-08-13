@@ -123,4 +123,4 @@ include = ["mlgidlab*"]
 # silently falls back to nothing — tests/test_icons.py checks the assets
 # are importable so a broken wheel fails CI rather than a user's install.
 [tool.setuptools.package-data]
-mlgidlab = ["assets/icons/*.svg"]
+mlgidlab = ["assets/icons/*.svg", "assets/app/*.png", "assets/app/*.ico"]

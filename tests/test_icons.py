@@ -129,3 +129,32 @@ def test_the_play_button_glyph_follows_playback_state(main_window):
     assert play != pause
     assert isinstance(main_window.play_button.icon(), QIcon)
     assert not main_window.play_button.icon().isNull()
+
+
+def test_menu_actions_carry_their_glyphs(main_window):
+    """The View menu should read as a list of places, and File/Edit as a
+    list of operations — which only works if the mapping is applied."""
+    for attr in ("action_open", "action_save", "action_undo",
+                 "action_find_peak", "action_export_figure",
+                 "action_fullscreen", "action_about"):
+        action = getattr(main_window, attr, None)
+        assert action is not None, attr
+        assert not action.icon().isNull(), f"{attr} has no icon"
+
+    assert not main_window._tree_dock.toggleViewAction().icon().isNull()
+
+
+def test_every_mapped_glyph_actually_ships(main_window):
+    """A typo in the mapping would silently leave an entry text-only."""
+    shipped = set(icons.available())
+    mapped = set(main_window._MENU_ICONS.values()) | set(
+        main_window._DOCK_ICONS.values())
+    assert mapped <= shipped, f"missing glyphs: {mapped - shipped}"
+
+
+def test_menu_icons_follow_a_theme_switch(main_window):
+    main_window._set_theme("dark")
+    dark = main_window.action_open.icon().pixmap(20, 20).toImage()
+    main_window._set_theme("light")
+    light = main_window.action_open.icon().pixmap(20, 20).toImage()
+    assert dark != light

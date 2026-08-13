@@ -4,6 +4,49 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## Unreleased
+
+### Added
+
+- **An application icon.** mlgidLAB now has a window / taskbar / Alt-Tab
+  icon, and a family-consistent `mlgidLAB` wordmark in the README and
+  the About dialog. Both are drawn from one description of the mlgid
+  family mark, whose geometry was measured off the family logo, so the
+  app icon is literally the same node graph the rest of mlgid-project
+  uses — recoloured to the detector colormap.
+- **Icons in the menus and on the controls.** 43 monochrome SVG glyphs,
+  recoloured to the live theme at load time, on the File / Edit / Tools
+  / View / Settings / Help entries, the dock toggles, the playback
+  transport and the file-browser Refresh button.
+
+### Changed
+
+- **Primary and destructive actions now look like what they are.** Run
+  detection / fitting / matching, Run full pipeline, Convert, Track
+  peaks, Save figure and the calibration "Add to conversion" buttons
+  carry an accent border and label; Delete peak and the metadata Remove
+  read as destructive. The six "Clear" buttons deliberately stay
+  neutral - they clear a path field, not analysis results.
+- **Section headers, tables and the status bar were restyled.**
+  Collapsible sections get a chevron and a hairline rule instead of
+  Qt's stock triangle; the peaks, scan-tracking and conversion tables
+  share one look; status-bar fields separate cleanly with the file name
+  carrying the emphasis.
+- Colours moved into a semantic token table (`mlgidlab/theme_tokens.py`)
+  behind a scoped stylesheet layer (`mlgidlab/skin.py`). Third-party
+  widgets - silx's tree and data viewer, pyqtgraph's plots, pyFAI's
+  calibration pages - are deliberately untouched.
+
+### Fixed
+
+- **The light theme is correct again.** Roughly 30 colours were
+  hardcoded for the dark theme and never followed a theme switch: the
+  figure-export preview painted a dark rectangle inside a light window,
+  status-bar separators stayed dark grey, the CIF-cache line's four
+  states were washed out, table striping was near-invisible, and the
+  peak-selection highlight and profile curve were white on a white
+  plot ground.
+
 ## 0.1.0a16 — sixteenth alpha (2026-08-13)
 
 ### Changed

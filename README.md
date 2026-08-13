@@ -1,5 +1,9 @@
 # mlgidLAB
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mlgid-project/mlgidLAB/main/docs/images/mlgid_logo_mlgidlab.png" width="400" alt="mlgidLAB">
+</p>
+
 A desktop GUI for the
 [mlgidBASE](https://github.com/mlgid-project/mlgidBASE) GIWAXS analysis
 pipeline. It drives the full
