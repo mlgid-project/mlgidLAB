@@ -23,13 +23,17 @@ from qdarkstyle.dark.palette import DarkPalette
 from qdarkstyle.light.palette import LightPalette
 from PySide6.QtWidgets import QApplication
 
+from mlgidlab import theme_tokens
+
 # pyqtgraph background / foreground per theme. Dark matches qdarkstyle's
 # panel colour (#19232d); light matches its panel colour (#fafafa) so the
-# plots sit flush with the surrounding docks in either theme.
-PG_DARK_BACKGROUND = "#19232d"
-PG_DARK_FOREGROUND = "#dfe1e2"
-PG_LIGHT_BACKGROUND = "#fafafa"
-PG_LIGHT_FOREGROUND = "#000000"
+# plots sit flush with the surrounding docks in either theme. The values
+# live in theme_tokens (as ``plot_bg`` / ``plot_fg``); these names stay
+# because callers and tests import them.
+PG_DARK_BACKGROUND = theme_tokens.color("plot_bg", "dark")
+PG_DARK_FOREGROUND = theme_tokens.color("plot_fg", "dark")
+PG_LIGHT_BACKGROUND = theme_tokens.color("plot_bg", "light")
+PG_LIGHT_FOREGROUND = theme_tokens.color("plot_fg", "light")
 
 # Look-up used by the runtime switcher to recolour already-built plots.
 PG_COLORS = {
@@ -43,7 +47,12 @@ def pg_colors(theme: str) -> tuple[str, str]:
     return PG_COLORS.get(theme, PG_COLORS["dark"])
 
 
-def _apply(app: QApplication, *, palette, background: str, foreground: str) -> None:
+def _apply(app: QApplication, *, name: str, palette,
+           background: str, foreground: str) -> None:
+    # Record the live theme first: drawing code with no widget to ask
+    # (overlay pens, plot curves) resolves its colours through
+    # theme_tokens.active_theme().
+    theme_tokens.set_active_theme(name)
     pg.setConfigOption("background", background)
     pg.setConfigOption("foreground", foreground)
     pg.setConfigOption("antialias", True)
@@ -55,6 +64,7 @@ def _apply(app: QApplication, *, palette, background: str, foreground: str) -> N
 def apply_dark_theme(app: QApplication) -> None:
     _apply(
         app,
+        name="dark",
         palette=DarkPalette,
         background=PG_DARK_BACKGROUND,
         foreground=PG_DARK_FOREGROUND,
@@ -67,6 +77,7 @@ def apply_light_theme(app: QApplication) -> None:
     it reads as light on every desktop."""
     _apply(
         app,
+        name="light",
         palette=LightPalette,
         background=PG_LIGHT_BACKGROUND,
         foreground=PG_LIGHT_FOREGROUND,
