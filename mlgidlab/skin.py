@@ -1,0 +1,186 @@
+"""The mlgidLAB skin: a QSS layer built from ``theme_tokens``, appended
+after the qdarkstyle sheet in ``theme._apply``.
+
+Scoping rule — the thing that keeps silx, pyFAI and pyqtgraph untouched
+-----------------------------------------------------------------------
+Qt matches QSS descendant selectors by walking ``QWidget::parentWidget()``,
+and that walk does **not** stop at window boundaries. Verified:
+
+    app.setStyleSheet('[mlgidPanel="true"] QPushButton { color: #ff0000; }')
+    dlg = QDialog(panel)     # a separate window, merely parented
+    -> a QPushButton inside dlg renders #ff0000
+
+``CalibrationDialog(self, ...)`` (conversion_panel.py) is exactly that
+shape, and it hosts five pyFAI task widgets; the file browser dock hosts
+silx's ``Hdf5TreeView``. So panel-root markers, class-name scoping and
+dock-objectName scoping are all unsafe, however tidy they look.
+
+Every rule below is therefore scoped to the **leaf widget itself**, via an
+objectName or a dynamic property that this application sets:
+
+    QPushButton[variant="primary"]     QToolButton#SectionHeader
+    QLabel[status="error"]             QLabel[role="sb-cell"]
+
+The single exception is a descendant rooted at a widget we tagged that
+never parents a dialog (a table and its own header). ``tests/
+test_skin_qss.py`` enforces this, so the rule cannot rot.
+
+Property values are always strings — ``setProperty("mlgid", "table")``,
+never a bool: Qt stringifies attribute comparisons and the bool spelling
+has differed between Qt versions.
+
+Nothing opts in yet; adopting call sites is the following stage.
+"""
+from __future__ import annotations
+
+from mlgidlab import theme_tokens
+
+#: Tagged as ``widget.setProperty("variant", …)``.
+PRIMARY = "primary"
+DANGER = "danger"
+
+#: objectName for the CollapsibleSection header button.
+SECTION_HEADER = "SectionHeader"
+
+#: The one descendant-scoped rule, kept in a constant so the guard test
+#: and the sheet cannot disagree about what is allowed.
+TABLE_SELECTOR = 'QTableView[mlgid="table"]'
+
+
+def marker(theme: str) -> str:
+    """The comment stamped at the top of the sheet, so a test (or a bug
+    report) can tell which theme's skin is live."""
+    return f"/* mlgid-skin {theme} */"
+
+
+def build_qss(theme: str) -> str:
+    """The skin layer for ``theme``. Appended to the qdarkstyle sheet."""
+    t = theme_tokens.tokens(theme)
+    return f"""{marker(theme)}
+
+/* --- primary action: accent border and label, transparent ground ----
+   Outlined rather than filled so a dock full of controls keeps one
+   obvious action without a block of colour fighting the detector
+   image next to it. */
+QPushButton[variant="{PRIMARY}"] {{
+    background-color: transparent;
+    color: {t['accent']};
+    border: 1px solid {t['accent']};
+    border-radius: 4px;
+    padding: 4px 12px;
+    font-weight: bold;
+}}
+QPushButton[variant="{PRIMARY}"]:hover {{
+    background-color: {t['accent_soft']};
+    color: {t['accent_hover']};
+    border-color: {t['accent_hover']};
+}}
+QPushButton[variant="{PRIMARY}"]:pressed {{
+    background-color: {t['accent_soft']};
+    color: {t['accent_pressed']};
+    border-color: {t['accent_pressed']};
+}}
+QPushButton[variant="{PRIMARY}"]:disabled {{
+    background-color: transparent;
+    color: {t['text_disabled']};
+    border-color: {t['border']};
+}}
+
+/* --- destructive action: a red edge, never a red fill ---------------
+   Reserved for operations that lose data. A filled red button reads as
+   "danger" even while idle, which is wrong for a control the user is
+   expected to press deliberately. */
+QPushButton[variant="{DANGER}"] {{
+    color: {t['danger']};
+    border: 1px solid {t['border']};
+    border-radius: 4px;
+    padding: 4px 12px;
+}}
+QPushButton[variant="{DANGER}"]:hover {{
+    color: {t['danger_hover']};
+    border-color: {t['danger']};
+}}
+QPushButton[variant="{DANGER}"]:disabled {{
+    color: {t['text_disabled']};
+    border-color: {t['border']};
+}}
+
+/* --- section header (CollapsibleSection's own button) ----------------
+   qdarkstyle ships 19 QToolButton rules, so the background and border
+   must be restated explicitly or the 13 headers grow button chrome. */
+QToolButton#{SECTION_HEADER} {{
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid {t['divider']};
+    border-radius: 0px;
+    padding: 6px 2px 5px 2px;
+    font-weight: bold;
+    color: {t['text']};
+    text-align: left;
+}}
+QToolButton#{SECTION_HEADER}:hover {{
+    color: {t['accent']};
+    border-bottom: 1px solid {t['accent']};
+}}
+QToolButton#{SECTION_HEADER}:checked {{
+    color: {t['text']};
+}}
+
+/* --- semantic status text -------------------------------------------
+   Replaces the hardcoded per-state hexes scattered through the panels,
+   which never followed a theme flip. */
+QLabel[status="muted"] {{ color: {t['text_muted']}; font-style: italic; }}
+QLabel[status="ok"] {{ color: {t['status_ok']}; font-style: italic; }}
+QLabel[status="warn"] {{ color: {t['status_warn']}; font-style: italic; }}
+QLabel[status="error"] {{ color: {t['status_error']}; font-style: italic; }}
+QLabel[status="info"] {{ color: {t['status_info']}; font-style: italic; }}
+QLabel[role="section"] {{ color: {t['text']}; font-weight: bold; }}
+QLabel[role="hint"] {{ color: {t['text_muted']}; font-style: italic; }}
+
+/* --- item views this application owns -------------------------------
+   qdarkstyle ships no QTableView rules at all, so alternating rows fall
+   back to the OS palette and are near-invisible in light theme. */
+{TABLE_SELECTOR} {{
+    gridline-color: {t['table_grid']};
+    alternate-background-color: {t['table_alt_row']};
+}}
+{TABLE_SELECTOR}::item {{
+    padding: 1px 3px;
+}}
+{TABLE_SELECTOR} QHeaderView::section {{
+    background-color: {t['table_header']};
+    color: {t['text_muted']};
+    border: none;
+    border-right: 1px solid {t['divider']};
+    border-bottom: 1px solid {t['divider']};
+    padding: 3px 4px;
+    font-weight: bold;
+}}
+
+/* --- status bar cells ------------------------------------------------ */
+QLabel[role="sb-cell"] {{
+    padding: 0 8px;
+    border-left: 1px solid {t['divider']};
+    color: {t['text_muted']};
+}}
+QLabel[role="sb-cell-active"] {{
+    padding: 0 8px;
+    border-left: 1px solid {t['divider']};
+    color: {t['text']};
+}}
+
+/* --- figure-export preview pane (a plot ground, not a panel) -------- */
+QLabel[role="preview-canvas"] {{
+    background-color: {t['plot_bg']};
+    color: {t['text_muted']};
+}}
+
+/* --- update banner (objectName already set in update_ui.py) --------- */
+#UpdateBanner {{
+    background-color: {t['banner_bg']};
+    border: none;
+}}
+QLabel#UpdateBannerText {{
+    color: {t['banner_fg']};
+}}
+"""

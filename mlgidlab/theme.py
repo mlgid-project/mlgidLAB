@@ -23,7 +23,7 @@ from qdarkstyle.dark.palette import DarkPalette
 from qdarkstyle.light.palette import LightPalette
 from PySide6.QtWidgets import QApplication
 
-from mlgidlab import theme_tokens
+from mlgidlab import skin, theme_tokens
 
 # pyqtgraph background / foreground per theme. Dark matches qdarkstyle's
 # panel colour (#19232d); light matches its panel colour (#fafafa) so the
@@ -57,7 +57,11 @@ def _apply(app: QApplication, *, name: str, palette,
     pg.setConfigOption("foreground", foreground)
     pg.setConfigOption("antialias", True)
     app.setStyleSheet(
-        qdarkstyle.load_stylesheet(qt_api="pyside6", palette=palette) + _OVERRIDES
+        qdarkstyle.load_stylesheet(qt_api="pyside6", palette=palette)
+        + _OVERRIDES
+        # Appended last so its selectors win equal-specificity ties with
+        # qdarkstyle's. Every rule is opt-in per widget — see skin.py.
+        + skin.build_qss(name)
     )
 
 
