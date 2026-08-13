@@ -8,6 +8,7 @@ import json
 
 import numpy as np
 from PySide6.QtCore import QSettings, Qt
+from mlgidlab import theme_tokens
 
 
 OVERLAY_KINDS = ("detected", "fitted", "manual")
@@ -41,6 +42,17 @@ OVERLAY_STYLE: dict[str, dict] = {
 }
 
 SELECTION_STYLE = {"color": "#ffffff", "style": Qt.PenStyle.SolidLine, "width": 2.5}
+
+
+def selection_style(theme: str | None = None) -> dict:
+    """``SELECTION_STYLE`` with a colour visible on this theme's plot.
+
+    The constant keeps its dark value so every existing import still
+    resolves; only the colour is swapped, because a white highlight on
+    the light theme's #fafafa plot ground is invisible.
+    """
+    return {**SELECTION_STYLE,
+            "color": theme_tokens.color("overlay_selection", theme)}
 
 # Faint preview of the would-be fitted_peaks box for the currently selected
 # manual peak. Same hue as the fitted overlay so the user reads the
@@ -125,6 +137,16 @@ _SIM_STATE_COLORS = {
     "explained": SIM_EXPLAINED_COLOR,
     "selected": SIM_SELECTED_COLOR,
 }
+
+
+def sim_state_colors(theme: str | None = None) -> dict:
+    """``_SIM_STATE_COLORS`` with a theme-visible "selected" entry.
+
+    Missed (orange) and explained (green) read on both grounds and are
+    left alone; only the white selection highlight needs flipping.
+    """
+    return {**_SIM_STATE_COLORS,
+            "selected": theme_tokens.color("sim_selected", theme)}
 SIM_OVERLAY_OPACITY = 0.55
 # Marker diameter encodes relative simulated intensity, log-scaled
 # across three decades (rel=1 -> MAX, rel<=1e-3 -> MIN).

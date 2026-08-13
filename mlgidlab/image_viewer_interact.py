@@ -30,6 +30,7 @@ from mlgidlab.viewer_styles import (
     MODE_POLAR,
     MODE_RAW,
     SELECTION_STYLE,
+    selection_style,
 )
 
 
@@ -1119,17 +1120,19 @@ class ViewerInteractMixin:
         # static overlay items (red dashed for detected, yellow
         # solid for manual) — those stay visible behind the white
         # outline + ROI handles.
+        # Asked for per draw: the highlight colour follows the theme
+        # (white on the dark plot ground, near-black on the light one).
+        style = selection_style()
         pen = pg.mkPen(
-            QColor(SELECTION_STYLE["color"]),
-            width=SELECTION_STYLE["width"],
+            QColor(style["color"]),
+            width=style["width"],
         )
-        pen.setStyle(SELECTION_STYLE["style"])
+        pen.setStyle(style["style"])
         pen.setCosmetic(True)
-        # Hover keeps the same white pen so there's no flicker on
-        # mouseover.
+        # Hover keeps the same pen so there's no flicker on mouseover.
         hover_pen = pg.mkPen(
-            QColor(SELECTION_STYLE["color"]),
-            width=SELECTION_STYLE["width"],
+            QColor(style["color"]),
+            width=style["width"],
         )
         hover_pen.setCosmetic(True)
 

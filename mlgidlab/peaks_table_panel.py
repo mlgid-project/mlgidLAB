@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
 
 from mlgidlab.file_model import MatchedStructure, PeakTable
 from mlgidlab.image_viewer import SelectedPeak
+from mlgidlab.widgets import skin_item_view as _skin_item_view
 
 
 # Tab index constants. Order matches the order tabs are added in
@@ -368,7 +369,7 @@ class PeaksTablePanel(QWidget):
         table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
         table.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
-        table.setAlternatingRowColors(True)
+        _skin_item_view(table)
         table.verticalHeader().setVisible(False)
         # Pack columns to their narrowest content for max visibility
         # in a narrow dock. ``ResizeToContents`` is applied after
@@ -384,14 +385,9 @@ class PeaksTablePanel(QWidget):
         # actual text width rather than the platform-default 26 px
         # floor. 18 px leaves room for the sort-arrow indicator.
         table.horizontalHeader().setMinimumSectionSize(18)
-        # Compact cell + header padding. Default Qt cell padding is
-        # ~6 px on each side; trimming to 1×3 reclaims ~6 px per
-        # column without harming legibility. Header gets the same
-        # treatment for the same reason.
-        table.setStyleSheet(
-            "QTableView::item { padding: 1px 3px; }"
-            " QHeaderView::section { padding: 1px 3px; }"
-        )
+        # Compact cell + header padding (~6 px reclaimed per column in
+        # a narrow dock) now comes from the skin's QTableView[mlgid]
+        # rules, applied by _skin_item_view above.
         return table, proxy
 
     # Per-column upper bound on width after pack. Long string

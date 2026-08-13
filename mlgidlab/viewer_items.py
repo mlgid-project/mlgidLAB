@@ -510,6 +510,19 @@ class _PeakShapeItem(pg.GraphicsObject):
         self._path = QPainterPath()
         self._bounding = QRectF()
 
+    def set_pen_color(self, color: str) -> None:
+        """Swap the outline colour, keeping style and width.
+
+        Used by the theme switch: the selection highlight is white on the
+        dark plot ground and near-black on the light one, and the item is
+        built once at construction.
+        """
+        pen = pg.mkPen(QColor(color), width=self._pen.widthF())
+        pen.setStyle(self._pen.style())
+        pen.setCosmetic(True)
+        self._pen = pen
+        self.update()
+
     def set_polar(
         self,
         peaks: PeakTable | None,

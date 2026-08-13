@@ -75,6 +75,7 @@ from mlgidlab.viewer_styles import (
     OVERLAY_KINDS,
     OVERLAY_STYLE,
     SELECTION_STYLE,
+    selection_style,
     SIM_EXPLAINED_COLOR,
     SIM_MARKER_MAX_PX,
     SIM_MARKER_MIN_PX,
@@ -750,6 +751,20 @@ class GIWAXSImageViewer(
                 hist_axis.setTextPen(pen)
         except Exception:
             logger.debug("suppressed exception recolouring histogram", exc_info=True)
+        # The selection highlight is drawn white on the dark plot ground
+        # and near-black on the light one; the overlay item was built at
+        # construction time, so re-pen it here. Overlay/matched colours
+        # are data, not chrome, and deliberately stay put.
+        try:
+            self._selection.set_pen_color(selection_style()["color"])
+        except Exception:
+            logger.debug("suppressed exception recolouring selection", exc_info=True)
+        # Re-render so the simulation overlay picks up its theme-visible
+        # "selected" colour on the next paint.
+        try:
+            self._render_simulation_overlays(self.current_frame)
+        except Exception:
+            logger.debug("suppressed exception refreshing sim overlay", exc_info=True)
 
     # -- Aspect ratio (toolbar "Aspect:" Fit / Default / Custom) --
 

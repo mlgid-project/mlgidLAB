@@ -14,7 +14,7 @@ from typing import Callable
 
 from mlgidlab.skin import DANGER, PRIMARY  # noqa: F401  (re-exported)
 
-from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
@@ -49,6 +49,22 @@ def set_variant(widget: QWidget, variant: str = "") -> QWidget:
     return widget
 
 
+def skin_item_view(view: QWidget) -> QWidget:
+    """Tag an item view so the skin paints its grid, header and rows.
+
+    Presentation only, deliberately: selection behaviour, edit triggers,
+    sorting and column sizing stay at the call sites, because those are
+    behaviour that the table tests pin and the two tables genuinely
+    differ on. It replaces the padding stylesheet that was copy-pasted
+    into both of them, and adds what qdarkstyle never shipped — it has
+    no QTableView rules at all, so alternating rows fell back to the OS
+    palette and were near-invisible in the light theme.
+    """
+    view.setProperty("mlgid", "table")
+    view.setAlternatingRowColors(True)
+    return view
+
+
 def make_form(parent: QWidget | None = None) -> QFormLayout:
     """Build a QFormLayout configured to wrap long rows.
 
@@ -81,15 +97,18 @@ class CollapsibleSection(QWidget):
         outer.setSpacing(0)
 
         self._toggle = QToolButton(self)
+        self._toggle.setObjectName("SectionHeader")
         self._toggle.setText(title)
         self._toggle.setCheckable(True)
         self._toggle.setChecked(expanded)
         self._toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self._toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
-        # Section header: no border, bold, full width — matches dark theme.
-        self._toggle.setStyleSheet(
-            "QToolButton { border: none; padding: 4px 0px; font-weight: bold; }"
-        )
+        self._toggle.setIconSize(QSize(14, 14))
+        # Look comes from the skin's QToolButton#SectionHeader rules
+        # (transparent ground, hairline rule, accent on hover). It has to
+        # restate background and border explicitly, because qdarkstyle
+        # ships 19 QToolButton rules that would otherwise give all 13
+        # headers full button chrome.
+        self._set_marker(expanded)
         self._toggle.toggled.connect(self._on_toggled)
         outer.addWidget(self._toggle)
 
@@ -101,15 +120,36 @@ class CollapsibleSection(QWidget):
         self._body.setVisible(expanded)
         outer.addWidget(self._body)
 
+    def _set_marker(self, expanded: bool) -> None:
+        """Point the chevron down (open) or right (closed).
+
+        ``icons.bind`` both sets the glyph and registers the button, so a
+        later theme switch repaints it; re-binding on every toggle keeps
+        the registered name in step with the state. The import is local
+        and guarded so a packaging slip degrades to Qt's built-in
+        triangle instead of leaving a blank header.
+        """
+        name = "chevron-down" if expanded else "chevron-right"
+        try:
+            from mlgidlab import icons
+
+            icons.bind(self._toggle, name)
+            if not self._toggle.icon().isNull():
+                self._toggle.setArrowType(Qt.ArrowType.NoArrow)
+                return
+        except Exception:  # pragma: no cover - defensive
+            pass
+        self._toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+
     def _on_toggled(self, checked: bool) -> None:
         self._apply_state(checked)
         self.expandedChanged.emit(checked)
 
     def _apply_state(self, expanded: bool) -> None:
         self._body.setVisible(expanded)
-        self._toggle.setArrowType(
-            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
-        )
+        self._set_marker(expanded)
 
 
 def make_debounced_timer(parent: QWidget, ms: int, slot: Callable[[], None]) -> QTimer:

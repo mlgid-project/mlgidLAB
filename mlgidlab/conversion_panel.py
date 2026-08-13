@@ -70,6 +70,7 @@ from mlgidlab.conversion_config import (
 )
 from mlgidlab.widgets import CollapsibleSection as _CollapsibleSection
 from mlgidlab.widgets import make_form as _make_form
+from mlgidlab.widgets import skin_item_view as _skin_item_view
 from mlgidlab.widgets import DANGER as _DANGER, PRIMARY as _PRIMARY, set_variant as _set_variant
 
 
@@ -1007,7 +1008,7 @@ class ConversionPanel(QWidget):
         exp_label = QLabel("<b>Experimental metadata</b>")
         section.body_layout.addWidget(exp_label)
 
-        self.exp_meta_table = QTableWidget(0, 3)
+        self.exp_meta_table = _skin_item_view(QTableWidget(0, 3))
         self.exp_meta_table.setHorizontalHeaderLabels(["Key", "Value", "Source"])
         self.exp_meta_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.Stretch

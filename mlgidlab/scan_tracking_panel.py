@@ -42,6 +42,7 @@ from mlgidlab.peaks_table_panel import (
 )
 from mlgidlab.phase_tracking import TrackingPayload, member_ids  # noqa: F401 (member_ids re-exported for the host)
 from mlgidlab.widgets import PRIMARY as _PRIMARY, set_variant as _set_variant
+from mlgidlab.widgets import skin_item_view as _skin_item_view
 
 logger = logging.getLogger(__name__)
 
@@ -201,14 +202,10 @@ class ScanTrackingPanel(QWidget):
             QTableView.SelectionMode.SingleSelection
         )
         self._table.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
-        self._table.setAlternatingRowColors(True)
+        _skin_item_view(self._table)
         self._table.verticalHeader().setVisible(False)
         self._table.horizontalHeader().setStretchLastSection(False)
         self._table.horizontalHeader().setMinimumSectionSize(18)
-        self._table.setStyleSheet(
-            "QTableView::item { padding: 1px 3px; }"
-            " QHeaderView::section { padding: 1px 3px; }"
-        )
         self._table.selectionModel().currentRowChanged.connect(
             self._on_row_changed
         )
