@@ -212,3 +212,47 @@ def _save_matched_color_overrides(overrides: dict[tuple, str]) -> None:
 # is a transitive dep via silx.
 COLORMAPS = ("viridis", "inferno", "plasma", "magma", "cividis", "gray")
 DEFAULT_COLORMAP = "magma"
+
+
+def resolve_colormap(name: str):
+    """The pyqtgraph ``ColorMap`` for ``name``, or None.
+
+    matplotlib first (always present via silx), then pyqtgraph's own
+    registry for anything matplotlib does not know. Shared by the render
+    path and the dropdown swatches so the strip cannot advertise a ramp
+    the image does not use.
+    """
+    import pyqtgraph as pg
+
+    for source in ("matplotlib", None):
+        try:
+            return (pg.colormap.get(name, source=source) if source
+                    else pg.colormap.get(name))
+        except Exception:
+            continue
+    return None
+
+
+def colormap_swatch(name: str, size: int = 32):
+    """A square gradient chip for ``name`` as a QPixmap (null if unknown).
+
+    The dropdown used to list six words; a GIWAXS user picks a colormap
+    by how it ramps, not by its name.
+
+    Square on purpose. A wide strip is the nicer picture, but Qt sizes
+    item icons from a single length — ``iconSize`` and the QSS
+    ``icon-size`` property are both one number — so a 56x12 strip is
+    either squeezed to the style's 16 px box or forces 58 px rows. A
+    square chip renders correctly at whatever size the style asks for.
+    """
+    from PySide6.QtGui import QColor, QImage, QPixmap
+
+    cmap = resolve_colormap(name)
+    if cmap is None:
+        return QPixmap()
+    lut = cmap.getLookupTable(nPts=size, alpha=False)
+    strip = QImage(size, 1, QImage.Format.Format_RGB32)
+    for x in range(size):
+        r, g, b = (int(v) for v in lut[x][:3])
+        strip.setPixelColor(x, 0, QColor(r, g, b))
+    return QPixmap.fromImage(strip).scaled(size, size)

@@ -31,6 +31,10 @@ pre-releases.
   the CIF parse bar, both status-bar bars and every progress dialog now
   fill in the theme's accent instead of the default blue, so a run in
   flight is the one moving, coloured thing on screen.
+- **The viewer's control strip reads as controls.** Cartesian / Polar is
+  a segmented toggle instead of two radios, Log scale is an on/off
+  button, and the colormap dropdown shows each ramp as a colour chip
+  rather than only its name.
 - **Every section now has the same shape.** Sections were built three
   ways (a hand-bolded label, a collapsible header, a group box), so the
   Display, Pipeline and Conversion docks each read like a different

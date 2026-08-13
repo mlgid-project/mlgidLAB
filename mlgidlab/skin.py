@@ -142,6 +142,62 @@ QLabel[role="{CARD_TITLE}"] {{
     color: {t['text']};
 }}
 
+/* --- segmented pair (viewer: Cartesian | Polar) ----------------------
+   One exclusive choice shown as two joined halves. The inner border is
+   dropped on the left half so the two meet on a single shared edge
+   rather than showing a double rule. */
+QToolButton[segment="left"], QToolButton[segment="right"] {{
+    background: transparent;
+    border: 1px solid {t['border']};
+    padding: 3px 10px;
+    color: {t['text_muted']};
+}}
+QToolButton[segment="left"] {{
+    border-right: none;
+    border-top-left-radius: 4px;
+    border-bottom-left-radius: 4px;
+}}
+QToolButton[segment="right"] {{
+    border-top-right-radius: 4px;
+    border-bottom-right-radius: 4px;
+}}
+QToolButton[segment="left"]:checked, QToolButton[segment="right"]:checked {{
+    background-color: {t['accent_soft']};
+    color: {t['accent']};
+    font-weight: bold;
+}}
+QToolButton[segment="left"]:hover, QToolButton[segment="right"]:hover {{
+    color: {t['accent_hover']};
+}}
+QToolButton[segment="left"]:disabled, QToolButton[segment="right"]:disabled {{
+    color: {t['text_disabled']};
+    border-color: {t['divider']};
+}}
+
+/* --- on/off toggle (viewer: Log scale) -------------------------------
+   A mode the image is in, not a form field, so it reads as a pressed
+   button rather than a tick. */
+QToolButton[variant="toggle"] {{
+    background: transparent;
+    border: 1px solid {t['border']};
+    border-radius: 4px;
+    padding: 3px 8px;
+    color: {t['text_muted']};
+}}
+QToolButton[variant="toggle"]:checked {{
+    background-color: {t['accent_soft']};
+    border-color: {t['accent']};
+    color: {t['accent']};
+    font-weight: bold;
+}}
+QToolButton[variant="toggle"]:hover {{
+    color: {t['accent_hover']};
+}}
+QToolButton[variant="toggle"]:disabled {{
+    color: {t['text_disabled']};
+    border-color: {t['divider']};
+}}
+
 /* --- semantic status text -------------------------------------------
    Replaces the hardcoded per-state hexes scattered through the panels,
    which never followed a theme flip. */

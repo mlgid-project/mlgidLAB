@@ -19,20 +19,20 @@ from PySide6.QtCore import (
     QRectF,
     QSettings,
     QSignalBlocker,
+    QSize,
     Qt,
     Signal,
 )
-from PySide6.QtGui import QAction, QColor, QPainterPath
+from PySide6.QtGui import QAction, QColor, QIcon, QPainterPath
 from PySide6.QtWidgets import (
     QButtonGroup,
-    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QRadioButton,
     QSlider,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -51,7 +51,7 @@ from mlgidlab.polar import polar_to_qxyz
 from mlgidlab.image_viewer_overlays import ViewerOverlaysMixin
 from mlgidlab.image_viewer_render import ViewerRenderMixin
 from mlgidlab.image_viewer_interact import ViewerInteractMixin
-from mlgidlab import simulation_pattern
+from mlgidlab import icons, simulation_pattern
 
 import logging
 logger = logging.getLogger(__name__)
@@ -62,6 +62,7 @@ logger = logging.getLogger(__name__)
 from mlgidlab.viewer_styles import (
     COLORMAPS,
     DEFAULT_COLORMAP,
+    colormap_swatch,
     FITTED_PREVIEW_OPACITY,
     FITTED_PREVIEW_STYLE,
     MATCHED_LINE_STYLES,
@@ -120,6 +121,58 @@ from mlgidlab.viewer_items import (
     _polar_table_row_contains,
     _robust_levels,
 )
+
+
+#: Edge of the square colormap chip. The pixmap is rendered at 32 px so
+#: it stays crisp if a style asks for more than the 16 px it is shown at.
+CMAP_SWATCH = 32
+CMAP_ICON_SIZE = 16
+
+
+class _SwatchCombo(QComboBox):
+    """A combo box whose icon size survives a style change.
+
+    Qt clears an explicitly set ``iconSize`` when the widget is polished
+    under an application stylesheet — it comes back as 0x0, and a 0x0
+    icon is simply not drawn, so the colormap chip disappears from the
+    closed box. That happens on the first show and again on every theme
+    flip, so the size is re-applied on each style change rather than once
+    at construction. (The QSS ``icon-size`` property looks like the tidy
+    answer but does not reach this combo; it is nested inside the viewer,
+    not a top-level widget.)
+    """
+
+    def __init__(self, icon_size: QSize, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._wanted_icon_size = icon_size
+        self.setIconSize(icon_size)
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if (event.type() == QEvent.Type.StyleChange
+                and self.iconSize() != self._wanted_icon_size):
+            self.setIconSize(self._wanted_icon_size)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self.iconSize() != self._wanted_icon_size:
+            self.setIconSize(self._wanted_icon_size)
+
+
+def _segment_button(text: str, glyph: str, position: str) -> QToolButton:
+    """One half of a segmented, mutually exclusive pair.
+
+    ``position`` ("left" / "right") tells the skin which outer corners to
+    round and which inner border to drop, so the two halves meet on a
+    single shared edge instead of showing a double rule.
+    """
+    button = QToolButton()
+    button.setText(text)
+    button.setCheckable(True)
+    button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+    button.setProperty("segment", position)
+    icons.bind(button, glyph)
+    return button
 
 
 class GIWAXSImageViewer(
@@ -187,20 +240,48 @@ class GIWAXSImageViewer(
         bar = QHBoxLayout()
         bar.setContentsMargins(8, 4, 8, 4)
         bar.addWidget(QLabel("View:"))
-        self._radio_cart = QRadioButton("Cartesian")
-        self._radio_polar = QRadioButton("Polar")
+        # A segmented pair rather than two radios: the choice is one
+        # exclusive view mode, and a segmented control shows the two
+        # options and the active one in the space two radios plus their
+        # labels took. Still a QButtonGroup, still named ``_radio_*``,
+        # so ``set_mode_radios_visible`` and the render path are
+        # unchanged.
+        self._radio_cart = _segment_button("Cartesian", "view-cartesian", "left")
+        self._radio_polar = _segment_button("Polar", "view-polar", "right")
         self._radio_polar.setChecked(True)
         self._radio_group = QButtonGroup(self)
+        self._radio_group.setExclusive(True)
         self._radio_group.addButton(self._radio_cart)
         self._radio_group.addButton(self._radio_polar)
         self._radio_cart.toggled.connect(self._on_radio_toggled)
-        bar.addWidget(self._radio_cart)
-        bar.addWidget(self._radio_polar)
+        segmented = QHBoxLayout()
+        segmented.setContentsMargins(0, 0, 0, 0)
+        segmented.setSpacing(0)          # the two halves share one edge
+        segmented.addWidget(self._radio_cart)
+        segmented.addWidget(self._radio_polar)
+        bar.addLayout(segmented)
         bar.addSpacing(16)
         bar.addWidget(QLabel("Colormap:"))
-        self._cmap_combo = QComboBox()
+        self._cmap_combo = _SwatchCombo(
+            QSize(CMAP_ICON_SIZE, CMAP_ICON_SIZE))
+        # With an app-level stylesheet installed, QComboBox takes its
+        # width from the CSS box model and does not grow for the icon, so
+        # the name ends up clipped. Measure the widest name rather than
+        # hardcoding a width, so this survives a font change.
+        _metrics = self._cmap_combo.fontMetrics()
+        self._cmap_combo.setMinimumWidth(
+            max(_metrics.horizontalAdvance(n) for n in COLORMAPS)
+            + 56                       # chip, dropdown arrow, padding
+        )
         for name in COLORMAPS:
-            self._cmap_combo.addItem(name)
+            # The ramp itself, not just its name: a colormap is picked by
+            # how it ramps. Falls back to a bare name if the chip cannot
+            # be built (a null pixmap makes a text-only row, not a crash).
+            swatch = colormap_swatch(name, CMAP_SWATCH)
+            if swatch.isNull():
+                self._cmap_combo.addItem(name)
+            else:
+                self._cmap_combo.addItem(QIcon(swatch), name)
         self._cmap_combo.setCurrentText(DEFAULT_COLORMAP)
         self._cmap_combo.currentTextChanged.connect(self._on_cmap_changed)
         bar.addWidget(self._cmap_combo)
@@ -210,7 +291,17 @@ class GIWAXSImageViewer(
         # recomputed on the transformed array so the LUT stays sensible.
         # Coordinates and overlays are unaffected — only the intensity
         # mapping changes.
-        self._log_check = QCheckBox("Log scale")
+        # A toggle button rather than a checkbox: it is a mode the image
+        # is in, and it reads as on/off at a glance next to the segmented
+        # view pair. Same name, same ``toggled`` signal, same persisted
+        # setting — ``setChecked`` still drives it.
+        self._log_check = QToolButton()
+        self._log_check.setText("Log scale")
+        self._log_check.setCheckable(True)
+        self._log_check.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._log_check.setProperty("variant", "toggle")
+        icons.bind(self._log_check, "log-scale")
         self._log_check.setChecked(False)
         self._log_check.setToolTip(
             "Display log10(intensity) instead of linear intensity. "

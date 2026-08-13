@@ -28,6 +28,7 @@ from mlgidlab.viewer_styles import (
     MODE_RAW,
     UNMATCHED_COLOR,
     UNMATCHED_UID,
+    resolve_colormap,
 )
 
 import logging
@@ -644,17 +645,9 @@ class ViewerRenderMixin:
         self._apply_cmap(name)
 
     def _apply_cmap(self, name: str) -> None:
-        # Try matplotlib first (always present via silx); fall back to the
-        # internal pyqtgraph maps if the user picked something not in mpl.
-        cmap = None
-        for source in ("matplotlib", None):
-            try:
-                cmap = pg.colormap.get(name, source=source) if source else pg.colormap.get(name)
-            except Exception:
-                logger.debug("suppressed exception in GIWAXSImageViewer._apply_cmap", exc_info=True)
-                cmap = None
-            if cmap is not None:
-                break
+        # One resolver, shared with the dropdown's gradient swatches, so
+        # the strip cannot advertise a ramp the image does not use.
+        cmap = resolve_colormap(name)
         if cmap is not None:
             self._view.setColorMap(cmap)
 
