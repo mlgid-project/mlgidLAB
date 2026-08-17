@@ -20,6 +20,7 @@ from PySide6.QtCore import (
     QSettings,
     QSignalBlocker,
     QSize,
+    QTimer,
     Qt,
     Signal,
 )
@@ -136,10 +137,15 @@ class _SwatchCombo(QComboBox):
     under an application stylesheet — it comes back as 0x0, and a 0x0
     icon is simply not drawn, so the colormap chip disappears from the
     closed box. That happens on the first show and again on every theme
-    flip, so the size is re-applied on each style change rather than once
-    at construction. (The QSS ``icon-size`` property looks like the tidy
-    answer but does not reach this combo; it is nested inside the viewer,
-    not a top-level widget.)
+    flip (``_set_theme`` re-polishes every widget), so the size has to be
+    re-applied rather than set once at construction.
+
+    The re-apply is deferred by a zero-timer: Qt clears the size *after*
+    the style change is delivered, so setting it from inside
+    ``changeEvent`` is undone immediately — the chip survived the first
+    show and then vanished on the first theme flip. (The QSS
+    ``icon-size`` property looks like the tidy answer but does not reach
+    this combo; it is nested inside the viewer, not a top-level widget.)
     """
 
     def __init__(self, icon_size: QSize, parent: QWidget | None = None) -> None:
@@ -147,16 +153,18 @@ class _SwatchCombo(QComboBox):
         self._wanted_icon_size = icon_size
         self.setIconSize(icon_size)
 
+    def _restore_icon_size(self) -> None:
+        if self.iconSize() != self._wanted_icon_size:
+            self.setIconSize(self._wanted_icon_size)
+
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
-        if (event.type() == QEvent.Type.StyleChange
-                and self.iconSize() != self._wanted_icon_size):
-            self.setIconSize(self._wanted_icon_size)
+        if event.type() == QEvent.Type.StyleChange:
+            QTimer.singleShot(0, self._restore_icon_size)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        if self.iconSize() != self._wanted_icon_size:
-            self.setIconSize(self._wanted_icon_size)
+        self._restore_icon_size()
 
 
 def _segment_button(text: str, glyph: str, position: str) -> QToolButton:

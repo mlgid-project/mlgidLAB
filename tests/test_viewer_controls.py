@@ -111,6 +111,23 @@ def test_the_dropdown_carries_the_ramps(viewer):
         assert not combo.itemIcon(index).isNull(), combo.itemText(index)
 
 
+def test_the_chip_survives_a_theme_flip(qtbot, main_window):
+    """Regression: Qt clears an explicitly set ``iconSize`` when a widget
+    is polished under an application stylesheet, and it clears it *after*
+    the style change is delivered — so the chip showed on first launch
+    and then disappeared from the closed box on the first View -> Theme.
+    A 0x0 icon is not drawn at all."""
+    combo = main_window.viewer._cmap_combo
+    main_window.show()
+    qtbot.waitUntil(lambda: not combo.iconSize().isEmpty(), timeout=2000)
+
+    for theme in ("light", "dark", "light"):
+        main_window._set_theme(theme)
+        qtbot.waitUntil(lambda: not combo.iconSize().isEmpty(), timeout=2000)
+        assert combo.iconSize().width() > 0, f"chip lost on {theme}"
+    assert not combo.itemIcon(combo.currentIndex()).isNull()
+
+
 def test_the_skin_defines_the_new_control_rules():
     for theme in ("dark", "light"):
         qss = skin.build_qss(theme)
