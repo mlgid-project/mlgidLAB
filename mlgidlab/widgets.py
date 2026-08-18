@@ -256,6 +256,18 @@ class Card(QWidget):
         style.polish(self._status)
         self._status.setVisible(bool(text))
 
+    def open_width_hint(self) -> int:
+        """How wide this section wants to be *when open*.
+
+        Valid while it is closed: a hidden widget still answers
+        ``sizeHint``, it just stops contributing to its parent's. The
+        dock-sizing code needs that, because the width a panel needs is
+        set by its fullest section, not by whichever ones happen to be
+        open when the window is built.
+        """
+        left, _, right, _ = BODY_INSET
+        return self._body.sizeHint().width() + left + right
+
     def is_expanded(self) -> bool:
         # ``isHidden`` rather than ``isVisible``: the question is whether
         # this section is open, which is true even while the whole dock

@@ -35,6 +35,15 @@ pre-releases.
 
 ### Changed
 
+- **The right-hand docks open wide enough to read.** The column was
+  pinned to 350 px, which compressed the Pipeline form (its
+  "Config (yaml)" field showed as a stub) — the panels sit in scroll
+  areas with the horizontal scrollbar locked off, so a narrow column
+  elides rather than scrolls. The width is now measured from the
+  panels themselves, including the sections that start collapsed, and
+  the window opens at 1600x950 where the screen allows it so there is
+  room for it.
+
 - **The strips above the image wrap instead of setting a width floor.**
   The viewer's control bar and the workflow rail were single rows whose
   minimum width is the sum of everything in them, which stopped the

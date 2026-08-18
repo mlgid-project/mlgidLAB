@@ -149,3 +149,15 @@ def conversion_panel(qtbot):
     panel = ConversionPanel()
     qtbot.addWidget(panel)
     return panel
+
+def test_a_closed_section_still_reports_the_width_it_wants(qtbot):
+    """The dock-sizing code asks a collapsed section how wide it would
+    be if opened; a hidden widget still answers ``sizeHint``, it just
+    stops contributing to its parent's."""
+    card = Card("Fitting", collapsible=True, expanded=False)
+    qtbot.addWidget(card)
+    wide = QLabel("a label far wider than the collapsed header is")
+    card.body_layout.addWidget(wide)
+    assert not card.is_expanded()
+    assert card.open_width_hint() > card.sizeHint().width()
+    assert card.open_width_hint() >= wide.sizeHint().width()

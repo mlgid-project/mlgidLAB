@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QStackedWidget,
+    QStyle,
     QTabWidget,
     QToolButton,
     QVBoxLayout,
@@ -64,6 +65,7 @@ from mlgidlab.workflow_rail import WorkflowRail
 from mlgidlab import file_model, theme_tokens
 from mlgidlab.widgets import (
     PRIMARY,
+    Card,
     make_debounced_timer,
     make_pen_swatch as _make_pen_swatch,
     section_label,
@@ -1000,18 +1002,12 @@ class BuildMixin:
         self.resizeDocks(
             [self._profile_dock], [max(self.height() // 3, 280)], Qt.Orientation.Vertical
         )
-        # Default column widths. Both areas are tuned together — the
-        # file browser was previously squeezed to ~100 px (truncated
-        # HDF5 paths), and after Peaks moved to the bottom the right
-        # dock area's natural sizeHint shrank from ~560 to ~240. The
-        # pinned values below split the difference: 280 leaves enough
-        # room for typical file paths and 350 gives the Display dock's
-        # form rows headroom without dominating the central image.
-        self.resizeDocks(
-            [self._tree_dock, self._display_dock],
-            [260, 350],
-            Qt.Orientation.Horizontal,
-        )
+        # Default column widths. The file browser stays pinned at 260,
+        # which leaves room for typical HDF5 paths (it was previously
+        # squeezed to ~100 px and truncated them). The right-hand column
+        # is measured instead of pinned — see
+        # ``_preferred_right_dock_width``.
+        self._apply_default_dock_widths()
         self.viewer.frameChanged.connect(self.profile_viewer.set_frame)
         # Bidirectional Display-dock slider sync: viewer pushes frame
         # changes into the slider (e.g. user scrubs the pyqtgraph
@@ -1204,6 +1200,76 @@ class BuildMixin:
             f"{self.session.original_path.name}{marker} — {APP_NAME}"
         )
         self._update_status_file()
+
+    #: Never open the right-hand column wider than this share of the
+    #: window, nor than this many pixels: the image is the point of the
+    #: screen, and a dock the user has to drag back is worse than one
+    #: they drag out once.
+    _RIGHT_DOCK_WINDOW_SHARE = 3
+    _RIGHT_DOCK_MAX_PX = 500
+    _RIGHT_DOCK_MIN_PX = 380
+
+    def _apply_default_dock_widths(self) -> None:
+        """Open the two side columns at their default widths.
+
+        Called once during construction and again on the first show,
+        because a request made before the window has geometry is scaled
+        down to whatever QMainWindow thinks it has (260 + 466 came out
+        as 197 + 403). The second call is the one that lands.
+        """
+        self.resizeDocks(
+            [self._tree_dock, self._display_dock],
+            [self._TREE_DOCK_PX, self._preferred_right_dock_width()],
+            Qt.Orientation.Horizontal,
+        )
+
+    #: File-browser column. Pinned: it holds HDF5 paths, which were
+    #: truncated when the area collapsed to ~100 px.
+    _TREE_DOCK_PX = 260
+
+    def _preferred_right_dock_width(self) -> int:
+        """How wide to open the right-hand dock column.
+
+        Every dock on the right shares one column, so the width that
+        matters is the one the fullest panel needs, not the one that
+        happens to be in front. It is measured rather than pinned, so a
+        panel that grows a longer label moves this with it:
+
+        * each panel's own ``sizeHint``, plus
+        * the width of any **closed** ``Card``, via ``open_width_hint``
+          — Pipeline's Fitting section wants ~465 px and starts closed,
+          so measuring only what is open reports far too little,
+        * plus the scroll area's frame and scrollbar.
+
+        The panels sit in resizable scroll areas, so a column that is
+        too narrow does not scroll: it compresses and elides. That is
+        what the pinned 350 looked like — the Pipeline "Config (yaml)"
+        field squeezed down to a stub.
+        """
+        docks = (
+            self._display_dock, self._pipeline_dock, self._sim_dock,
+            self._conversion_dock, self._logs_dock,
+        )
+        wanted = 0
+        for dock in docks:
+            content = dock.widget()
+            if content is None:
+                continue
+            scroll = content.findChild(QScrollArea)
+            if scroll is not None and scroll.widget() is not None:
+                content = scroll.widget()
+            wanted = max(wanted, content.sizeHint().width())
+            for card in content.findChildren(Card):
+                if not card.is_expanded():
+                    wanted = max(wanted, card.open_width_hint())
+        wanted += self.style().pixelMetric(
+            QStyle.PixelMetric.PM_ScrollBarExtent) + 8   # frame + margins
+        share = max(self.width() // self._RIGHT_DOCK_WINDOW_SHARE,
+                    self._RIGHT_DOCK_MIN_PX)
+        return max(
+            self._RIGHT_DOCK_MIN_PX,
+            min(wanted, share, self._RIGHT_DOCK_MAX_PX),
+        )
 
     def _build_status_bar(self) -> None:
         """Permanent status-bar widgets: file / entry / frame / pipeline + cursor.
