@@ -660,9 +660,11 @@ class ViewerInteractMixin:
     # ``mlgidlab.peak_picking``: kind priority first, smallest box
     # inside a kind, rings only on their radial edges.
 
-    #: Extra slack, in screen pixels, for "the user clicked the same
-    #: spot again" when deciding whether to cycle.
-    _CYCLE_SLOP_PX = 4.0
+    #: How far the cursor may drift between two clicks and still count
+    #: as "the same spot" for cycling. Generous on purpose: a hand
+    #: moves several pixels between two deliberate clicks, and a miss
+    #: here means the box underneath stays unreachable.
+    _CYCLE_SLOP_PX = 12.0
 
     def _ring_edge_tol(self) -> float:
         """Half-width of a ring's clickable edge, in data units.
@@ -798,38 +800,100 @@ class ViewerInteractMixin:
             out.extend(peak_picking.rank_hits(hits))
         return out
 
+    def _effective_stack(
+        self, x: float, y: float, candidates: list[SelectedPeak],
+    ) -> tuple[list[SelectedPeak], tuple, bool]:
+        """The stack a click at ``(x, y)`` should step through.
+
+        A click near the previous one sticks to the stack that one
+        anchored, as long as it still lands on part of it. Without that,
+        stepping fails exactly where it is needed most: the inner box is
+        often narrower than the few pixels a hand drifts between two
+        clicks, so the second click sees only the outer box and picks it
+        again — which is how a detected box inside a fitted one ended up
+        unreachable.
+
+        A click that lands on a box the anchor did not offer is a fresh
+        click, so moving onto a neighbouring box still selects it and
+        clicking empty space still deselects.
+
+        Returns ``(candidates, keys, anchored)``.
+        """
+        keys = tuple(self._sel_key(c) for c in candidates)
+        anchor = self._cycle_anchor
+        if anchor is None or not self._near_anchor(x, y, anchor):
+            return candidates, keys, False
+        anchored = self._hit_candidates(*anchor)
+        anchored_keys = tuple(self._sel_key(c) for c in anchored)
+        # Re-tested rather than remembered, so a frame change, a fresh
+        # pipeline result or a hidden overlay drops the anchor instead
+        # of selecting something that is no longer there.
+        if anchored_keys != self._cycle_keys:
+            return candidates, keys, False
+        # Subset, not overlap: a click that has drifted off the inner
+        # box still sees only boxes the anchor already offered, while a
+        # click that has found something *new* (a different box nearby)
+        # is a deliberate new pick and must not be hijacked into a step.
+        if not keys or not set(keys) <= set(anchored_keys):
+            return candidates, keys, False
+        return anchored, anchored_keys, True
+
     def _cycle_pick(self, x: float, y: float,
                     candidates: list[SelectedPeak]) -> SelectedPeak:
         """Pick from ``candidates``, advancing on a repeat click.
 
         Clicking the same spot again steps to the next box under it, so
-        a box completely inside another is still reachable. Two guards
-        keep that from firing by accident: the click has to land within
-        a few pixels of the previous one on the same stack of boxes, and
-        it has to arrive slower than the double-click interval, because
-        a bare double-click (which resets the zoom) delivers a single
-        click first and would otherwise cycle on its way through.
+        a box completely inside another is still reachable.
+
+        There is deliberately no timing condition. Gating on the
+        double-click interval (to stop a zoom-reset double-click from
+        cycling on its way through) also swallowed ordinary deliberate
+        clicks, which is exactly the case this exists for. The
+        double-click is handled where it actually happens instead, in
+        ``revert_cycle_for_double_click``.
         """
-        keys = tuple(self._sel_key(c) for c in candidates)
-        now = time.monotonic()
-        gap_ms = (now - self._cycle_time) * 1000.0
-        same_stack = (
-            self._cycle_anchor is not None
-            and keys == self._cycle_keys
-            and self._near_anchor(x, y, self._cycle_anchor)
+        anchor = self._cycle_anchor
+        candidates, keys, anchored = self._effective_stack(x, y, candidates)
+        previous = self._selected
+        index = (
+            self._next_index(keys)
+            if anchored and len(candidates) > 1 else 0
         )
-        index = 0
-        if same_stack and len(candidates) > 1 and gap_ms >= _double_click_ms():
-            current = (
-                self._sel_key(self._selected)
-                if self._selected is not None else None
-            )
-            if current in keys:
-                index = (keys.index(current) + 1) % len(keys)
-        self._cycle_anchor = (x, y)
+        # While stepping, the anchor stays on the click that started it,
+        # so a drift of a few pixels per click cannot creep off the box.
+        self._cycle_anchor = anchor if anchored else (x, y)
         self._cycle_keys = keys
-        self._cycle_time = now
+        self._cycle_time = time.monotonic()
+        self._cycle_prev = previous if index else None
         return candidates[index]
+
+    def _next_index(self, keys: tuple) -> int:
+        """Index of the candidate after the current selection."""
+        current = (
+            self._sel_key(self._selected)
+            if self._selected is not None else None
+        )
+        if current in keys:
+            return (keys.index(current) + 1) % len(keys)
+        return 0
+
+    def revert_cycle_for_double_click(self) -> None:
+        """Undo a cycle step that a double-click caused on its way past.
+
+        Qt delivers press/release (which we read as a click) before the
+        double-click event that resets the zoom, so a double-click on a
+        stack of boxes would quietly step the selection. Rather than
+        refuse to cycle on fast clicks — which broke deliberate ones —
+        the step is taken back here, once we know the gesture was a
+        double-click after all.
+        """
+        if self._cycle_prev is None:
+            return
+        elapsed_ms = (time.monotonic() - self._cycle_time) * 1000.0
+        restore, self._cycle_prev = self._cycle_prev, None
+        if elapsed_ms <= _double_click_ms():
+            self._set_selected(restore)
+            self._reset_cycle()
 
     def _near_anchor(self, x: float, y: float,
                      anchor: tuple[float, float]) -> bool:
@@ -839,6 +903,7 @@ class ViewerInteractMixin:
     def _reset_cycle(self) -> None:
         self._cycle_anchor = None
         self._cycle_keys = ()
+        self._cycle_prev = None
 
     # -- Hover preview -------------------------------------------------
 
@@ -878,7 +943,40 @@ class ViewerInteractMixin:
         if sel is None:
             self._hover.clear_path()
             return
-        table = _peaks_from_manual([
+        table = _peaks_from_manual(self._hover_boxes(sel))
+        extent = self.angular_extent()
+        if self._mode == MODE_CARTESIAN:
+            self._hover.set_cartesian(table, extent=extent)
+        else:
+            self._hover.set_polar(table, extent=extent)
+
+    def _hover_boxes(self, sel: SelectedPeak) -> list[ManualPeak]:
+        """The boxes to outline for ``sel``.
+
+        Clicking a matched peak selects the whole structure (the
+        selection highlight draws every visible peak in it), so the
+        preview has to promise the same thing — otherwise it outlines
+        one box and the click lights up five.
+        """
+        if sel.multi_peak_ids:
+            fitted = (self._frame_peaks.get(sel.frame) or {}).get("fitted")
+            if fitted is not None and len(fitted):
+                wanted = set(int(v) for v in sel.multi_peak_ids)
+                boxes = [
+                    ManualPeak(
+                        radius=float(fitted.radius[i]),
+                        angle=float(fitted.angle[i]),
+                        radius_width=float(fitted.radius_width[i]),
+                        angle_width=float(fitted.angle_width[i]),
+                        is_ring=bool(fitted.is_ring[i]),
+                        temp_id=int(fitted.ids[i]),
+                    )
+                    for i in range(len(fitted))
+                    if int(fitted.ids[i]) in wanted
+                ]
+                if boxes:
+                    return boxes
+        return [
             ManualPeak(
                 radius=sel.radius,
                 angle=sel.angle,
@@ -887,12 +985,7 @@ class ViewerInteractMixin:
                 is_ring=sel.is_ring,
                 temp_id=sel.peak_id,
             )
-        ])
-        extent = self.angular_extent()
-        if self._mode == MODE_CARTESIAN:
-            self._hover.set_cartesian(table, extent=extent)
-        else:
-            self._hover.set_polar(table, extent=extent)
+        ]
 
     def _clear_hover(self) -> None:
         self._hover_pos = None
@@ -935,6 +1028,10 @@ class ViewerInteractMixin:
         #   and a fitted multi-select reaches fitted. With no multi-kind
         #   primary yet, fitted wins over detected (same priority as a
         #   bare click). No hit under the cursor → no-op.
+        # * Shift+click: step to the next box under the cursor,
+        #   unconditionally. The same walk as a repeat click, without
+        #   the "same spot" test, for when the boxes are nested and the
+        #   hand is not steady.
         # * Ctrl+Alt never reaches here (press branch consumed it
         #   as a draw gesture).
         if self._mode not in (MODE_POLAR, MODE_CARTESIAN) or self._busy:
@@ -961,6 +1058,30 @@ class ViewerInteractMixin:
             bool(mods & Qt.KeyboardModifier.ControlModifier)
             and not bool(mods & Qt.KeyboardModifier.AltModifier)
         )
+        shift_only = (
+            bool(mods & Qt.KeyboardModifier.ShiftModifier)
+            and not bool(mods & Qt.KeyboardModifier.ControlModifier)
+            and not bool(mods & Qt.KeyboardModifier.AltModifier)
+        )
+
+        # Shift+click always takes the next box under the cursor, with
+        # no "same spot" or timing conditions to satisfy: the plain
+        # repeat click is the convenient path, this is the one that
+        # always works. (Shift, not Alt: Alt+click is a window-move
+        # gesture on several Linux desktops.)
+        if shift_only:
+            candidates = self._hit_candidates(x, y)
+            if not candidates:
+                return
+            anchor = self._cycle_anchor
+            candidates, keys, anchored = self._effective_stack(
+                x, y, candidates)
+            self._cycle_anchor = anchor if anchored else (x, y)
+            self._cycle_keys = keys
+            self._cycle_time = time.monotonic()
+            self._cycle_prev = None
+            self._set_selected(candidates[self._next_index(keys)])
+            return
 
         # Ctrl+click multi-selects detected OR fitted peaks. Search the
         # current multi-selection's kind first (so the user keeps

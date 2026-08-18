@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtWidgets import QApplication
@@ -22,6 +23,7 @@ from mlgidlab import peak_picking
 from mlgidlab.image_viewer import GIWAXSImageViewer
 from mlgidlab.peak_picking import Box, box_area, contains, rank_hits
 from mlgidlab.theme import apply_dark_theme
+from mlgidlab.file_model import MatchedStructure
 from mlgidlab.viewer_items import ManualPeak, _peaks_from_manual
 
 pytestmark = pytest.mark.gui
@@ -98,22 +100,6 @@ def picker(qtbot):
     return viewer
 
 
-@pytest.fixture
-def instant_double_click():
-    """Make every re-click count as deliberate.
-
-    Cycling ignores clicks that arrive within the double-click interval,
-    because a bare double-click (which resets the zoom) delivers a single
-    click on its way through. Setting the interval to zero lets the tests
-    click as fast as they like; the guard itself is tested separately.
-    """
-    app = QApplication.instance()
-    original = app.doubleClickInterval()
-    app.setDoubleClickInterval(0)
-    yield
-    app.setDoubleClickInterval(original)
-
-
 def _peak(radius, angle, dr, da, temp_id, is_ring=False):
     return ManualPeak(radius=radius, angle=angle, radius_width=dr,
                       angle_width=da, is_ring=is_ring, temp_id=temp_id)
@@ -175,7 +161,7 @@ def test_a_ring_is_selected_by_clicking_its_edge(picker):
     assert picker.selected_peak.peak_id == 1
 
 
-def test_clicking_again_walks_down_the_stack(picker, instant_double_click):
+def test_clicking_again_walks_down_the_stack(picker):
     _install(picker, detected=[_peak(2.0, 30.0, 0.5, 20.0, 1),
                                _peak(2.0, 30.0, 0.05, 4.0, 2)])
     seen = []
@@ -185,8 +171,7 @@ def test_clicking_again_walks_down_the_stack(picker, instant_double_click):
     assert seen == [2, 1, 2], "smallest first, then out, then round again"
 
 
-def test_a_click_somewhere_else_starts_the_stack_over(picker,
-                                                      instant_double_click):
+def test_a_click_somewhere_else_starts_the_stack_over(picker):
     _install(picker, detected=[_peak(2.0, 30.0, 0.5, 20.0, 1),
                                _peak(2.0, 30.0, 0.05, 4.0, 2)])
     _click(picker, 2.0, 30.0)
@@ -197,22 +182,30 @@ def test_a_click_somewhere_else_starts_the_stack_over(picker,
     assert picker.selected_peak.peak_id == 2
 
 
-def test_a_rapid_second_click_does_not_cycle(picker):
-    """A bare double-click resets the zoom, and Qt delivers a single
-    click first — it must not change the selection on its way through."""
-    QApplication.instance().setDoubleClickInterval(10_000)
-    try:
-        _install(picker, detected=[_peak(2.0, 30.0, 0.5, 20.0, 1),
-                                   _peak(2.0, 30.0, 0.05, 4.0, 2)])
-        _click(picker, 2.0, 30.0)
-        _click(picker, 2.0, 30.0)
-        assert picker.selected_peak.peak_id == 2
-    finally:
-        QApplication.instance().setDoubleClickInterval(400)
+def test_a_double_click_takes_its_cycle_step_back(picker):
+    """A bare double-click resets the zoom, and Qt delivers a plain
+    click first — which cycles. Refusing to cycle on fast clicks was
+    worse (it swallowed deliberate ones), so the step is taken back once
+    the gesture turns out to be a double-click."""
+    _install(picker, detected=[_peak(2.0, 30.0, 0.5, 20.0, 1),
+                               _peak(2.0, 30.0, 0.05, 4.0, 2)])
+    _click(picker, 2.0, 30.0)
+    _click(picker, 2.0, 30.0)
+    assert picker.selected_peak.peak_id == 1, "the click stepped down"
+    picker.revert_cycle_for_double_click()
+    assert picker.selected_peak.peak_id == 2, "and the double-click undid it"
 
 
-def test_ctrl_click_keeps_its_kind_and_takes_the_smaller_box(picker,
-                                                             instant_double_click):
+def test_only_a_real_cycle_step_is_reverted(picker):
+    """A first selection is not a step, so a double-click on a fresh
+    box must not clear it."""
+    _install(picker, detected=[_peak(2.0, 30.0, 0.05, 4.0, 2)])
+    _click(picker, 2.0, 30.0)
+    picker.revert_cycle_for_double_click()
+    assert picker.selected_peak.peak_id == 2
+
+
+def test_ctrl_click_keeps_its_kind_and_takes_the_smaller_box(picker):
     """Ctrl+click still extends one kind (so a detected multi-select is
     not broken by the fitted box drawn over it), and inside that kind it
     follows the same smallest-box rule."""
@@ -229,6 +222,116 @@ def test_ctrl_click_keeps_its_kind_and_takes_the_smaller_box(picker,
     _click(picker, 2.0, 30.0, Qt.KeyboardModifier.ControlModifier)
     ids = [s.peak_id for s in picker.selected_peaks()]
     assert 2 in ids, "extended detected, and took the inner detected box"
+
+
+# -- the nested detected / fitted case the user hit ------------------------
+
+def test_a_detected_box_inside_a_fitted_one_is_reachable(picker):
+    """Kind priority hands the first click to the fitted box, so the
+    detected box under it is only reachable by stepping down."""
+    _install(picker,
+             fitted=[_peak(2.0, 35.0, 0.12, 10.0, 5)],
+             detected=[_peak(2.0, 35.0, 0.03, 3.0, 7)])
+    _click(picker, 2.0, 35.0)
+    assert picker.selected_peak.kind == "fitted"
+    _click(picker, 2.0, 35.0)
+    assert picker.selected_peak.kind == "detected"
+    assert picker.selected_peak.peak_id == 7
+
+
+def test_a_hand_that_drifts_a_few_pixels_still_steps_down(picker):
+    """The first cut allowed 4 px between clicks, which a hand does not
+    manage — the box underneath stayed unreachable in practice."""
+    _install(picker,
+             fitted=[_peak(2.0, 35.0, 0.12, 10.0, 5)],
+             detected=[_peak(2.0, 35.0, 0.03, 3.0, 7)])
+    x_px, y_px = picker._plot.getViewBox().viewPixelSize()
+    _click(picker, 2.0, 35.0)
+    _click(picker, 2.0 + 6 * x_px, 35.0 + 4 * y_px)
+    assert picker.selected_peak.kind == "detected"
+
+
+def test_shift_click_always_steps_to_the_next_box(picker):
+    """The deterministic path: no same-spot test, no timing, for when
+    the boxes are nested and the hand is not steady."""
+    _install(picker,
+             fitted=[_peak(2.0, 35.0, 0.12, 10.0, 5)],
+             detected=[_peak(2.0, 35.0, 0.03, 3.0, 7)])
+    _click(picker, 2.0, 35.0)
+    assert picker.selected_peak.kind == "fitted"
+    _click(picker, 2.1, 40.0, Qt.KeyboardModifier.ShiftModifier)  # empty: no-op
+    assert picker.selected_peak.kind == "fitted"
+    _click(picker, 2.0, 35.0, Qt.KeyboardModifier.ShiftModifier)
+    assert picker.selected_peak.kind == "detected"
+    _click(picker, 2.0, 35.0, Qt.KeyboardModifier.ShiftModifier)
+    assert picker.selected_peak.kind == "fitted", "and it wraps"
+
+
+def test_a_nearby_click_on_a_different_box_is_not_a_step(picker):
+    """Sticking to the anchored stack must not hijack a click that has
+    moved on to something else."""
+    _install(picker, detected=[_peak(2.0, 35.0, 0.12, 10.0, 5),
+                               _peak(2.0, 35.0, 0.03, 3.0, 7),
+                               _peak(2.02, 35.0, 0.005, 0.6, 9)])
+    _click(picker, 2.0, 35.0)
+    assert picker.selected_peak.peak_id == 7, "the inner box"
+    x_px, _ = picker._plot.getViewBox().viewPixelSize()
+    # Still within the slop, but now over a box the anchored stack
+    # never contained.
+    _click(picker, 2.02, 35.0)
+    assert picker.selected_peak.peak_id == 9
+
+
+# -- matched structures ----------------------------------------------------
+
+def _match(picker, peaks, ids):
+    """Install ``peaks`` as fitted rows and claim them as one structure."""
+    table = _peaks_from_manual(list(peaks))
+    picker.set_peaks(0, {"detected": None, "fitted": table, "manual": None})
+    picker.set_matched_structures(0, [MatchedStructure(
+        solution_field="matched_segments_0000", local_idx=0, cif="PbI2",
+        h=1, k=0, l=0, probability=0.9, peaks=table,
+        peak_list=np.asarray(ids, dtype=int))])
+    picker.set_overlay_visible("fitted", False)   # so matched is what a click takes
+    return table
+
+
+def test_the_selection_outline_sits_above_the_matched_boxes(picker):
+    """Regression: matched overlay items are rebuilt and re-added to the
+    viewbox on *every* render, so they land above anything added once at
+    construction. The white highlight around a selected matched peak was
+    painted over by the structure's own box, leaving only the sliver
+    where the wider pen stuck out — while fitted and detected, added
+    before the selection item, looked right."""
+    _match(picker, [_peak(1.95, 32.0, 0.06, 5.0, 10),
+                    _peak(2.05, 38.0, 0.06, 5.0, 11)], [0, 1])
+    _click(picker, 1.95, 32.0)
+    assert picker.selected_peak.kind == "matched"
+    matched_z = [item.zValue() for _uid, item in picker._matched_items]
+    assert matched_z, "the structure really is drawn"
+    assert picker._selection.zValue() > max(matched_z)
+    assert picker._hover.zValue() > max(matched_z)
+    assert picker._selection.zValue() > picker._hover.zValue(), (
+        "a selected box keeps its solid highlight over the preview")
+
+
+def test_the_hover_outlines_the_whole_matched_structure(picker):
+    """Clicking a matched peak selects the structure, so previewing one
+    box of it would promise the wrong thing."""
+    _match(picker, [_peak(1.95, 32.0, 0.06, 5.0, 10),
+                    _peak(2.05, 38.0, 0.06, 5.0, 11)], [0, 1])
+    depth = picker._update_hover(1.95, 32.0)
+    assert depth == 1
+    assert picker._hover_key[0] == "matched"
+    outlined = picker._hover_boxes(picker._hit_candidates(1.95, 32.0)[0])
+    assert sorted(b.temp_id for b in outlined) == [10, 11]
+
+
+def test_a_single_peak_hover_outlines_only_itself(picker):
+    """The structure expansion must not leak into ordinary candidates."""
+    _install(picker, detected=[_peak(2.0, 30.0, 0.05, 4.0, 2)])
+    outlined = picker._hover_boxes(picker._hit_candidates(2.0, 30.0)[0])
+    assert [b.temp_id for b in outlined] == [2]
 
 
 # -- hover preview ---------------------------------------------------------

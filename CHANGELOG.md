@@ -81,6 +81,11 @@ pre-releases.
 
 ### Fixed
 
+- **A selected matched peak is highlighted like every other peak.** The
+  structure's own box was painted over the white selection outline (the
+  matched overlay is rebuilt on every render, so it ended up on top),
+  leaving a sliver of white instead of a highlight. Fitted and detected
+  were never affected.
 - **Clicking overlapping peak boxes now has a rule you can see.** Which
   box a click took used to come down to table order, which is invisible
   (each overlay kind is drawn as one path with one pen). The familiar
@@ -88,7 +93,10 @@ pre-releases.
   and inside a kind the **smallest box wins**, so a box drawn inside
   another is reachable instead of being shadowed by it. Clicking the
   same spot again steps to the next box underneath, so the outer one is
-  still one click away.
+  still one click away — and **Shift+click** always takes the next box,
+  for stacks where the inner box is smaller than the few pixels a hand
+  drifts between two clicks (a detected box inside a fitted one was
+  otherwise unreachable).
 - **Rings no longer swallow the peaks in their band.** A ring's box
   spans every angle at its radius, so it used to compete with every spot
   peak there. A ring is now picked by clicking within a few pixels of

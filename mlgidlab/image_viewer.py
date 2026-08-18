@@ -437,6 +437,15 @@ class GIWAXSImageViewer(
         # hovered and selected still shows the solid selection pen.
         self._hover = _PeakShapeItem(**hover_style())
         self._hover.setOpacity(HOVER_OPACITY)
+        # Explicit z, because the matched overlay items are rebuilt and
+        # re-added to the viewbox on *every* render, so they land above
+        # anything added once at construction. Without this the white
+        # highlight around a selected matched peak was painted over by
+        # the structure's own box, leaving only the sliver where the
+        # wider pen stuck out — while fitted and detected (added here,
+        # before the selection) looked correct.
+        self._hover.setZValue(40)
+        self._selection.setZValue(45)
         self._fitted_preview = _PeakShapeItem(**FITTED_PREVIEW_STYLE)
         self._fitted_preview.setOpacity(FITTED_PREVIEW_OPACITY)
         vb = self._plot.getViewBox()
@@ -466,6 +475,11 @@ class GIWAXSImageViewer(
         self._label_filter.drawFinished.connect(self._on_draw_finished)
         self._label_filter.selectAt.connect(self._on_select_at)
         self._label_filter.doubleClicked.connect(self._reset_view_to_default)
+        # A double-click delivers a plain click first, which may have
+        # stepped the selection through a stack of boxes; take that
+        # step back now that the gesture is known.
+        self._label_filter.doubleClicked.connect(
+            self.revert_cycle_for_double_click)
         self._label_filter.cursorPos.connect(self._on_cursor_pos)
         self._label_filter.cursorLeft.connect(self._on_cursor_left)
 
@@ -623,6 +637,9 @@ class GIWAXSImageViewer(
         # which would otherwise cycle on their way to resetting the zoom.
         self._cycle_anchor: tuple[float, float] | None = None
         self._cycle_keys: tuple = ()
+        # Selection to restore if the click that just cycled turns
+        # out to have been the first half of a double-click.
+        self._cycle_prev: SelectedPeak | None = None
         self._cycle_time: float = 0.0
 
         # Geometry of the fitted-preview box for the current selection
