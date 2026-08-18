@@ -14,6 +14,7 @@ from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainterPath, QPolygonF
 from PySide6.QtWidgets import QWidget
 
+from mlgidlab import peak_picking
 from mlgidlab.file_model import PeakTable
 from mlgidlab.polar import polar_to_qxyz
 from mlgidlab.viewer_styles import (
@@ -585,24 +586,46 @@ class _PeakShapeItem(pg.GraphicsObject):
         painter.drawPath(self._path)
 
 
-def _polar_box_contains(peak: ManualPeak, x: float, y: float) -> bool:
-    """Hit-test the polar bounding box of a ManualPeak."""
-    r_lo = peak.radius - peak.radius_width / 2.0
-    r_hi = peak.radius + peak.radius_width / 2.0
-    a_lo = peak.angle - peak.angle_width / 2.0
-    a_hi = peak.angle + peak.angle_width / 2.0
-    return r_lo <= x <= r_hi and a_lo <= y <= a_hi
+def _box_of(peak: ManualPeak) -> peak_picking.Box:
+    return peak_picking.Box(
+        radius=float(peak.radius),
+        radius_width=float(peak.radius_width),
+        angle=float(peak.angle),
+        angle_width=float(peak.angle_width),
+        is_ring=bool(peak.is_ring),
+    )
 
 
-def _polar_table_row_contains(table: PeakTable, i: int, x: float, y: float) -> bool:
+def _box_of_row(table: PeakTable, i: int) -> peak_picking.Box:
+    return peak_picking.Box(
+        radius=float(table.radius[i]),
+        radius_width=float(table.radius_width[i]),
+        angle=float(table.angle[i]),
+        angle_width=float(table.angle_width[i]),
+        is_ring=bool(table.is_ring[i]),
+    )
+
+
+def _polar_box_contains(
+    peak: ManualPeak, x: float, y: float, *, ring_edge_tol: float | None = None,
+) -> bool:
+    """Hit-test the polar bounding box of a ManualPeak.
+
+    ``ring_edge_tol`` (data units) makes a ring clickable only near its
+    inner / outer radius; ``None`` keeps the whole band, which is the
+    historical behaviour. See ``mlgidlab.peak_picking`` for why.
+    """
+    return peak_picking.contains(
+        _box_of(peak), x, y, ring_edge_tol=ring_edge_tol)
+
+
+def _polar_table_row_contains(
+    table: PeakTable, i: int, x: float, y: float, *,
+    ring_edge_tol: float | None = None,
+) -> bool:
     """Hit-test row ``i`` of a PeakTable in polar coordinates."""
-    r = float(table.radius[i])
-    dr = float(table.radius_width[i])
-    a = float(table.angle[i])
-    da = float(table.angle_width[i])
-    r_lo, r_hi = r - dr / 2.0, r + dr / 2.0
-    a_lo, a_hi = a - da / 2.0, a + da / 2.0
-    return r_lo <= x <= r_hi and a_lo <= y <= a_hi
+    return peak_picking.contains(
+        _box_of_row(table, i), x, y, ring_edge_tol=ring_edge_tol)
 
 
 def _cart_to_polar(q_xy: float, q_z: float) -> tuple[float, float]:
@@ -621,18 +644,22 @@ def _cart_to_polar(q_xy: float, q_z: float) -> tuple[float, float]:
     return r, a
 
 
-def _cart_box_contains(peak: ManualPeak, q_xy: float, q_z: float) -> bool:
+def _cart_box_contains(
+    peak: ManualPeak, q_xy: float, q_z: float, *,
+    ring_edge_tol: float | None = None,
+) -> bool:
     """Cartesian hit-test for a ManualPeak's polar box."""
     r, a = _cart_to_polar(q_xy, q_z)
-    return _polar_box_contains(peak, r, a)
+    return _polar_box_contains(peak, r, a, ring_edge_tol=ring_edge_tol)
 
 
 def _cart_table_row_contains(
-    table: PeakTable, i: int, q_xy: float, q_z: float,
+    table: PeakTable, i: int, q_xy: float, q_z: float, *,
+    ring_edge_tol: float | None = None,
 ) -> bool:
     """Cartesian hit-test for row ``i`` of a PeakTable."""
     r, a = _cart_to_polar(q_xy, q_z)
-    return _polar_table_row_contains(table, i, r, a)
+    return _polar_table_row_contains(table, i, r, a, ring_edge_tol=ring_edge_tol)
 
 
 def _clip_angle(

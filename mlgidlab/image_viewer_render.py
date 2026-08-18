@@ -538,6 +538,9 @@ class ViewerRenderMixin:
 
         # Matched overlays: rebuild items for whatever the current frame has.
         self._render_matched_overlays(frame)
+        # The hover outline is drawn outside this path (per mouse move),
+        # so re-point it at whatever now sits under a stationary cursor.
+        self._refresh_hover()
         # Simulated "expected pattern" overlay (frame-independent data,
         # but rebuilt here so it follows every mode/stack transition).
         self._render_simulation_overlays(frame)
@@ -654,10 +657,17 @@ class ViewerRenderMixin:
     # -- Cursor readout (status bar) --
 
     def _on_cursor_pos(self, pt: QPointF) -> None:
+        # Hover first: it both draws the pre-selection outline and
+        # reports how many boxes are stacked here, which the status bar
+        # shows so the user knows a second click has somewhere to go.
+        depth = self._update_hover(float(pt.x()), float(pt.y()))
         info = self._compute_cursor_info(pt)
+        if info is not None and depth > 1:
+            info["overlapping"] = depth
         self.cursorMoved.emit(info)
 
     def _on_cursor_left(self) -> None:
+        self._clear_hover()
         self.cursorMoved.emit(None)
 
     def _compute_cursor_info(self, pt: QPointF) -> dict | None:

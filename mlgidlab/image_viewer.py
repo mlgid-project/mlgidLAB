@@ -68,6 +68,8 @@ from mlgidlab.viewer_styles import (
     colormap_swatch,
     FITTED_PREVIEW_OPACITY,
     FITTED_PREVIEW_STYLE,
+    HOVER_OPACITY,
+    hover_style,
     MATCHED_LINE_STYLES,
     MATCHED_LINE_WIDTH,
     MATCHED_MARKER_SIZE,
@@ -430,12 +432,18 @@ class GIWAXSImageViewer(
         self._fitted = _PeakShapeItem(**OVERLAY_STYLE["fitted"])
         self._manual = _PeakShapeItem(**OVERLAY_STYLE["manual"])
         self._selection = _PeakShapeItem(**SELECTION_STYLE)
+        # Pre-selection preview: outlines the box a bare click would
+        # take. Added before the selection item so a box that is both
+        # hovered and selected still shows the solid selection pen.
+        self._hover = _PeakShapeItem(**hover_style())
+        self._hover.setOpacity(HOVER_OPACITY)
         self._fitted_preview = _PeakShapeItem(**FITTED_PREVIEW_STYLE)
         self._fitted_preview.setOpacity(FITTED_PREVIEW_OPACITY)
         vb = self._plot.getViewBox()
         vb.addItem(self._detected, ignoreBounds=True)
         vb.addItem(self._fitted, ignoreBounds=True)
         vb.addItem(self._manual, ignoreBounds=True)
+        vb.addItem(self._hover, ignoreBounds=True)
         vb.addItem(self._selection, ignoreBounds=True)
         vb.addItem(self._fitted_preview, ignoreBounds=True)
 
@@ -600,6 +608,22 @@ class GIWAXSImageViewer(
         # Set during a pipeline run so we don't allow concurrent ROI edits or
         # Delete keypresses while mlgidbase has the file open for writes.
         self._busy: bool = False
+
+        # Pre-selection preview state. ``_hover_pos`` is the last
+        # cursor point in data coordinates (so a re-render can redraw
+        # the outline without waiting for the next mouse move) and
+        # ``_hover_key`` identifies what is currently outlined, so a
+        # move inside the same box costs one hit test and no repaint.
+        self._hover_pos: tuple[float, float] | None = None
+        self._hover_key: tuple | None = None
+        # Click-through cycling: repeatedly clicking the same spot walks
+        # the boxes stacked under it. Anchored to the click point and
+        # the exact candidate list, so moving the cursor or changing the
+        # frame starts over. ``_cycle_time`` gates out double-clicks,
+        # which would otherwise cycle on their way to resetting the zoom.
+        self._cycle_anchor: tuple[float, float] | None = None
+        self._cycle_keys: tuple = ()
+        self._cycle_time: float = 0.0
 
         # Geometry of the fitted-preview box for the current selection
         # (radius_center, fwhm_radial, angle_center, fwhm_angular). Cleared
@@ -870,6 +894,7 @@ class GIWAXSImageViewer(
         # are data, not chrome, and deliberately stay put.
         try:
             self._selection.set_pen_color(selection_style()["color"])
+            self._hover.set_pen_color(hover_style()["color"])
         except Exception:
             logger.debug("suppressed exception recolouring selection", exc_info=True)
         # Re-render so the simulation overlay picks up its theme-visible

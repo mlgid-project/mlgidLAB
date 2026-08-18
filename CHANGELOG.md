@@ -8,6 +8,9 @@ pre-releases.
 
 ### Added
 
+- **A hover preview for peak selection.** Moving over the image outlines
+  the box a click would take, and when boxes are stacked the status bar
+  says how many are under the cursor.
 - **A workflow rail.** A strip above the image showing the five stages
   in order — Convert, Detect, Fit, Match, Track — with what each has
   produced for the current frame. Clicking a stage brings its dock
@@ -78,6 +81,18 @@ pre-releases.
 
 ### Fixed
 
+- **Clicking overlapping peak boxes now has a rule you can see.** Which
+  box a click took used to come down to table order, which is invisible
+  (each overlay kind is drawn as one path with one pen). The familiar
+  kind priority still comes first (manual, fitted, detected, matched),
+  and inside a kind the **smallest box wins**, so a box drawn inside
+  another is reachable instead of being shadowed by it. Clicking the
+  same spot again steps to the next box underneath, so the outer one is
+  still one click away.
+- **Rings no longer swallow the peaks in their band.** A ring's box
+  spans every angle at its radius, so it used to compete with every spot
+  peak there. A ring is now picked by clicking within a few pixels of
+  its inner or outer radius.
 - **The light theme is correct again.** Roughly 30 colours were
   hardcoded for the dark theme and never followed a theme switch: the
   figure-export preview painted a dark rectangle inside a light window,

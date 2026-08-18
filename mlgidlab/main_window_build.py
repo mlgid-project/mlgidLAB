@@ -1667,6 +1667,10 @@ class BuildMixin:
         mode = info.get("mode")
         inten = info.get("intensity", float("nan"))
         inten_str = "—" if inten != inten else f"{inten:.3g}"  # NaN check
+        # Overlapping boxes under the cursor: says that clicking again
+        # steps to the next one, which is otherwise invisible.
+        depth = int(info.get("overlapping", 0) or 0)
+        stack = f"  |  {depth} boxes here" if depth > 1 else ""
         if mode == "pixel":
             # Raw detector frames have no q-axes, so no d / 2θ either.
             self._sb_cursor.setText(
@@ -1676,7 +1680,7 @@ class BuildMixin:
             q = math.hypot(info["q_xy"], info["q_z"])
             self._sb_cursor.setText(
                 f"q_xy={info['q_xy']:.3f}, q_z={info['q_z']:.3f}, "
-                f"I={inten_str}{self._q_derived_tail(q)}"
+                f"I={inten_str}{self._q_derived_tail(q)}{stack}"
             )
         elif mode == "polar":
             # ``theta`` here is the azimuth of the polar map, written χ
@@ -1684,7 +1688,7 @@ class BuildMixin:
             # standing next to it.
             self._sb_cursor.setText(
                 f"r={info['r']:.3f}, χ={info['theta']:.1f}°, "
-                f"I={inten_str}{self._q_derived_tail(float(info['r']))}"
+                f"I={inten_str}{self._q_derived_tail(float(info['r']))}{stack}"
             )
         else:
             self._sb_cursor.setText("")

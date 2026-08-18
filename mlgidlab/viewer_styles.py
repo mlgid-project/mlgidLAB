@@ -54,6 +54,22 @@ def selection_style(theme: str | None = None) -> dict:
     return {**SELECTION_STYLE,
             "color": theme_tokens.color("overlay_selection", theme)}
 
+# Pre-selection preview: the box a bare click would take, outlined
+# while the cursor is over it. Same colour as the selection highlight
+# (it is the same answer, one step earlier) but thinner, dashed and
+# half-opaque so it never reads as an actual selection.
+HOVER_STYLE = {"color": SELECTION_STYLE["color"],
+               "style": Qt.PenStyle.DashLine,
+               "width": 1.8}
+HOVER_OPACITY = 0.55
+
+
+def hover_style(theme: str | None = None) -> dict:
+    """``HOVER_STYLE`` with a colour visible on this theme's plot."""
+    return {**HOVER_STYLE,
+            "color": theme_tokens.color("overlay_selection", theme)}
+
+
 # Faint preview of the would-be fitted_peaks box for the currently selected
 # manual peak. Same hue as the fitted overlay so the user reads the
 # relationship at a glance, but dashed + reduced opacity so it's clearly a
