@@ -1670,7 +1670,7 @@ class BuildMixin:
         # Overlapping boxes under the cursor: says that clicking again
         # steps to the next one, which is otherwise invisible.
         depth = int(info.get("overlapping", 0) or 0)
-        stack = (f"  |  {depth} boxes here, Shift+click to step"
+        stack = (f"  |  {depth} boxes here, click again for the next"
                  if depth > 1 else "")
         if mode == "pixel":
             # Raw detector frames have no q-axes, so no d / 2θ either.

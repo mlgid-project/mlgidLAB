@@ -41,7 +41,7 @@ OVERLAY_STYLE: dict[str, dict] = {
     "manual":   {"color": "#ffeb3b", "style": Qt.PenStyle.SolidLine, "width": 1.6},
 }
 
-SELECTION_STYLE = {"color": "#ffffff", "style": Qt.PenStyle.SolidLine, "width": 2.5}
+SELECTION_STYLE = {"color": "#ffffff", "style": Qt.PenStyle.SolidLine, "width": 3.0}
 
 
 def selection_style(theme: str | None = None) -> dict:
@@ -55,19 +55,22 @@ def selection_style(theme: str | None = None) -> dict:
             "color": theme_tokens.color("overlay_selection", theme)}
 
 # Pre-selection preview: the box a bare click would take, outlined
-# while the cursor is over it. Same colour as the selection highlight
-# (it is the same answer, one step earlier) but thinner, dashed and
-# half-opaque so it never reads as an actual selection.
-HOVER_STYLE = {"color": SELECTION_STYLE["color"],
-               "style": Qt.PenStyle.DashLine,
-               "width": 1.8}
-HOVER_OPACITY = 0.55
+# while the cursor is over it. Solid, opaque and wider than every
+# overlay pen (1.2 detected / fitted, 1.6 manual / matched), so it
+# *covers* the box underneath instead of blending with it — a
+# translucent preview over the dashed red detection read as pink, and
+# looked different on every overlay kind. The accent colour rather than
+# the selection white, so "under the cursor" and "selected" stay
+# distinguishable at a glance.
+HOVER_STYLE = {"color": "#fc8961",
+               "style": Qt.PenStyle.SolidLine,
+               "width": 2.6}
+HOVER_OPACITY = 1.0
 
 
 def hover_style(theme: str | None = None) -> dict:
-    """``HOVER_STYLE`` with a colour visible on this theme's plot."""
-    return {**HOVER_STYLE,
-            "color": theme_tokens.color("overlay_selection", theme)}
+    """``HOVER_STYLE`` with this theme's accent."""
+    return {**HOVER_STYLE, "color": theme_tokens.color("accent", theme)}
 
 
 # Faint preview of the would-be fitted_peaks box for the currently selected

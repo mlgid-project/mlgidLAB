@@ -448,6 +448,11 @@ class GIWAXSImageViewer(
         self._selection.setZValue(45)
         self._fitted_preview = _PeakShapeItem(**FITTED_PREVIEW_STYLE)
         self._fitted_preview.setOpacity(FITTED_PREVIEW_OPACITY)
+        # Above the selection, which is where insertion order used to
+        # put it: the preview is a *different* box (where the fit would
+        # land), not a highlight, and hiding it under the outline would
+        # lose information on the frames where the two nearly coincide.
+        self._fitted_preview.setZValue(46)
         vb = self._plot.getViewBox()
         vb.addItem(self._detected, ignoreBounds=True)
         vb.addItem(self._fitted, ignoreBounds=True)
@@ -630,15 +635,12 @@ class GIWAXSImageViewer(
         # move inside the same box costs one hit test and no repaint.
         self._hover_pos: tuple[float, float] | None = None
         self._hover_key: tuple | None = None
-        # Click-through cycling: repeatedly clicking the same spot walks
-        # the boxes stacked under it. Anchored to the click point and
-        # the exact candidate list, so moving the cursor or changing the
-        # frame starts over. ``_cycle_time`` gates out double-clicks,
-        # which would otherwise cycle on their way to resetting the zoom.
-        self._cycle_anchor: tuple[float, float] | None = None
-        self._cycle_keys: tuple = ()
-        # Selection to restore if the click that just cycled turns
-        # out to have been the first half of a double-click.
+        # Click-through stepping: a click never hands back the box that
+        # is already selected, it takes the next one under the cursor.
+        # ``_cycle_prev`` is the selection to restore if the click that
+        # just stepped turns out to have been the first half of a
+        # double-click (which resets the zoom), and ``_cycle_time`` is
+        # when that step happened.
         self._cycle_prev: SelectedPeak | None = None
         self._cycle_time: float = 0.0
 

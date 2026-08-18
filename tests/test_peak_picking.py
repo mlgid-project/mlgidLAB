@@ -19,9 +19,10 @@ import pytest
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtWidgets import QApplication
 
-from mlgidlab import peak_picking
+from mlgidlab import peak_picking, theme_tokens
 from mlgidlab.image_viewer import GIWAXSImageViewer
 from mlgidlab.peak_picking import Box, box_area, contains, rank_hits
+from mlgidlab.viewer_styles import OVERLAY_STYLE, hover_style, selection_style
 from mlgidlab.theme import apply_dark_theme
 from mlgidlab.file_model import MatchedStructure
 from mlgidlab.viewer_items import ManualPeak, _peaks_from_manual
@@ -67,6 +68,21 @@ def test_a_ring_with_a_clamped_angular_width_still_checks_the_angle():
                   angle_width=45.0, is_ring=True)
     assert contains(clamped, 1.9, 45.0, ring_edge_tol=0.03)
     assert not contains(clamped, 1.9, 170.0, ring_edge_tol=0.03)
+
+
+def test_a_pad_grows_the_box_before_testing():
+    """Peak boxes are often a handful of pixels across, and a box that
+    has to be hit exactly is not a box the user can select."""
+    assert not contains(SPOT, 2.04, 30.0)
+    assert contains(SPOT, 2.04, 30.0, pad_radius=0.02)
+    assert not contains(SPOT, 2.0, 34.0)
+    assert contains(SPOT, 2.0, 34.0, pad_angle=2.0)
+
+
+def test_the_pad_leaves_a_rings_edge_rule_alone():
+    """A ring is already padded by its edge tolerance; adding the hit
+    pad on top would widen the band twice."""
+    assert not contains(RING, 2.0, 30.0, ring_edge_tol=0.03, pad_radius=0.5)
 
 
 def test_the_smallest_box_ranks_first_and_rings_rank_last():
@@ -171,13 +187,16 @@ def test_clicking_again_walks_down_the_stack(picker):
     assert seen == [2, 1, 2], "smallest first, then out, then round again"
 
 
-def test_a_click_somewhere_else_starts_the_stack_over(picker):
+def test_a_click_never_hands_back_the_selected_box(picker):
+    """The rule in one line: if the box you clicked is the one already
+    selected, the click takes the next box under the cursor."""
     _install(picker, detected=[_peak(2.0, 30.0, 0.5, 20.0, 1),
                                _peak(2.0, 30.0, 0.05, 4.0, 2)])
     _click(picker, 2.0, 30.0)
     _click(picker, 2.0, 30.0)
     assert picker.selected_peak.peak_id == 1
-    # Same boxes, different spot inside the outer one: not a repeat click
+    # Elsewhere inside the outer box, still over both: the outer one is
+    # selected, so this hands back the inner one.
     _click(picker, 2.01, 31.0)
     assert picker.selected_peak.peak_id == 2
 
@@ -240,8 +259,8 @@ def test_a_detected_box_inside_a_fitted_one_is_reachable(picker):
 
 
 def test_a_hand_that_drifts_a_few_pixels_still_steps_down(picker):
-    """The first cut allowed 4 px between clicks, which a hand does not
-    manage — the box underneath stayed unreachable in practice."""
+    """Stepping asks nothing of the hand: any click that still covers
+    the selected box moves on to the next one."""
     _install(picker,
              fitted=[_peak(2.0, 35.0, 0.12, 10.0, 5)],
              detected=[_peak(2.0, 35.0, 0.03, 3.0, 7)])
@@ -251,34 +270,41 @@ def test_a_hand_that_drifts_a_few_pixels_still_steps_down(picker):
     assert picker.selected_peak.kind == "detected"
 
 
-def test_shift_click_always_steps_to_the_next_box(picker):
-    """The deterministic path: no same-spot test, no timing, for when
-    the boxes are nested and the hand is not steady."""
-    _install(picker,
-             fitted=[_peak(2.0, 35.0, 0.12, 10.0, 5)],
-             detected=[_peak(2.0, 35.0, 0.03, 3.0, 7)])
-    _click(picker, 2.0, 35.0)
-    assert picker.selected_peak.kind == "fitted"
-    _click(picker, 2.1, 40.0, Qt.KeyboardModifier.ShiftModifier)  # empty: no-op
-    assert picker.selected_peak.kind == "fitted"
-    _click(picker, 2.0, 35.0, Qt.KeyboardModifier.ShiftModifier)
-    assert picker.selected_peak.kind == "detected"
-    _click(picker, 2.0, 35.0, Qt.KeyboardModifier.ShiftModifier)
-    assert picker.selected_peak.kind == "fitted", "and it wraps"
+def test_a_near_miss_still_hits_a_small_box(picker):
+    """The case that stayed broken: an 8 px box inside a big one. Exact
+    containment sent a click three pixels off to the box around it —
+    and since the stack then held only that box, there was nothing to
+    step to and the inner box could not be selected at all."""
+    x_px, y_px = picker._plot.getViewBox().viewPixelSize()
+    _install(picker, detected=[_peak(2.0, 35.0, 60 * x_px, 60 * y_px, 1),
+                               _peak(2.0, 35.0, 8 * x_px, 8 * y_px, 2)])
+    _click(picker, 2.0 + 7 * x_px, 35.0)          # 3 px outside the small box
+    assert picker.selected_peak.peak_id == 2
 
 
-def test_a_nearby_click_on_a_different_box_is_not_a_step(picker):
-    """Sticking to the anchored stack must not hijack a click that has
-    moved on to something else."""
+def test_the_tolerance_is_only_a_few_pixels(picker):
+    """It must not turn every click into a selection."""
+    x_px, y_px = picker._plot.getViewBox().viewPixelSize()
+    _install(picker, detected=[_peak(2.0, 35.0, 8 * x_px, 8 * y_px, 2)])
+    _click(picker, 2.0 + 14 * x_px, 35.0)         # 10 px outside
+    assert picker.selected_peak is None
+
+
+def test_a_click_on_a_box_that_is_not_selected_takes_that_box(picker):
+    """Stepping applies only to the box you already have: a click that
+    has moved onto a different one selects it outright, innermost
+    first."""
+    x_px, _ = picker._plot.getViewBox().viewPixelSize()
+    # The third box sits 8 px away, outside the hit tolerance of the
+    # first click.
+    elsewhere = 2.0 + 8 * x_px
     _install(picker, detected=[_peak(2.0, 35.0, 0.12, 10.0, 5),
                                _peak(2.0, 35.0, 0.03, 3.0, 7),
-                               _peak(2.02, 35.0, 0.005, 0.6, 9)])
+                               _peak(elsewhere, 35.0, 2 * x_px, 0.6, 9)])
     _click(picker, 2.0, 35.0)
     assert picker.selected_peak.peak_id == 7, "the inner box"
-    x_px, _ = picker._plot.getViewBox().viewPixelSize()
-    # Still within the slop, but now over a box the anchored stack
-    # never contained.
-    _click(picker, 2.02, 35.0)
+    # Now over a box that is not the selection: taken outright.
+    _click(picker, elsewhere, 35.0)
     assert picker.selected_peak.peak_id == 9
 
 
@@ -309,6 +335,10 @@ def test_the_selection_outline_sits_above_the_matched_boxes(picker):
     assert picker.selected_peak.kind == "matched"
     matched_z = [item.zValue() for _uid, item in picker._matched_items]
     assert matched_z, "the structure really is drawn"
+    painted = _scan(picker, 1.95, 32.0)
+    assert selection_style()["color"] in painted
+    structure_colour = picker._pen_for_key(("PbI2", 1, 0, 0))["color"]
+    assert structure_colour not in painted, "covered, not painted over"
     assert picker._selection.zValue() > max(matched_z)
     assert picker._hover.zValue() > max(matched_z)
     assert picker._selection.zValue() > picker._hover.zValue(), (
@@ -332,6 +362,77 @@ def test_a_single_peak_hover_outlines_only_itself(picker):
     _install(picker, detected=[_peak(2.0, 30.0, 0.05, 4.0, 2)])
     outlined = picker._hover_boxes(picker._hit_candidates(2.0, 30.0)[0])
     assert [b.temp_id for b in outlined] == [2]
+
+
+# -- how a highlight looks -------------------------------------------------
+
+def _scan(picker, x, y, span=40):
+    """Colours along a horizontal line through the data point ``(x, y)``.
+
+    Reads the rendered widget rather than the pen settings, because the
+    complaint was about what ends up on screen: a translucent preview
+    blended with the box under it instead of covering it.
+    """
+    QApplication.processEvents()
+    image = picker.grab().toImage()
+    view = picker._view.ui.graphicsView
+    scene = picker._plot.getViewBox().mapViewToScene(QPointF(x, y))
+    centre = view.mapTo(picker, view.mapFromScene(scene))
+    seen = set()
+    for dx in range(-span, span + 1):
+        colour = image.pixelColor(centre.x() + dx, centre.y())
+        if colour.red() + colour.green() + colour.blue() > 160:
+            seen.add(colour.name())
+    return seen
+
+
+@pytest.mark.parametrize("kind", ["detected", "fitted", "manual"])
+def test_every_kind_gets_the_same_highlight_over_its_own_box(picker, kind):
+    """One look for every overlay kind, and it covers the box rather
+    than blending with it: the translucent preview over the dashed red
+    detection came out pink, and every kind read differently."""
+    box = _peak(2.0, 35.0, 0.3, 20.0, 3)
+    if kind == "manual":
+        picker._manual_peaks[0] = [box]
+        picker.set_peaks(0, {"detected": None, "fitted": None, "manual": None})
+    else:
+        _install(picker, **{kind: [box]})
+    own = OVERLAY_STYLE[kind]["color"]
+    if kind != "manual":
+        assert own in _scan(picker, 2.0, 35.0), "the box paints its own colour"
+    # A manual box is a scratch label: deliberately invisible until it
+    # is the selection (see ``_render_overlays``), so there is nothing
+    # to cover yet — the check that matters for it is after the click.
+
+    picker._update_hover(2.0, 35.0)
+    hovered = _scan(picker, 2.0, 35.0)
+    assert hover_style()["color"] in hovered
+    assert own not in hovered, "the source colour is covered, not blended"
+
+    _click(picker, 2.0, 35.0)
+    selected = _scan(picker, 2.0, 35.0)
+    assert selection_style()["color"] in selected
+    assert own not in selected
+
+
+def test_the_highlight_pens_outrank_every_overlay_pen():
+    widest = max(style["width"] for style in OVERLAY_STYLE.values())
+    assert selection_style()["width"] > widest
+    assert hover_style()["width"] > widest
+
+
+def test_the_hover_colour_is_the_accent_and_follows_the_theme(qtbot,
+                                                              main_window):
+    """White is the selection's colour; the preview takes the accent so
+    "under the cursor" and "selected" are not the same signal. The item
+    is built once, so the pen has to be swapped on a theme change."""
+    assert hover_style("dark")["color"] == theme_tokens.color("accent", "dark")
+    assert hover_style("light")["color"] != hover_style("dark")["color"]
+
+    viewer = main_window.viewer
+    for theme in ("light", "dark"):
+        main_window._set_theme(theme)
+        assert viewer._hover._pen.color().name() == hover_style(theme)["color"]
 
 
 # -- hover preview ---------------------------------------------------------

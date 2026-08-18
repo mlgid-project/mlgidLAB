@@ -43,6 +43,14 @@ RING_EDGE_TOL_PX = 6.0
 #: size yet (no geometry, so nothing has been rendered to click on).
 RING_EDGE_TOL_FALLBACK = 0.02
 
+#: How far outside a box a click still counts as hitting it, in screen
+#: pixels. A detected peak is often only a handful of pixels across, so
+#: exact containment made a small box inside a larger one effectively
+#: unselectable: miss it by three pixels and the click went to the box
+#: around it, with no way back — the inner box was never in the stack
+#: to step to.
+HIT_TOL_PX = 4.0
+
 K = TypeVar("K")
 
 
@@ -85,6 +93,8 @@ def contains(
     angle: float,
     *,
     ring_edge_tol: float | None = None,
+    pad_radius: float = 0.0,
+    pad_angle: float = 0.0,
 ) -> bool:
     """Does ``(radius, angle)`` hit ``box``?
 
@@ -93,12 +103,18 @@ def contains(
     behaviour where a ring's whole radial band counts, which is what
     non-picking callers (geometry maths, tests of the old helpers)
     still want.
+
+    ``pad_radius`` / ``pad_angle`` grow the box before testing, in data
+    units. The picker passes a few screen pixels' worth: peak boxes are
+    often only a handful of pixels across, and a box that has to be hit
+    exactly is not a box the user can select. Rings are already padded
+    by ``ring_edge_tol``, so only their angular bound takes the pad.
     """
     half_r = abs(box.radius_width) / 2.0
     r_lo, r_hi = box.radius - half_r, box.radius + half_r
 
     if math.isfinite(box.angle_width):
-        half_a = abs(box.angle_width) / 2.0
+        half_a = abs(box.angle_width) / 2.0 + abs(pad_angle)
         if not (box.angle - half_a <= angle <= box.angle + half_a):
             return False
 
@@ -107,7 +123,7 @@ def contains(
             abs(radius - r_lo) <= ring_edge_tol
             or abs(radius - r_hi) <= ring_edge_tol
         )
-    return r_lo <= radius <= r_hi
+    return r_lo - abs(pad_radius) <= radius <= r_hi + abs(pad_radius)
 
 
 def rank_hits(hits: Sequence[tuple[K, Box]]) -> list[K]:

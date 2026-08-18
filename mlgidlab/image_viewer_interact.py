@@ -17,7 +17,11 @@ from PySide6.QtWidgets import QApplication
 
 from mlgidlab import peak_picking
 from mlgidlab.file_model import PeakTable, _LazyPolarStack
-from mlgidlab.peak_picking import RING_EDGE_TOL_FALLBACK, RING_EDGE_TOL_PX
+from mlgidlab.peak_picking import (
+    HIT_TOL_PX,
+    RING_EDGE_TOL_FALLBACK,
+    RING_EDGE_TOL_PX,
+)
 from mlgidlab.polar import polar_to_qxyz
 from mlgidlab.viewer_items import (
     FileGeomAction,
@@ -660,12 +664,6 @@ class ViewerInteractMixin:
     # ``mlgidlab.peak_picking``: kind priority first, smallest box
     # inside a kind, rings only on their radial edges.
 
-    #: How far the cursor may drift between two clicks and still count
-    #: as "the same spot" for cycling. Generous on purpose: a hand
-    #: moves several pixels between two deliberate clicks, and a miss
-    #: here means the box underneath stays unreachable.
-    _CYCLE_SLOP_PX = 12.0
-
     def _ring_edge_tol(self) -> float:
         """Half-width of a ring's clickable edge, in data units.
 
@@ -679,6 +677,20 @@ class ViewerInteractMixin:
         if not math.isfinite(x_per_px) or x_per_px <= 0.0:
             return RING_EDGE_TOL_FALLBACK
         return RING_EDGE_TOL_PX * x_per_px
+
+    def _hit_pads(self, radius: float) -> tuple[float, float]:
+        """``HIT_TOL_PX`` as (radial, angular) tolerances at ``radius``.
+
+        In polar mode the axes *are* radius and angle, so the pixel
+        sizes convert directly. In Cartesian both axes are q, so the
+        angular pad is the angle a few pixels subtend at this radius —
+        which is why it takes the radius at all.
+        """
+        x_per_px, y_per_px = self._pixel_slop(HIT_TOL_PX)
+        if self._mode == MODE_POLAR:
+            return x_per_px, y_per_px
+        span = max(abs(radius), 1e-6)
+        return x_per_px, min(180.0, math.degrees(y_per_px / span))
 
     def _pixel_slop(self, pixels: float) -> tuple[float, float]:
         """``pixels`` as (x, y) data-unit tolerances at the current zoom."""
@@ -732,6 +744,7 @@ class ViewerInteractMixin:
         else:
             r, a = float(x), float(y)
         tol = self._ring_edge_tol()
+        pad_r, pad_a = self._hit_pads(r)
         frame = self.current_frame
         peaks_for_frame = self._frame_peaks.get(frame) or {}
         out: list[SelectedPeak] = []
@@ -744,7 +757,10 @@ class ViewerInteractMixin:
                     continue
                 for peak in reversed(self._manual_peaks.get(frame, [])):
                     box = _box_of(peak)
-                    if peak_picking.contains(box, r, a, ring_edge_tol=tol):
+                    if peak_picking.contains(
+                        box, r, a, ring_edge_tol=tol,
+                        pad_radius=pad_r, pad_angle=pad_a,
+                    ):
                         hits.append(
                             (SelectedPeak.from_manual(peak, frame), box))
 
@@ -760,7 +776,10 @@ class ViewerInteractMixin:
                     ):
                         continue
                     box = _box_of_row(table, i)
-                    if peak_picking.contains(box, r, a, ring_edge_tol=tol):
+                    if peak_picking.contains(
+                        box, r, a, ring_edge_tol=tol,
+                        pad_radius=pad_r, pad_angle=pad_a,
+                    ):
                         hits.append(
                             (self._row_selection(kind, table, i, frame), box))
 
@@ -785,7 +804,8 @@ class ViewerInteractMixin:
                             continue
                         box = _box_of_row(tbl, i)
                         if not peak_picking.contains(
-                            box, r, a, ring_edge_tol=tol
+                            box, r, a, ring_edge_tol=tol,
+                            pad_radius=pad_r, pad_angle=pad_a,
                         ):
                             continue
                         sel = self._row_selection("matched", tbl, i, frame)
@@ -800,69 +820,20 @@ class ViewerInteractMixin:
             out.extend(peak_picking.rank_hits(hits))
         return out
 
-    def _effective_stack(
-        self, x: float, y: float, candidates: list[SelectedPeak],
-    ) -> tuple[list[SelectedPeak], tuple, bool]:
-        """The stack a click at ``(x, y)`` should step through.
+    def _cycle_pick(self, candidates: list[SelectedPeak]) -> SelectedPeak:
+        """Pick from ``candidates``: the box *after* the current
+        selection, or the innermost one.
 
-        A click near the previous one sticks to the stack that one
-        anchored, as long as it still lands on part of it. Without that,
-        stepping fails exactly where it is needed most: the inner box is
-        often narrower than the few pixels a hand drifts between two
-        clicks, so the second click sees only the outer box and picks it
-        again — which is how a detected box inside a fitted one ended up
-        unreachable.
-
-        A click that lands on a box the anchor did not offer is a fresh
-        click, so moving onto a neighbouring box still selects it and
-        clicking empty space still deselects.
-
-        Returns ``(candidates, keys, anchored)``.
+        The whole rule is "a click never hands back the box you already
+        have": if what is selected is among the boxes under the cursor,
+        the click takes the next one and wraps at the end. That is what
+        makes a box nested inside another reachable — click once for the
+        innermost, again for the one around it — without a gesture to
+        remember or a "same spot" test to satisfy.
         """
         keys = tuple(self._sel_key(c) for c in candidates)
-        anchor = self._cycle_anchor
-        if anchor is None or not self._near_anchor(x, y, anchor):
-            return candidates, keys, False
-        anchored = self._hit_candidates(*anchor)
-        anchored_keys = tuple(self._sel_key(c) for c in anchored)
-        # Re-tested rather than remembered, so a frame change, a fresh
-        # pipeline result or a hidden overlay drops the anchor instead
-        # of selecting something that is no longer there.
-        if anchored_keys != self._cycle_keys:
-            return candidates, keys, False
-        # Subset, not overlap: a click that has drifted off the inner
-        # box still sees only boxes the anchor already offered, while a
-        # click that has found something *new* (a different box nearby)
-        # is a deliberate new pick and must not be hijacked into a step.
-        if not keys or not set(keys) <= set(anchored_keys):
-            return candidates, keys, False
-        return anchored, anchored_keys, True
-
-    def _cycle_pick(self, x: float, y: float,
-                    candidates: list[SelectedPeak]) -> SelectedPeak:
-        """Pick from ``candidates``, advancing on a repeat click.
-
-        Clicking the same spot again steps to the next box under it, so
-        a box completely inside another is still reachable.
-
-        There is deliberately no timing condition. Gating on the
-        double-click interval (to stop a zoom-reset double-click from
-        cycling on its way through) also swallowed ordinary deliberate
-        clicks, which is exactly the case this exists for. The
-        double-click is handled where it actually happens instead, in
-        ``revert_cycle_for_double_click``.
-        """
-        anchor = self._cycle_anchor
-        candidates, keys, anchored = self._effective_stack(x, y, candidates)
         previous = self._selected
-        index = (
-            self._next_index(keys)
-            if anchored and len(candidates) > 1 else 0
-        )
-        # While stepping, the anchor stays on the click that started it,
-        # so a drift of a few pixels per click cannot creep off the box.
-        self._cycle_anchor = anchor if anchored else (x, y)
-        self._cycle_keys = keys
+        index = self._next_index(keys)
         self._cycle_time = time.monotonic()
         self._cycle_prev = previous if index else None
         return candidates[index]
@@ -895,14 +866,7 @@ class ViewerInteractMixin:
             self._set_selected(restore)
             self._reset_cycle()
 
-    def _near_anchor(self, x: float, y: float,
-                     anchor: tuple[float, float]) -> bool:
-        slop_x, slop_y = self._pixel_slop(self._CYCLE_SLOP_PX)
-        return abs(x - anchor[0]) <= slop_x and abs(y - anchor[1]) <= slop_y
-
     def _reset_cycle(self) -> None:
-        self._cycle_anchor = None
-        self._cycle_keys = ()
         self._cycle_prev = None
 
     # -- Hover preview -------------------------------------------------
@@ -1018,7 +982,8 @@ class ViewerInteractMixin:
         #
         # * Bare click (no modifiers): takes the best candidate from the
         #   full priority list ``manual > fitted > detected > matched``,
-        #   and clicking the same spot again walks down the stack.
+        #   unless that box is already selected — then it takes the next
+        #   one under the cursor, so a nested box is one more click away.
         # * Ctrl+click: multi-select. Hit-tests the detected and fitted
         #   overlays (only — manual / matched stay single-select) and
         #   routes through ``_toggle_selected``. The search prefers the
@@ -1028,10 +993,6 @@ class ViewerInteractMixin:
         #   and a fitted multi-select reaches fitted. With no multi-kind
         #   primary yet, fitted wins over detected (same priority as a
         #   bare click). No hit under the cursor → no-op.
-        # * Shift+click: step to the next box under the cursor,
-        #   unconditionally. The same walk as a repeat click, without
-        #   the "same spot" test, for when the boxes are nested and the
-        #   hand is not steady.
         # * Ctrl+Alt never reaches here (press branch consumed it
         #   as a draw gesture).
         if self._mode not in (MODE_POLAR, MODE_CARTESIAN) or self._busy:
@@ -1058,31 +1019,6 @@ class ViewerInteractMixin:
             bool(mods & Qt.KeyboardModifier.ControlModifier)
             and not bool(mods & Qt.KeyboardModifier.AltModifier)
         )
-        shift_only = (
-            bool(mods & Qt.KeyboardModifier.ShiftModifier)
-            and not bool(mods & Qt.KeyboardModifier.ControlModifier)
-            and not bool(mods & Qt.KeyboardModifier.AltModifier)
-        )
-
-        # Shift+click always takes the next box under the cursor, with
-        # no "same spot" or timing conditions to satisfy: the plain
-        # repeat click is the convenient path, this is the one that
-        # always works. (Shift, not Alt: Alt+click is a window-move
-        # gesture on several Linux desktops.)
-        if shift_only:
-            candidates = self._hit_candidates(x, y)
-            if not candidates:
-                return
-            anchor = self._cycle_anchor
-            candidates, keys, anchored = self._effective_stack(
-                x, y, candidates)
-            self._cycle_anchor = anchor if anchored else (x, y)
-            self._cycle_keys = keys
-            self._cycle_time = time.monotonic()
-            self._cycle_prev = None
-            self._set_selected(candidates[self._next_index(keys)])
-            return
-
         # Ctrl+click multi-selects detected OR fitted peaks. Search the
         # current multi-selection's kind first (so the user keeps
         # building one kind even where detected/fitted overlap), then
@@ -1109,7 +1045,7 @@ class ViewerInteractMixin:
             if self._selected is not None:
                 self._set_selected(None)
             return
-        self._set_selected(self._cycle_pick(x, y, candidates))
+        self._set_selected(self._cycle_pick(candidates))
 
     def _set_selected(
         self, sel: SelectedPeak | None, *, preserve_manual: bool = False,

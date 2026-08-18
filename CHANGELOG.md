@@ -81,6 +81,17 @@ pre-releases.
 
 ### Fixed
 
+- **Highlights cover the box they mark, and look the same on every
+  kind.** The hover preview was translucent, so a detected box's dashed
+  red showed through it as pink while a fitted box's cyan did not. Both
+  the preview and the selection outline are now solid, opaque and wider
+  than any overlay pen; the preview is the accent colour and the
+  selection stays white, so "under the cursor" and "selected" remain
+  distinguishable.
+- **A small peak box inside a larger one is selectable.** Boxes had to
+  be hit exactly, so missing an 8 px detection by three pixels selected
+  the box around it — and with only that box in the stack there was
+  nothing to step to. Clicks now carry a few pixels of tolerance.
 - **A selected matched peak is highlighted like every other peak.** The
   structure's own box was painted over the white selection outline (the
   matched overlay is rebuilt on every render, so it ended up on top),
@@ -93,10 +104,8 @@ pre-releases.
   and inside a kind the **smallest box wins**, so a box drawn inside
   another is reachable instead of being shadowed by it. Clicking the
   same spot again steps to the next box underneath, so the outer one is
-  still one click away — and **Shift+click** always takes the next box,
-  for stacks where the inner box is smaller than the few pixels a hand
-  drifts between two clicks (a detected box inside a fitted one was
-  otherwise unreachable).
+  still one click away: a click never hands back the box that is already
+  selected.
 - **Rings no longer swallow the peaks in their band.** A ring's box
   spans every angle at its radius, so it used to compete with every spot
   peak there. A ring is now picked by clicking within a few pixels of
