@@ -90,6 +90,11 @@ pre-releases.
 
 ### Fixed
 
+- **The hover outline no longer lingers.** It could survive the cursor
+  leaving: a re-render while a run was in flight left it painted, and a
+  re-render after the pointer had left the window redrew it. Every exit
+  now clears it — leaving the plot or the viewer, a run starting, a
+  view-mode switch, and closing the file.
 - **Highlights cover the box they mark, and look the same on every
   kind.** The hover preview was translucent, so a detected box's dashed
   red showed through it as pink while a fitted box's cyan did not. Both

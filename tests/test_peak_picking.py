@@ -16,7 +16,7 @@ import math
 
 import numpy as np
 import pytest
-from PySide6.QtCore import QPointF, Qt
+from PySide6.QtCore import QEvent, QPointF, Qt
 from PySide6.QtWidgets import QApplication
 
 from mlgidlab import peak_picking, theme_tokens
@@ -470,6 +470,104 @@ def test_leaving_the_image_drops_the_outline(picker):
     picker._on_cursor_left()
     assert picker._hover_key is None
     assert picker._hover_pos is None
+
+
+def _outlined(picker) -> bool:
+    return not picker._hover.boundingRect().isNull()
+
+
+def _pointer_over(picker, over: bool) -> None:
+    """Fake the pointer being on (or off) the plot.
+
+    ``underMouse`` reads ``WA_UnderMouse``, which Qt sets from real
+    enter/leave dispatch — offscreen there is no pointer to dispatch,
+    so the tests set the attribute the same way Qt would.
+    """
+    picker._view.ui.graphicsView.setAttribute(
+        Qt.WidgetAttribute.WA_UnderMouse, over)
+
+
+def test_a_re_render_while_busy_takes_the_outline_with_it(picker):
+    """Regression: ``_refresh_hover`` zeroes the hover key before
+    re-running, and ``_clear_hover`` used to skip the repaint when the
+    key was already None — so any early return in ``_update_hover``
+    (busy, dragging, mid draw-drag) left the outline painted on."""
+    _install(picker, detected=[_peak(2.0, 30.0, 0.3, 20.0, 1)])
+    _pointer_over(picker, True)
+    picker._update_hover(2.0, 30.0)
+    assert _outlined(picker)
+
+    picker._busy = True
+    picker._render_overlays(0)
+    assert not _outlined(picker)
+    picker._busy = False
+
+
+def test_starting_a_run_drops_the_outline(picker):
+    """Hit-testing is off while the pipeline runs, so an outline left up
+    would promise a click that does nothing — and the user watching a
+    run is not moving the mouse to trigger the next update."""
+    _install(picker, detected=[_peak(2.0, 30.0, 0.3, 20.0, 1)])
+    _pointer_over(picker, True)
+    picker._update_hover(2.0, 30.0)
+    picker.set_busy(True)
+    assert not _outlined(picker)
+    picker.set_busy(False)
+
+
+def test_a_re_render_does_not_resurrect_an_outline_for_a_cursor_that_left(picker):
+    """A Leave is not guaranteed — the pointer can exit fast, or the
+    window can lose it to a popup or a keyboard switch. Without the
+    ``underMouse`` check, the next frame change faithfully redrew the
+    outline for a cursor that had gone."""
+    _install(picker, detected=[_peak(2.0, 30.0, 0.3, 20.0, 1)])
+    _pointer_over(picker, True)
+    picker._update_hover(2.0, 30.0)
+    assert _outlined(picker)
+
+    _pointer_over(picker, False)          # gone, no Leave delivered
+    picker._render_overlays(0)
+    assert not _outlined(picker)
+
+
+def test_the_outline_survives_a_re_render_under_the_cursor(picker):
+    """The other half: overlays are rebuilt on frame changes and
+    pipeline results, and a cursor sitting on a box should keep its
+    preview."""
+    _install(picker, detected=[_peak(2.0, 30.0, 0.3, 20.0, 1)])
+    _pointer_over(picker, True)
+    picker._update_hover(2.0, 30.0)
+    picker._render_overlays(0)
+    assert _outlined(picker)
+
+
+def test_leaving_the_viewer_drops_the_outline(picker):
+    _install(picker, detected=[_peak(2.0, 30.0, 0.3, 20.0, 1)])
+    _pointer_over(picker, True)
+    picker._update_hover(2.0, 30.0)
+    picker.leaveEvent(QEvent(QEvent.Type.Leave))
+    assert not _outlined(picker)
+    assert picker._hover_pos is None
+
+
+def test_switching_view_mode_drops_the_outline(picker):
+    """The remembered point is in the space just left — polar is
+    (r, angle), Cartesian is (q_xy, q_z) — so re-running the hover on
+    it would outline nonsense."""
+    _install(picker, detected=[_peak(2.0, 30.0, 0.3, 20.0, 1)])
+    _pointer_over(picker, True)
+    picker._update_hover(2.0, 30.0)
+    picker.set_mode("cartesian")
+    assert not _outlined(picker)
+    assert picker._hover_pos is None
+
+
+def test_closing_the_file_drops_the_outline(picker):
+    _install(picker, detected=[_peak(2.0, 30.0, 0.3, 20.0, 1)])
+    _pointer_over(picker, True)
+    picker._update_hover(2.0, 30.0)
+    picker.clear()
+    assert not _outlined(picker)
 
 
 def test_the_readout_reports_a_stacked_cursor(main_window):

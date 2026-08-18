@@ -756,6 +756,11 @@ class ViewerOverlaysMixin:
         else:
             self._radio_cart.setChecked(True)
         self._sync_roi()  # ROI exists only in polar mode
+        # The remembered cursor point is in the space we just left
+        # (polar is (r, angle), Cartesian is (q_xy, q_z)), so re-running
+        # the hover on it would outline nonsense. The next mouse move
+        # re-establishes it.
+        self._clear_hover()
         self._render_active_mode()
 
     @property
@@ -768,6 +773,7 @@ class ViewerOverlaysMixin:
         self._fitted.clear_path()
         self._manual.clear_path()
         self._selection.clear_path()
+        self._clear_hover()
         self._fitted_preview.clear_path()
         self._fitted_preview_geom = None
         self._fitted_preview_extras_geoms = []

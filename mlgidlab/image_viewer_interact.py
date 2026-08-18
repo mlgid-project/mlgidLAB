@@ -318,6 +318,12 @@ class ViewerInteractMixin:
     def set_busy(self, busy: bool) -> None:
         """Disable interactive editing while a pipeline run is in flight."""
         self._busy = busy
+        if busy:
+            # Hit-testing is off for the duration, so an outline left
+            # up would promise a click that does nothing. Waiting for
+            # the next mouse move to notice is not good enough — the
+            # user is watching a run, not moving the mouse.
+            self._clear_hover()
         self._sync_roi()
 
     @property
@@ -952,10 +958,18 @@ class ViewerInteractMixin:
         ]
 
     def _clear_hover(self) -> None:
+        """Drop the outline, unconditionally.
+
+        It used to skip the repaint when ``_hover_key`` was already
+        None, which looked like a cheap guard and was a leak:
+        ``_refresh_hover`` zeroes the key *before* re-running the hover,
+        so any early return in ``_update_hover`` (busy, dragging, mid
+        draw-drag) reached this with the key already cleared and left
+        the outline painted on screen.
+        """
         self._hover_pos = None
-        if self._hover_key is not None:
-            self._hover_key = None
-            self._hover.clear_path()
+        self._hover_key = None
+        self._hover.clear_path()
 
     def _refresh_hover(self) -> None:
         """Recompute the outline after a re-render.
@@ -963,12 +977,32 @@ class ViewerInteractMixin:
         Overlays are rebuilt on frame changes, pipeline results and
         theme flips while the cursor sits still; without this the
         outline would point at whatever used to be under it.
+
+        ``underMouse`` is the guard that keeps this honest. A Leave
+        event is not guaranteed — the pointer can exit fast, the window
+        can be switched from the keyboard, a popup can grab it — and
+        without the check a re-render would faithfully redraw an
+        outline for a cursor that left minutes ago.
         """
         pos = self._hover_pos
         if pos is None:
             return
+        if not self._view.ui.graphicsView.underMouse():
+            self._clear_hover()
+            return
         self._hover_key = None
         self._update_hover(*pos)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        """Second net for the hover outline.
+
+        The event filter clears it on the graphics view's Leave, but a
+        Leave is not guaranteed to arrive there: the pointer can exit
+        through a child widget, or the window can lose it to a popup or
+        a keyboard-driven switch. This one fires on the viewer itself.
+        """
+        super().leaveEvent(event)
+        self._clear_hover()
 
     def _on_select_at(self, pos: QPointF, mods=Qt.KeyboardModifier.NoModifier) -> None:
         # Raw mode has no q-space overlays to hit-test. Polar and
