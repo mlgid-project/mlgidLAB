@@ -32,6 +32,14 @@ pre-releases.
 
 ### Changed
 
+- **The strips above the image wrap instead of setting a width floor.**
+  The viewer's control bar and the workflow rail were single rows whose
+  minimum width is the sum of everything in them, which stopped the
+  central column from being dragged narrower than about 740 px. Both now
+  reflow onto a second row, so the floor is the widest single cluster
+  (about 280 px) and the side docks can be pulled out much further.
+  Controls wrap as clusters, never between a label and its own control.
+
 - **Primary and destructive actions now look like what they are.** Run
   detection / fitting / matching, Run full pipeline, Convert, Track
   peaks, Save figure and the calibration "Add to conversion" buttons

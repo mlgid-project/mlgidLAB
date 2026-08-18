@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from mlgidlab import icons
+from mlgidlab.flow_layout import install_flow
 from mlgidlab.widgets import GAP, PAD
 
 #: (key, label, glyph). Order is the order of the workflow, which is the
@@ -98,8 +99,41 @@ class _StageChip(QWidget):
         self.run_button.setEnabled(runnable)
 
 
+class _StageBlock(QWidget):
+    """One stage as the rail wraps it: chip over its state line, and the
+    arrow to the next stage trailing it.
+
+    Keeping the arrow *inside* the block means a wrapped row ends with an
+    arrow pointing on to the next row, instead of a stray arrow opening a
+    row like a bullet.
+    """
+
+    def __init__(self, chip: _StageChip, with_arrow: bool,
+                 parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(GAP)
+        column = QVBoxLayout()
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+        column.addWidget(chip)
+        column.addWidget(chip.state)
+        row.addLayout(column)
+        if with_arrow:
+            arrow = QLabel("\u2192", self)
+            arrow.setProperty("status", "muted")
+            row.addWidget(arrow)
+
+
 class WorkflowRail(QWidget):
-    """The five stages, left to right, above the central view."""
+    """The five stages, left to right, above the central view.
+
+    The row wraps: five stages plus their arrows are wider than a
+    narrowed central column, and a strip that cannot wrap would set a
+    floor under how far the side docks can be dragged out. Each stage
+    wraps as one block — see ``mlgidlab.flow_layout``.
+    """
 
     #: A stage was clicked: bring the dock that owns it forward.
     stageActivated = Signal(str)
@@ -109,27 +143,18 @@ class WorkflowRail(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setProperty("mlgid", "rail")
-        outer = QHBoxLayout(self)
-        outer.setContentsMargins(PAD, 2, PAD, 2)
-        outer.setSpacing(GAP)
+        outer = install_flow(self, margins=(PAD, 2, PAD, 2),
+                             hspacing=GAP, vspacing=GAP)
 
         self.chips: dict[str, _StageChip] = {}
         for index, (key, label, glyph) in enumerate(STAGES):
-            if index:
-                arrow = QLabel("→")
-                arrow.setProperty("status", "muted")
-                outer.addWidget(arrow)
             chip = _StageChip(key, label, glyph, self)
             chip.activated.connect(self.stageActivated)
             chip.runRequested.connect(self.stageRunRequested)
-            column = QVBoxLayout()
-            column.setContentsMargins(0, 0, 0, 0)
-            column.setSpacing(0)
-            column.addWidget(chip)
-            column.addWidget(chip.state)
-            outer.addLayout(column)
+            outer.addWidget(
+                _StageBlock(chip, with_arrow=index < len(STAGES) - 1, parent=self)
+            )
             self.chips[key] = chip
-        outer.addStretch(1)
 
         line = QFrame(self)
         line.setFrameShape(QFrame.Shape.HLine)

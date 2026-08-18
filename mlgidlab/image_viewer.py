@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QSizePolicy,
     QSlider,
     QToolButton,
     QVBoxLayout,
@@ -49,6 +50,7 @@ from mlgidlab.file_model import (
 if TYPE_CHECKING:
     from mlgidlab.file_model import FrameSource
 from mlgidlab.polar import polar_to_qxyz
+from mlgidlab.flow_layout import ToolGroup, wrapping_bar
 from mlgidlab.image_viewer_overlays import ViewerOverlaysMixin
 from mlgidlab.image_viewer_render import ViewerRenderMixin
 from mlgidlab.image_viewer_interact import ViewerInteractMixin
@@ -245,9 +247,17 @@ class GIWAXSImageViewer(
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        bar = QHBoxLayout()
-        bar.setContentsMargins(8, 4, 8, 4)
-        bar.addWidget(QLabel("View:"))
+        # The control strip wraps. It used to be one QHBoxLayout, whose
+        # minimum width is the sum of every control in it — that sum was
+        # the floor under how narrow the central column could be dragged.
+        # A FlowLayout breaks onto a second row instead, so the floor is
+        # the widest single cluster. Controls are grouped into clusters
+        # that wrap as a unit; see ``mlgidlab.flow_layout``.
+        bar_widget = wrapping_bar(self, margins=(8, 4, 8, 4))
+        bar = bar_widget.layout()
+
+        view_group = ToolGroup()
+        view_group.add(QLabel("View:"))
         # A segmented pair rather than two radios: the choice is one
         # exclusive view mode, and a segmented control shows the two
         # options and the active one in the space two radios plus their
@@ -267,9 +277,11 @@ class GIWAXSImageViewer(
         segmented.setSpacing(0)          # the two halves share one edge
         segmented.addWidget(self._radio_cart)
         segmented.addWidget(self._radio_polar)
-        bar.addLayout(segmented)
-        bar.addSpacing(16)
-        bar.addWidget(QLabel("Colormap:"))
+        view_group.add_layout(segmented)
+        bar.addWidget(view_group)
+
+        cmap_group = ToolGroup()
+        cmap_group.add(QLabel("Colormap:"))
         self._cmap_combo = _SwatchCombo(
             QSize(CMAP_ICON_SIZE, CMAP_ICON_SIZE))
         # With an app-level stylesheet installed, QComboBox takes its
@@ -292,8 +304,9 @@ class GIWAXSImageViewer(
                 self._cmap_combo.addItem(QIcon(swatch), name)
         self._cmap_combo.setCurrentText(DEFAULT_COLORMAP)
         self._cmap_combo.currentTextChanged.connect(self._on_cmap_changed)
-        bar.addWidget(self._cmap_combo)
-        bar.addSpacing(16)
+        cmap_group.add(self._cmap_combo)
+        bar.addWidget(cmap_group)
+
         # Log/linear contrast toggle. When checked, the displayed image
         # is log10(clip(data, floor, inf)) and the histogram levels are
         # recomputed on the transformed array so the LUT stays sensible.
@@ -318,14 +331,15 @@ class GIWAXSImageViewer(
         )
         self._log_check.toggled.connect(self._on_log_toggled)
         bar.addWidget(self._log_check)
-        bar.addSpacing(16)
+
         # Aspect ratio of the shown image. "Fit" (default) stretches the
         # frame to fill the panel (setAspectLocked(False)); "Custom" locks
         # the y-to-x data-unit scale to the spin value — 1.00 is the
         # undistorted view (equal Å⁻¹ per axis, so q-space rings stay
         # round in Cartesian mode). The lock lives on the PlotItem and so
         # survives mode switches and re-renders. See _on_aspect_changed.
-        bar.addWidget(QLabel("Aspect:"))
+        aspect_group = ToolGroup()
+        aspect_group.add(QLabel("Aspect:"))
         self._aspect_combo = QComboBox()
         self._aspect_combo.addItems(["Fit", "Default", "Custom"])
         self._aspect_combo.setToolTip(
@@ -334,7 +348,7 @@ class GIWAXSImageViewer(
             "the ratio box. Scrolling over an axis switches to Custom."
         )
         self._aspect_combo.currentIndexChanged.connect(self._on_aspect_changed)
-        bar.addWidget(self._aspect_combo)
+        aspect_group.add(self._aspect_combo)
         self._aspect_spin = QDoubleSpinBox()
         self._aspect_spin.setRange(0.05, 20.0)
         self._aspect_spin.setSingleStep(0.05)
@@ -345,19 +359,19 @@ class GIWAXSImageViewer(
             "tall, <1 taller than wide."
         )
         self._aspect_spin.valueChanged.connect(self._on_aspect_changed)
-        bar.addWidget(self._aspect_spin)
+        aspect_group.add(self._aspect_spin)
+        bar.addWidget(aspect_group)
+
         # The frame-navigation controls (prev / play / next / slider /
         # label) used to live in the Display dock's Frame row. They
         # now sit here in the toolbar so the user can scrub frames
         # regardless of which right-dock tab is in front. The host
         # injects them via ``insert_frame_controls`` after the
         # Display dock builds them — see MainWindow.
-        bar.addStretch(1)
+        self._frames_group: ToolGroup | None = None
         # Keep a handle on the layout so the host can splice the
-        # frame-navigation widgets in just before the trailing stretch.
+        # frame-navigation widgets in.
         self._toolbar_layout = bar
-        bar_widget = QWidget(self)
-        bar_widget.setLayout(bar)
         outer.addWidget(bar_widget)
 
         self._plot = pg.PlotItem()
@@ -1079,43 +1093,29 @@ class GIWAXSImageViewer(
             self._render_overlays(frame)
 
     def insert_frame_controls(self, widgets: list[QWidget]) -> None:
-        """Splice ``widgets`` into the toolbar just before the
-        trailing stretch.
+        """Add the frame-navigation cluster to the end of the toolbar.
 
-        The host (MainWindow) owns the frame-navigation widgets
-        (previous, play, next, slider, label) so it can keep their
-        signal wiring intact when re-parenting them. The trailing
-        stretch added in ``__init__`` is **preserved** here — when
-        the slider is hidden (single-frame stack) the stretch is
-        the only expanding item left, which keeps the other toolbar
-        controls clustered to the left instead of being spread out
-        across the image width. When the slider is visible it
-        carries a much larger stretch factor so it dominates and
-        consumes the leftover horizontal space; the trailing
-        stretch only kicks in when the slider's stretch
-        contribution is zero (hidden widget).
+        The host (MainWindow) owns these widgets (previous, play, next,
+        slider, index, label) so it can keep their signal wiring intact
+        when re-parenting them. They go into one :class:`ToolGroup`, so
+        the strip wraps the transport as a block rather than splitting
+        it mid-cluster, and so the group vanishes entirely when the host
+        hides all six for a single-frame stack.
+
+        The slider carries the stretch inside the group and the group is
+        horizontally Expanding, which is what makes it swallow whatever
+        width its row has left over.
         """
-        bar = self._toolbar_layout
-        # Insert in front of the trailing stretch (always the last
-        # item from __init__). ``insert_at`` is updated after each
-        # call so widgets land in the order given.
-        insert_at = bar.count() - 1
-        if insert_at < 0:
-            insert_at = 0
-        bar.insertSpacing(insert_at, 16)
-        insert_at += 1
+        if self._frames_group is None:
+            group = ToolGroup()
+            group.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                QSizePolicy.Policy.Preferred)
+            self._frames_group = group
+            self._toolbar_layout.addWidget(group)
         for w in widgets:
-            if isinstance(w, QSlider):
-                # Slider gets a much larger stretch factor than the
-                # trailing stretch so it eats the leftover width
-                # when visible. When the slider is hidden, the
-                # trailing stretch (factor 1) absorbs the space
-                # alone and the other toolbar items stay packed
-                # against the left edge.
-                bar.insertWidget(insert_at, w, 100)
-            else:
-                bar.insertWidget(insert_at, w)
-            insert_at += 1
+            # The slider gets the stretch so it, not the buttons either
+            # side of it, absorbs the row's spare width.
+            self._frames_group.add(w, 100 if isinstance(w, QSlider) else 0)
 
     def set_overlay_visible(self, kind: str, visible: bool) -> None:
         if kind not in OVERLAY_KINDS:
