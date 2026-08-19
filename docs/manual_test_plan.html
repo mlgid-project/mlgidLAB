@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>mlgidLAB v0.1.0a10 — manual test plan</title>
+<title>mlgidLAB v0.1.0a17 — manual test plan</title>
 <style>
   :root { --fg:#1b1b1b; --muted:#666; --line:#ddd; --accent:#1763b6; --warn:#b35a00; --pass:#1a7f37; --fail:#c0392b; }
   * { box-sizing: border-box; }
@@ -59,7 +59,7 @@
   <span class="count">Progress autosaves in this browser.</span>
 </div>
 
-<h1>mlgidLAB v0.1.0a10 — manual test plan</h1>
+<h1>mlgidLAB v0.1.0a17 — manual test plan</h1>
 <p class="sub">Mark each step <b>pass</b> or <b>fail</b> as you go (leave it
 blank if you didn't test it), and set an overall result per section. At
 the end, click <b>Copy results</b> and email the summary to me — it lists
@@ -71,7 +71,7 @@ every failed step by name. About 30-45 min for a full pass.</p>
   terminal output is the most useful thing to send me).
   <pre>conda create -n mlgidlab python=3.12 -y
 conda activate mlgidlab
-pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a10"
+pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a17"
 mlgidlab</pre>
   <b>The test files are hosted once</b> on the
   <a href="https://github.com/mlgid-project/mlgidLAB/releases/tag/v0.1.0a9">v0.1.0a9
@@ -81,7 +81,7 @@ mlgidlab</pre>
   <code>example/</code> folder sits alongside it — you don't need to hunt
   anything down. You're welcome to try your own files too, but nothing
   else is required. Full install detail:
-  <a href="https://github.com/mlgid-project/mlgidLAB/blob/v0.1.0a10/docs/getting_started.md">docs/getting_started.md</a>.
+  <a href="https://github.com/mlgid-project/mlgidLAB/blob/v0.1.0a17/docs/getting_started.md">docs/getting_started.md</a>.
 </div>
 
 <h2>Reference files (in <code>example/</code>)</h2>
@@ -291,6 +291,25 @@ Not tested. The per-step marks are what tell us exactly which parts broke.</p>
   <textarea id="n13" placeholder="Notes for area 13"></textarea>
 </div>
 
+<div class="area" data-area="14">
+  <div class="hdr"><h3>14. Quick select + peak linking (new in a17)</h3>
+    <label>Result <select id="r14"></select></label></div>
+  <p class="filehint">Use: <code>organic_labeled.h5</code> in <b>polar</b> mode
+    (hand-drawn boxes are polar-only).</p>
+  <ul class="steps">
+    <li><label><input type="checkbox" id="c14_1"> Tick Quick select (Display dock), target Detected: drawing a second box commits the first</label></li>
+    <li><label><input type="checkbox" id="c14_2"> Draw a box, then redraw over the same spot: nothing is committed, the box is just replaced</label></li>
+    <li><label><input type="checkbox" id="c14_3"> Pending box commits on click-away / Enter / frame change; Esc discards it instead</label></li>
+    <li><label><input type="checkbox" id="c14_4"> Ctrl+Z after a commit turns the peak back into the box you drew</label></li>
+    <li><label><input type="checkbox" id="c14_5"> Target Fitted: each box yields a detected AND a fitted peak sharing one id</label></li>
+    <li><label><input type="checkbox" id="c14_6"> Fit a detected peak twice with different borders: still one fitted peak, updated</label></li>
+    <li><label><input type="checkbox" id="c14_7"> Delete a detected peak: its fit goes too. Delete a fit: the detection stays</label></li>
+    <li><label><input type="checkbox" id="c14_8"> Settings &rarr; Settings…: turning the link off restores the old independent behaviour</label></li>
+    <li><label><input type="checkbox" id="c14_9"> Peaks dock: Ctrl+click several rows, press Delete — one confirmation, all removed</label></li>
+  </ul>
+  <textarea id="n14" placeholder="Notes for area 14"></textarea>
+</div>
+
 <h2>Collecting and sending logs</h2>
 <p>There is no log file on disk — logs live in the app and the terminal.
 Three ways to capture them, easiest first:</p>
@@ -408,7 +427,8 @@ email together with the logs, and send to
     "Detect / Fit / Match", "Edit: manual + Add to fitted",
     "Multi-select / copy-paste / batch / delete", "Undo / redo",
     "Figure export", "CSV export + Clear/Reset",
-    "Save / close / theme", "Robustness / edge"
+    "Save / close / theme", "Robustness / edge",
+    "Quick select + peak linking"
   ];
   // Step ids belonging to area `a`, in document order.
   function areaSteps(a) {
@@ -420,7 +440,7 @@ email together with the logs, and send to
 
   document.getElementById("copyBtn").addEventListener("click", function () {
     var L = [];
-    L.push("mlgidLAB v0.1.0a10 — manual test results");
+    L.push("mlgidLAB v0.1.0a17 — manual test results");
     L.push("Name: " + (val("t_name") || "(none)"));
     L.push("OS: " + (val("t_os") || "(none)") +
            "   Python: " + (val("t_py") || "(none)"));

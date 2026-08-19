@@ -445,7 +445,7 @@ class MainWindow(
         self._2d_preview_cache: dict[tuple, object] = {}
 
         self.setWindowTitle(APP_NAME)
-        self.resize(1400, 900)
+        self.resize(*self._default_window_size())
 
         self._build_menu()
         self._build_central()
@@ -457,6 +457,8 @@ class MainWindow(
         self._build_view_menu()
         self._build_settings_menu()
         self._build_help_menu()
+        # Menu glyphs in one pass, now that every action exists.
+        self._apply_menu_icons()
         # Frame-navigation shortcuts. Installed last so the viewer +
         # entry combo exist. Window-context QActions; text inputs
         # (QLineEdit, QSpinBox) consume Left/Right/Home/End for
@@ -475,6 +477,13 @@ class MainWindow(
         self._build_status_bar()
         self._update_title()
         self._update_actions()
+        # Seed the welcome page. Its wordmark, recent list and backend
+        # notice are all filled by _refresh_welcome_view, which is
+        # otherwise only reached through _apply_session_mode — and that
+        # first runs when a file is opened. Without this call the page
+        # the user sees at cold start is an empty label under a "Recent"
+        # heading with nothing beneath it.
+        self._refresh_welcome_view()
         # Accept dropped files anywhere on the main window so the user
         # can drag NeXus / raw paths in from a file manager. The drop
         # handler classifies each file by content and dispatches.
@@ -484,6 +493,30 @@ class MainWindow(
         # has tabified the right-side stack. View → Reset layout
         # restores from this snapshot — see ``_reset_layout``.
         self._default_layout_state = self.saveState()
+        # One-shot guard for the first-show dock sizing (see showEvent).
+        self._dock_widths_applied = False
+
+    @staticmethod
+    def _default_window_size() -> tuple[int, int]:
+        """Open at 1600x950 where the screen allows it.
+
+        The window holds two dock columns with the image between them,
+        and QMainWindow shares the width out between them: at 1400 the
+        right-hand column could only be opened to ~350 px, which
+        compressed its forms (the panels sit in resizable scroll areas,
+        so a narrow column elides rather than scrolls). Falls back to
+        90% of the available geometry, so a laptop still gets a window
+        that fits its screen.
+        """
+        screen = QApplication.primaryScreen()
+        if screen is None:                      # headless / no display
+            return (1400, 900)
+        available = screen.availableGeometry()
+        # Never smaller than the long-standing 1400x900: a screen that
+        # cannot fit it could not fit it before either, and shrinking
+        # the default there would squeeze the docks instead of helping.
+        return (max(1400, min(1600, int(available.width() * 0.9))),
+                max(900, min(950, int(available.height() * 0.9))))
 
     @property
     def session(self) -> Session | None:
@@ -526,6 +559,15 @@ class MainWindow(
         if getattr(self, "_closed", False):
             return super().eventFilter(obj, ev)
         et = ev.type()
+        # Status-bar pipeline cell: clicking it opens the log of the run
+        # it is reporting on.
+        if (et == QEvent.Type.MouseButtonPress
+                and obj is getattr(self, "_sb_pipeline", None)):
+            dock = getattr(self, "_logs_dock", None)
+            if dock is not None:
+                dock.show()
+                dock.raise_()
+            return True
         if et not in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress):
             return super().eventFilter(obj, ev)
         fw = QApplication.focusWidget()
@@ -561,6 +603,14 @@ class MainWindow(
         # Dock tab bars only materialise with the first layout pass —
         # sweep for ghosts right after it (see the method docstring).
         QTimer.singleShot(0, self._hide_stale_dock_tab_bars)
+        # Dock widths asked for during construction are only advisory:
+        # QMainWindow has no real geometry yet and scales the request
+        # down to whatever it thinks it has. Ask again on the first
+        # show, when the numbers actually land. Once only — after that
+        # the column belongs to the user.
+        if not self._dock_widths_applied:
+            self._dock_widths_applied = True
+            QTimer.singleShot(0, self._apply_default_dock_widths)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         """Accept drops carrying local file URLs.

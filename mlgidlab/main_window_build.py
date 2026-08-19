@@ -6,9 +6,18 @@ source split.
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QAction, QFont, QKeySequence, QPixmap
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QFont,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QCheckBox,
@@ -26,6 +35,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSlider,
     QSpinBox,
+    QStackedWidget,
     QStyle,
     QTabWidget,
     QToolButton,
@@ -45,19 +55,42 @@ from mlgidlab.main_window_constants import (
 )
 from mlgidlab.parameter_panel import ParameterPanel
 from mlgidlab.peaks_table_panel import PeaksTablePanel
+from mlgidlab.pipeline import is_mlgidbase_available
 from mlgidlab.pipeline_panel import PipelinePanel
 from mlgidlab.profile_viewer import ProfileViewer
 from mlgidlab.scan_tracking_panel import ScanTrackingPanel
 from mlgidlab.update_ui import _UpdateBanner
+from mlgidlab.welcome_view import WelcomeView
+from mlgidlab.workflow_rail import WorkflowRail
+from mlgidlab import file_model, theme_tokens
 from mlgidlab.widgets import (
+    PRIMARY,
+    Card,
     make_debounced_timer,
     make_pen_swatch as _make_pen_swatch,
+    section_label,
+    set_variant,
+    skin_progress,
 )
 from silx.gui.data.DataViewerFrame import DataViewerFrame
+from mlgidlab import icons
 
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _dirty_dot(diameter: int = 8) -> QPixmap:
+    """A filled accent disc marking unsaved changes."""
+    pix = QPixmap(diameter + 4, diameter + 4)
+    pix.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(theme_tokens.color("accent")))
+    painter.drawEllipse(2, 2, diameter, diameter)
+    painter.end()
+    return pix
 
 
 class BuildMixin:
@@ -95,7 +128,26 @@ class BuildMixin:
             self._on_install_update_requested
         )
         col.addWidget(self._update_banner)
-        col.addWidget(self.tabs)
+        # The workflow spine, between the banner and the view. Hidden
+        # with no session — the welcome page owns that state.
+        self.workflow_rail = WorkflowRail(central)
+        self.workflow_rail.stageActivated.connect(self._on_rail_stage_activated)
+        self.workflow_rail.stageRunRequested.connect(self._on_rail_stage_run)
+        self.workflow_rail.hide()
+        col.addWidget(self.workflow_rail)
+        # The tabs share the column with a welcome page, shown whenever
+        # no session is open (``_apply_session_mode``). A stack rather
+        # than show/hide on the tabs so the two can never both be up, and
+        # so the docks' own visibility logic is untouched — nothing in
+        # the dock layout lives in the central widget.
+        self.welcome_view = WelcomeView(central)
+        self.welcome_view.openRequested.connect(self._action_open)
+        self.welcome_view.importRequested.connect(self._action_import_converted)
+        self.welcome_view.recentRequested.connect(self._open_recent)
+        self._central_stack = QStackedWidget(central)
+        self._central_stack.addWidget(self.welcome_view)   # index 0
+        self._central_stack.addWidget(self.tabs)           # index 1
+        col.addWidget(self._central_stack)
         self.setCentralWidget(central)
 
     def _build_docks(self) -> None:
@@ -136,7 +188,10 @@ class BuildMixin:
         # re-sync every open session with the filesystem (close deleted
         # originals, reload changed ones). Also on F5.
         self._tree_refresh_btn = QToolButton()
-        self._tree_refresh_btn.setText("⟳ Refresh")
+        self._tree_refresh_btn.setText("Refresh")
+        self._tree_refresh_btn.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        icons.bind(self._tree_refresh_btn, "refresh")
         self._tree_refresh_btn.setAutoRaise(True)
         self._tree_refresh_btn.setToolTip(
             "Re-check every open file on disk (F5): close files whose "
@@ -215,13 +270,7 @@ class BuildMixin:
         # picks up the right colour automatically.
         self.play_button = QToolButton()
         self.play_button.setCheckable(True)
-        self._icon_play = self.style().standardIcon(
-            QStyle.StandardPixmap.SP_MediaPlay
-        )
-        self._icon_pause = self.style().standardIcon(
-            QStyle.StandardPixmap.SP_MediaPause
-        )
-        self.play_button.setIcon(self._icon_play)
+        self.play_button.setIcon(icons.icon("play"))
         self.play_button.setToolTip(
             "Play frames from the current position to the end.\n"
             "Stops at the last frame; click again to pause."
@@ -231,18 +280,14 @@ class BuildMixin:
         # clamp at boundaries (the buttons disable themselves at
         # frame 0 / last via ``_refresh_frame_nav_enabled``).
         self.prev_frame_button = QToolButton()
-        self.prev_frame_button.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowBack)
-        )
+        icons.bind(self.prev_frame_button, "prev")
         self.prev_frame_button.setToolTip("Previous frame")
         self.prev_frame_button.setAutoRepeat(True)
         self.prev_frame_button.setAutoRepeatDelay(300)
         self.prev_frame_button.setAutoRepeatInterval(80)
         self.prev_frame_button.clicked.connect(self._on_prev_frame_clicked)
         self.next_frame_button = QToolButton()
-        self.next_frame_button.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowForward)
-        )
+        icons.bind(self.next_frame_button, "next")
         self.next_frame_button.setToolTip("Next frame")
         self.next_frame_button.setAutoRepeat(True)
         self.next_frame_button.setAutoRepeatDelay(300)
@@ -274,7 +319,7 @@ class BuildMixin:
         # Start hidden — only useful once a multi-frame stack is loaded.
         self._set_frame_slider_visible(False)
 
-        layout.addWidget(QLabel("Overlays"))
+        layout.addWidget(section_label("Overlays"))
         # Manual peaks intentionally omitted: the GUI now keeps at most
         # one manual box per frame (drawn → replaced → committed via
         # Add-to-fitted/detected, removed via Esc / Delete), so a
@@ -686,7 +731,8 @@ class BuildMixin:
         sim_add_row = QHBoxLayout()
         sim_add_row.setContentsMargins(20, 0, 0, 0)
         sim_add_row.setSpacing(6)
-        self._sim_add_btn = QPushButton("Add selected peaks (fit + match)")
+        self._sim_add_btn = set_variant(
+            QPushButton("Add selected peaks (fit + match)"), PRIMARY)
         self._sim_add_btn.setEnabled(False)
         self._sim_add_btn.clicked.connect(self._on_add_predicted_peaks)
         sim_add_row.addWidget(self._sim_add_btn)
@@ -956,18 +1002,12 @@ class BuildMixin:
         self.resizeDocks(
             [self._profile_dock], [max(self.height() // 3, 280)], Qt.Orientation.Vertical
         )
-        # Default column widths. Both areas are tuned together — the
-        # file browser was previously squeezed to ~100 px (truncated
-        # HDF5 paths), and after Peaks moved to the bottom the right
-        # dock area's natural sizeHint shrank from ~560 to ~240. The
-        # pinned values below split the difference: 280 leaves enough
-        # room for typical file paths and 350 gives the Display dock's
-        # form rows headroom without dominating the central image.
-        self.resizeDocks(
-            [self._tree_dock, self._display_dock],
-            [260, 350],
-            Qt.Orientation.Horizontal,
-        )
+        # Default column widths. The file browser stays pinned at 260,
+        # which leaves room for typical HDF5 paths (it was previously
+        # squeezed to ~100 px and truncated them). The right-hand column
+        # is measured instead of pinned — see
+        # ``_preferred_right_dock_width``.
+        self._apply_default_dock_widths()
         self.viewer.frameChanged.connect(self.profile_viewer.set_frame)
         # Bidirectional Display-dock slider sync: viewer pushes frame
         # changes into the slider (e.g. user scrubs the pyqtgraph
@@ -1016,9 +1056,43 @@ class BuildMixin:
         self.peaks_table_panel.peakSelectedFromTable.connect(
             self._on_peak_selected_from_table
         )
+        # Ctrl / Shift multi-select in the table drives the same
+        # multi-selection Ctrl+click on the image does, and Delete in
+        # the table routes into the same handlers the image-side
+        # Delete key uses — one confirmation, one write path, one undo
+        # entry, whichever half of the window the user is looking at.
+        self.peaks_table_panel.peaksSelectedFromTable.connect(
+            self._on_peaks_selected_from_table
+        )
+        self.peaks_table_panel.deletePeaksRequested.connect(
+            self._on_delete_peaks_from_table
+        )
+        self.viewer.selectionsChanged.connect(
+            self.peaks_table_panel.set_external_selections
+        )
 
         # Commit / delete actions on the parameter panel. Add-to-detected and
         # delete reuse the existing PipelineWorker path.
+        # Quick select: the panel owns the flag, the viewer owns the
+        # gesture, and the host owns every file write — so the mode is
+        # pushed one way and the commit request comes back the other.
+        self.parameter_panel.quickSelectChanged.connect(
+            self._on_quick_select_toggled
+        )
+        self.parameter_panel.quickTargetChanged.connect(
+            lambda _t: self._update_status_quick_select()
+        )
+        self.viewer.manualPeakCommitRequested.connect(
+            self._on_quick_commit_requested
+        )
+        # The pending marker in the status cell has to follow the box
+        # appearing and disappearing, whoever caused it.
+        self.viewer.manualPeakAdded.connect(
+            lambda *_a: self._update_status_quick_select()
+        )
+        self.viewer.manualPeakRemoved.connect(
+            lambda *_a: self._update_status_quick_select()
+        )
         self.parameter_panel.addToDetectedRequested.connect(self._on_add_to_detected)
         self.parameter_panel.addToFittedRequested.connect(self._on_add_to_fitted)
         # Batch 2D fit of the multi-selection. The button on the
@@ -1161,6 +1235,76 @@ class BuildMixin:
         )
         self._update_status_file()
 
+    #: Never open the right-hand column wider than this share of the
+    #: window, nor than this many pixels: the image is the point of the
+    #: screen, and a dock the user has to drag back is worse than one
+    #: they drag out once.
+    _RIGHT_DOCK_WINDOW_SHARE = 3
+    _RIGHT_DOCK_MAX_PX = 500
+    _RIGHT_DOCK_MIN_PX = 380
+
+    def _apply_default_dock_widths(self) -> None:
+        """Open the two side columns at their default widths.
+
+        Called once during construction and again on the first show,
+        because a request made before the window has geometry is scaled
+        down to whatever QMainWindow thinks it has (260 + 466 came out
+        as 197 + 403). The second call is the one that lands.
+        """
+        self.resizeDocks(
+            [self._tree_dock, self._display_dock],
+            [self._TREE_DOCK_PX, self._preferred_right_dock_width()],
+            Qt.Orientation.Horizontal,
+        )
+
+    #: File-browser column. Pinned: it holds HDF5 paths, which were
+    #: truncated when the area collapsed to ~100 px.
+    _TREE_DOCK_PX = 260
+
+    def _preferred_right_dock_width(self) -> int:
+        """How wide to open the right-hand dock column.
+
+        Every dock on the right shares one column, so the width that
+        matters is the one the fullest panel needs, not the one that
+        happens to be in front. It is measured rather than pinned, so a
+        panel that grows a longer label moves this with it:
+
+        * each panel's own ``sizeHint``, plus
+        * the width of any **closed** ``Card``, via ``open_width_hint``
+          — Pipeline's Fitting section wants ~465 px and starts closed,
+          so measuring only what is open reports far too little,
+        * plus the scroll area's frame and scrollbar.
+
+        The panels sit in resizable scroll areas, so a column that is
+        too narrow does not scroll: it compresses and elides. That is
+        what the pinned 350 looked like — the Pipeline "Config (yaml)"
+        field squeezed down to a stub.
+        """
+        docks = (
+            self._display_dock, self._pipeline_dock, self._sim_dock,
+            self._conversion_dock, self._logs_dock,
+        )
+        wanted = 0
+        for dock in docks:
+            content = dock.widget()
+            if content is None:
+                continue
+            scroll = content.findChild(QScrollArea)
+            if scroll is not None and scroll.widget() is not None:
+                content = scroll.widget()
+            wanted = max(wanted, content.sizeHint().width())
+            for card in content.findChildren(Card):
+                if not card.is_expanded():
+                    wanted = max(wanted, card.open_width_hint())
+        wanted += self.style().pixelMetric(
+            QStyle.PixelMetric.PM_ScrollBarExtent) + 8   # frame + margins
+        share = max(self.width() // self._RIGHT_DOCK_WINDOW_SHARE,
+                    self._RIGHT_DOCK_MIN_PX)
+        return max(
+            self._RIGHT_DOCK_MIN_PX,
+            min(wanted, share, self._RIGHT_DOCK_MAX_PX),
+        )
+
     def _build_status_bar(self) -> None:
         """Permanent status-bar widgets: file / entry / frame / pipeline + cursor.
 
@@ -1170,19 +1314,61 @@ class BuildMixin:
         message after its timeout but leaves the permanent labels alone.
         """
         sb = self.statusBar()
+        # Unsaved-changes dot, in front of the file name. It replaces the
+        # "*" the name used to carry: a marker glued to the end of a
+        # filename is easy to read as part of the name, and it moved with
+        # the text. (The window title keeps its "*" — that is the
+        # platform convention for a modified document.)
+        self._sb_dirty = QLabel()
+        self._sb_dirty.setPixmap(_dirty_dot())
+        self._sb_dirty.setToolTip("Unsaved changes")
+        self._sb_dirty.hide()
         self._sb_file = QLabel("no file")
         self._sb_entry = QLabel("")
         self._sb_frame = QLabel("")
         self._sb_pipeline = QLabel("idle")
+        # Quick-select labelling changes what a drag does, and the
+        # Display dock that owns its checkbox is tabbed and scrollable —
+        # so the mode needs somewhere it cannot hide. Empty and hidden
+        # while the mode is off, which is most of the time.
+        self._sb_quick = QLabel("")
+        self._sb_quick.hide()
         self._sb_cursor = QLabel("")
+        # A run in flight gets its own bar in the row, right after the
+        # pipeline cell. Indeterminate until a frame count arrives, which
+        # is honest: several ops are one opaque backend call.
+        self._sb_pipe_bar = skin_progress(QProgressBar())
+        self._sb_pipe_bar.setRange(0, 0)
+        self._sb_pipe_bar.setFixedWidth(70)
+        self._sb_pipe_bar.setFixedHeight(12)
+        self._sb_pipe_bar.setTextVisible(False)
+        self._sb_pipe_bar.hide()
+        sb.addPermanentWidget(self._sb_dirty)
         for w in (self._sb_file, self._sb_entry, self._sb_frame,
-                  self._sb_pipeline, self._sb_cursor):
-            # Light separation so the eye can scan the row.
-            w.setStyleSheet("padding: 0 8px; border-left: 1px solid #444;")
+                  self._sb_pipeline, self._sb_pipe_bar, self._sb_quick,
+                  self._sb_cursor):
+            # Light separation so the eye can scan the row. The divider
+            # colour and padding come from the skin, which is why this
+            # is a role tag rather than a stylesheet: the old hardcoded
+            # #444 stayed dark-grey in the light theme. The file name is
+            # the one field that says *what you are looking at*, so it
+            # keeps the full text colour while the rest read as context.
+            if isinstance(w, QLabel):
+                w.setProperty(
+                    "role",
+                    "sb-cell-active"
+                    if w in (self._sb_file, self._sb_quick) else "sb-cell")
             sb.addPermanentWidget(w)
+        # The pipeline cell is the one place a run reports from, so make
+        # it the way into the log of that run.
+        self._sb_pipeline.setToolTip("Pipeline activity — click to open the Logs dock")
+        self._sb_pipeline.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._sb_pipeline.installEventFilter(self)
         # The cursor readout is the chattiest widget; let it stretch
-        # so values don't truncate, others stay tight.
-        self._sb_cursor.setMinimumWidth(360)
+        # so values don't truncate, others stay tight. Monospace so the
+        # numbers stop jittering sideways as the cursor moves.
+        self._sb_cursor.setProperty("role", "sb-cell-mono")
+        self._sb_cursor.setMinimumWidth(430)
         self.viewer.cursorMoved.connect(self._on_status_cursor_moved)
         self._status_cursor_visible = True
         # Bottom-left, non-modal open-progress: a small busy (indeterminate)
@@ -1199,7 +1385,7 @@ class BuildMixin:
         # (_on_open_finished). addWidget puts these on the left, before the
         # transient showMessage text.
         self._sb_open_label = QLabel("")
-        self._sb_open_bar = QProgressBar()
+        self._sb_open_bar = skin_progress(QProgressBar())
         self._sb_open_bar.setRange(0, 0)          # indeterminate "busy" march
         self._sb_open_bar.setMaximumWidth(110)
         self._sb_open_bar.setTextVisible(False)
@@ -1213,7 +1399,7 @@ class BuildMixin:
         # load ("Loading <entry>…" → dismissed on arrival), so sharing
         # it would let that dismiss hide an still-running browser fill.
         self._sb_tree_label = QLabel("")
-        self._sb_tree_bar = QProgressBar()
+        self._sb_tree_bar = skin_progress(QProgressBar())
         self._sb_tree_bar.setRange(0, 100)
         self._sb_tree_bar.setMaximumWidth(110)
         self._sb_tree_bar.setTextVisible(False)
@@ -1225,11 +1411,10 @@ class BuildMixin:
     def _update_status_file(self) -> None:
         if self.session is None:
             self._sb_file.setText("no file")
+            self._sb_dirty.hide()
             return
-        marker = "*" if self.session.dirty else ""
-        self._sb_file.setText(
-            f"{self.session.original_path.name}{marker}"
-        )
+        self._sb_file.setText(self.session.original_path.name)
+        self._sb_dirty.setVisible(bool(self.session.dirty))
 
     def _active_raw_frame_for_calibration(self):
         """Return a 2D ndarray to seed the pyFAI calibration dialog.
@@ -1294,6 +1479,103 @@ class BuildMixin:
             logger.debug("suppressed exception in MainWindow._active_raw_frame_for_calibration", exc_info=True)
             return None
 
+    # -- Workflow rail -------------------------------------------------
+
+    #: stage key -> (dock attribute, attribute path of the panel's own
+    #: Run button). The rail never builds a command: it clicks the
+    #: button the panel already owns, so the kwargs, the enablement and
+    #: the queueing all stay in one place.
+    _RAIL_TARGETS = {
+        "convert": ("_conversion_dock", ("conversion_panel", "btn_convert")),
+        "detect": ("_pipeline_dock", ("pipeline_panel", "btn_detect")),
+        "fit": ("_pipeline_dock", ("pipeline_panel", "btn_fit")),
+        "match": ("_pipeline_dock", ("pipeline_panel", "btn_match")),
+        "track": ("_scan_tracking_dock", ("scan_tracking_panel", "btn_track")),
+    }
+
+    def _rail_run_button(self, key: str):
+        target = self._RAIL_TARGETS.get(key)
+        if target is None:
+            return None
+        panel_attr, button_attr = target[1]
+        panel = getattr(self, panel_attr, None)
+        return getattr(panel, button_attr, None) if panel is not None else None
+
+    def _on_rail_stage_activated(self, key: str) -> None:
+        """Bring the dock that owns ``key`` forward."""
+        target = self._RAIL_TARGETS.get(key)
+        if target is None:
+            return
+        dock = getattr(self, target[0], None)
+        if dock is not None:
+            dock.show()
+            dock.raise_()
+
+    def _on_rail_stage_run(self, key: str) -> None:
+        button = self._rail_run_button(key)
+        if button is not None and button.isEnabled():
+            button.click()
+
+    def _refresh_workflow_rail(self) -> None:
+        """Re-read the current frame's tables and retag the stages.
+
+        Counts are per frame, from what the overlays already hold — no
+        extra I/O, and no claim about the rest of the scan.
+        """
+        rail = getattr(self, "workflow_rail", None)
+        if rail is None:
+            return
+        session = self.session
+        rail.setVisible(session is not None)
+        if session is None:
+            return
+        rail.set_mode(session.kind)
+
+        running = self._pipe_thread is not None
+        for key in self._RAIL_TARGETS:
+            button = self._rail_run_button(key)
+            rail.set_runnable(
+                key, bool(button is not None and button.isEnabled()))
+
+        if session.kind == "raw":
+            rail.set_state("convert", "ready" if not running else "running…",
+                           "run" if running else "muted")
+            for key in ("detect", "fit", "match", "track"):
+                rail.set_state(key, "after conversion", "muted")
+            return
+
+        rail.set_state("convert", "done", "ok")
+        frame = int(getattr(self.viewer, "current_frame", 0))
+        peaks = getattr(self.viewer, "_frame_peaks", {}).get(frame) or {}
+        counts = {
+            kind: (0 if table is None else int(len(table.ids)))
+            for kind, table in peaks.items()
+        }
+        matched = len(self.viewer.matched_structures(frame))
+        payload = getattr(self, "_scan_payload", None)
+        tracks = len(getattr(payload, "components", None) or []) if payload else 0
+
+        for key, count, empty in (
+            ("detect", counts.get("detected", 0), "not run"),
+            ("fit", counts.get("fitted", 0), "not run"),
+            ("match", matched, "not run"),
+        ):
+            if count:
+                rail.set_state(key, f"{count} this frame", "ok")
+            else:
+                rail.set_state(key, empty, "muted")
+        rail.set_state("track", f"{tracks} tracks" if tracks else "not run",
+                       "ok" if tracks else "muted")
+
+    def _refresh_welcome_view(self) -> None:
+        """Re-seed the welcome page's theme-dependent and live content."""
+        view = getattr(self, "welcome_view", None)
+        if view is None:
+            return
+        view.set_theme(getattr(self, "_current_theme", "dark"))
+        view.set_recent(self._load_recent_files())
+        view.set_backend_available(is_mlgidbase_available())
+
     def _update_status_entry(self) -> None:
         entry = self.entry_combo.currentText() if hasattr(self, "entry_combo") else ""
         self._sb_entry.setText(entry or "")
@@ -1313,8 +1595,63 @@ class BuildMixin:
             self._sb_frame.setText(f"frame {cur}")
         else:
             self._sb_frame.setText(f"frame {cur} / {n - 1}")
+        # The rail's counts are per frame, so they move with this.
+        self._refresh_workflow_rail()
+
+    def _set_pipeline_running(self, running: bool) -> None:
+        """Colour the pipeline cell and show/hide its bar.
+
+        The ``status`` tag rides alongside the cell's ``role`` tag; the
+        skin pairs the two so a running cell is accented while an idle
+        one keeps the muted context colour.
+        """
+        self._sb_pipeline.setProperty("status", "run" if running else "")
+        style = self._sb_pipeline.style()
+        style.unpolish(self._sb_pipeline)
+        style.polish(self._sb_pipeline)
+        self._sb_pipe_bar.setVisible(running)
+        if not running:
+            # Back to the busy marquee for the next run, whose frame
+            # count is not known until its first progress tick.
+            self._sb_pipe_bar.setRange(0, 0)
+
+    def _update_status_quick_select(self) -> None:
+        """Show the quick-select mode, and whether a box is pending.
+
+        The pending marker is the point: with the mode on, a box that
+        has not been committed yet is the one piece of state the image
+        alone does not make obvious (a manual box looks like a
+        selection), and it is what a frame change or a click is about
+        to write.
+        """
+        panel = getattr(self, "parameter_panel", None)
+        cell = getattr(self, "_sb_quick", None)
+        if cell is None or panel is None:
+            return
+        if not panel.quick_select_enabled():
+            cell.hide()
+            cell.setText("")
+            return
+        target = panel.quick_select_target()
+        pending = self.viewer.pending_manual_peak() is not None
+        cell.setText(f"quick: {target}" + (" • 1 pending" if pending else ""))
+        cell.setToolTip(
+            "Quick select is on: drawing the next box commits the "
+            "previous one as a "
+            f"{target} peak."
+            + (
+                "\nOne box is waiting — it commits when you draw the "
+                "next one, click away, press Enter or change frame."
+                if pending else ""
+            )
+        )
+        cell.show()
 
     def _update_status_pipeline(self, command=None, *, running: bool) -> None:
+        self._set_pipeline_running(running)
+        # A finished run changes what the stages can report, and a
+        # started one disables their run glyphs.
+        self._refresh_workflow_rail()
         if not running:
             self._sb_pipeline.setText("idle")
             # Drop any progress tail from the previous run so a stale
@@ -1400,6 +1737,13 @@ class BuildMixin:
             new_tail = ""
         else:
             new_tail = f" · {done}/{total} frames"
+        # Mirror the same ticks onto the status-bar bar. Setting the
+        # range on every tick is what promotes it from the busy marquee
+        # to a real 0..total bar the first time a count arrives.
+        if total > 1 and op_name != "track_peaks":
+            if self._sb_pipe_bar.maximum() != total:
+                self._sb_pipe_bar.setRange(0, int(total))
+            self._sb_pipe_bar.setValue(int(done))
         if getattr(self, "_pipe_progress_tail", "") == new_tail:
             return
         self._pipe_progress_tail = new_tail
@@ -1408,6 +1752,50 @@ class BuildMixin:
         # command rather than rebuilding here.
         cmd = getattr(self, "_pipe_command", None)
         self._update_status_pipeline(cmd, running=True)
+
+    def _entry_wavelength(self) -> float | None:
+        """λ in Å for the active entry, cached; None when unknown.
+
+        Resolved lazily on the first cursor move after an entry change
+        rather than during the switch itself: the switch path is the one
+        the big-scan work made I/O-free, and a readout is not worth
+        putting a file open back into it.
+        """
+        session = self.session
+        entry = self.entry_combo.currentText() if hasattr(self, "entry_combo") else ""
+        if session is None or not entry:
+            return None
+        key = (str(getattr(session, "temp_path", "")), entry)
+        if getattr(self, "_wavelength_key", None) == key:
+            return self._wavelength_value
+        value = None
+        try:
+            geom = file_model.read_geometry_for_entry(session.temp_path, entry)
+            if geom:
+                wl = float(geom.get("wavelength_angstrom") or 0.0)
+                value = wl if wl > 0 else None
+        except Exception:
+            logger.debug("suppressed exception reading wavelength", exc_info=True)
+        self._wavelength_key = key
+        self._wavelength_value = value
+        return value
+
+    def _q_derived_tail(self, q: float) -> str:
+        """`d` and `2θ` for a |q|, as far as the entry's metadata allows.
+
+        d = 2π/|q| needs nothing but the cursor; 2θ = 2·asin(λ|q|/4π)
+        needs the entry's wavelength, so it appears only when the file
+        carries one.
+        """
+        if not q or q <= 0:
+            return ""
+        tail = f"  d={2 * math.pi / q:.3f} Å"
+        wl = self._entry_wavelength()
+        if wl:
+            arg = wl * q / (4 * math.pi)
+            if arg <= 1.0:
+                tail += f"  2θ={2 * math.degrees(math.asin(arg)):.2f}°"
+        return tail
 
     def _on_status_cursor_moved(self, info) -> None:
         if not self._status_cursor_visible:
@@ -1419,17 +1807,29 @@ class BuildMixin:
         mode = info.get("mode")
         inten = info.get("intensity", float("nan"))
         inten_str = "—" if inten != inten else f"{inten:.3g}"  # NaN check
+        # Overlapping boxes under the cursor: says that clicking again
+        # steps to the next one, which is otherwise invisible.
+        depth = int(info.get("overlapping", 0) or 0)
+        stack = (f"  |  {depth} boxes here, click again for the next"
+                 if depth > 1 else "")
         if mode == "pixel":
+            # Raw detector frames have no q-axes, so no d / 2θ either.
             self._sb_cursor.setText(
                 f"row={info['row']}, col={info['col']}, I={inten_str}"
             )
         elif mode == "cartesian":
+            q = math.hypot(info["q_xy"], info["q_z"])
             self._sb_cursor.setText(
-                f"q_xy={info['q_xy']:.3f}, q_z={info['q_z']:.3f}, I={inten_str}"
+                f"q_xy={info['q_xy']:.3f}, q_z={info['q_z']:.3f}, "
+                f"I={inten_str}{self._q_derived_tail(q)}{stack}"
             )
         elif mode == "polar":
+            # ``theta`` here is the azimuth of the polar map, written χ
+            # so it cannot be misread as the scattering angle 2θ now
+            # standing next to it.
             self._sb_cursor.setText(
-                f"r={info['r']:.3f}, θ={info['theta']:.1f}°, I={inten_str}"
+                f"r={info['r']:.3f}, χ={info['theta']:.1f}°, "
+                f"I={inten_str}{self._q_derived_tail(float(info['r']))}{stack}"
             )
         else:
             self._sb_cursor.setText("")

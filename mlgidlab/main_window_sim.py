@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 from mlgidlab import file_model, pipeline, simulation_pattern
+from mlgidlab.peak_link import link_enabled
 from mlgidlab.pipeline import PipelineCommand
 
 import logging
@@ -173,9 +174,10 @@ class SimOverlayMixin:
 
     def _set_sim_hint(self, text: str, error: bool = True) -> None:
         self._sim_orient_hint.setText(text)
-        self._sim_orient_hint.setStyleSheet(
-            "color: #d05050;" if error else ""
-        )
+        self._sim_orient_hint.setProperty("status", "error" if error else "")
+        style = self._sim_orient_hint.style()
+        style.unpolish(self._sim_orient_hint)
+        style.polish(self._sim_orient_hint)
         self._sim_orient_hint.setVisible(bool(text))
 
     def _update_sim_orient_visibility(self) -> None:
@@ -749,6 +751,10 @@ class SimOverlayMixin:
                 "entry": entry,
                 "plan": plan,
                 "fit_params": self._panel_fit_params(),
+                # The op writes a detected row and its fit as a
+                # pair; with the link on they share an id. Read
+                # here, not in the worker.
+                "link_ids": link_enabled(),
             })
             commands.append(inject_cmd)
             ticks[id(inject_cmd)] = len(plan)
@@ -1153,6 +1159,10 @@ class SimOverlayMixin:
                 "entry": entry,
                 "plan": plan,
                 "fit_params": self._panel_fit_params(),
+                # The op writes a detected row and its fit as a
+                # pair; with the link on they share an id. Read
+                # here, not in the worker.
+                "link_ids": link_enabled(),
             })
             commands.append(inject_cmd)
             ticks[id(inject_cmd)] = len(plan)

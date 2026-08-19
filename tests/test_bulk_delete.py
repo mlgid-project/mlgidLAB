@@ -122,9 +122,14 @@ def test_bulk_delete_removes_all_selected(
 
 
 def test_bulk_delete_leaves_fitted_intact(
-    main_window, synthetic_nexus_with_peaks, monkeypatch,
+    main_window, synthetic_nexus_with_peaks, monkeypatch, peak_link_off,
 ):
-    """Detected bulk delete must not touch fitted rows (no cascade)."""
+    """Detected bulk delete must not touch fitted rows (no cascade).
+
+    This is the unlinked contract, which is why the fixture turns the
+    fitted/detected link off: with the link on (the shipped default) a
+    detected delete deliberately takes the matching fit with it, and
+    that half is covered in ``test_peak_linking.py``."""
     _open(main_window, synthetic_nexus_with_peaks)
     path = main_window.session.temp_path
     fit_before = len(file_model.load_peaks(path, "entry_0000", 0)["fitted"])

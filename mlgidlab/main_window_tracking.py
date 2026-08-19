@@ -11,7 +11,9 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QMessageBox, QProgressDialog
 from mlgidlab import file_model, phase_tracking
 from mlgidlab.phase_views_window import PhaseViewsWindow
+from mlgidlab.peak_link import link_enabled
 from mlgidlab.pipeline import PipelineCommand
+from mlgidlab.widgets import skin_progress
 
 import logging
 
@@ -73,7 +75,7 @@ class TrackingMixin:
         via ``_on_pipeline_frame_progress``, so the dialog and the
         Pipeline panel's bar agree)."""
         self._close_tracking_progress()
-        dlg = QProgressDialog(self)
+        dlg = skin_progress(QProgressDialog(self))
         dlg.setWindowTitle("Peak tracking")
         dlg.setLabelText(label)
         dlg.setCancelButton(None)          # no clean way to interrupt mlgidBASE
@@ -474,6 +476,8 @@ class TrackingMixin:
             "entry": entry,
             "plan": plan,
             "fit_params": fit_params,
+            # Same pairing as the expected-pattern injection.
+            "link_ids": link_enabled(),
         })
         match_cmds = self._build_interp_match_commands(
             plan, entry, match_kwargs

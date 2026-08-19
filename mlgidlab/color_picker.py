@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mlgidlab import theme_tokens
 from mlgidlab.image_viewer import MATCHED_PALETTE
 
 _GRID_COLUMNS = len(MATCHED_PALETTE)
@@ -72,7 +73,8 @@ class ColorGridPopup(QWidget):
             btn.setFixedSize(_SWATCH_PX, _SWATCH_PX)
             btn.setToolTip(hex_color)
             btn.setStyleSheet(
-                f"background-color: {hex_color}; border: 1px solid #444;"
+                f"background-color: {hex_color};"
+                f" border: 1px solid {theme_tokens.color('border')};"
             )
             btn.clicked.connect(lambda _=False, c=hex_color: self._pick(c))
             grid.addWidget(btn, i // _GRID_COLUMNS, i % _GRID_COLUMNS)

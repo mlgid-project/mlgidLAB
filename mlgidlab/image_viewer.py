@@ -19,20 +19,22 @@ from PySide6.QtCore import (
     QRectF,
     QSettings,
     QSignalBlocker,
+    QSize,
+    QTimer,
     Qt,
     Signal,
 )
-from PySide6.QtGui import QAction, QColor, QPainterPath
+from PySide6.QtGui import QAction, QColor, QIcon, QPainterPath
 from PySide6.QtWidgets import (
     QButtonGroup,
-    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QRadioButton,
+    QSizePolicy,
     QSlider,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -48,10 +50,11 @@ from mlgidlab.file_model import (
 if TYPE_CHECKING:
     from mlgidlab.file_model import FrameSource
 from mlgidlab.polar import polar_to_qxyz
+from mlgidlab.flow_layout import ToolGroup, wrapping_bar
 from mlgidlab.image_viewer_overlays import ViewerOverlaysMixin
 from mlgidlab.image_viewer_render import ViewerRenderMixin
 from mlgidlab.image_viewer_interact import ViewerInteractMixin
-from mlgidlab import simulation_pattern
+from mlgidlab import icons, simulation_pattern
 
 import logging
 logger = logging.getLogger(__name__)
@@ -62,8 +65,11 @@ logger = logging.getLogger(__name__)
 from mlgidlab.viewer_styles import (
     COLORMAPS,
     DEFAULT_COLORMAP,
+    colormap_swatch,
     FITTED_PREVIEW_OPACITY,
     FITTED_PREVIEW_STYLE,
+    HOVER_OPACITY,
+    hover_style,
     MATCHED_LINE_STYLES,
     MATCHED_LINE_WIDTH,
     MATCHED_MARKER_SIZE,
@@ -75,6 +81,7 @@ from mlgidlab.viewer_styles import (
     OVERLAY_KINDS,
     OVERLAY_STYLE,
     SELECTION_STYLE,
+    selection_style,
     SIM_EXPLAINED_COLOR,
     SIM_MARKER_MAX_PX,
     SIM_MARKER_MIN_PX,
@@ -119,6 +126,65 @@ from mlgidlab.viewer_items import (
     _polar_table_row_contains,
     _robust_levels,
 )
+
+
+#: Edge of the square colormap chip. The pixmap is rendered at 32 px so
+#: it stays crisp if a style asks for more than the 16 px it is shown at.
+CMAP_SWATCH = 32
+CMAP_ICON_SIZE = 16
+
+
+class _SwatchCombo(QComboBox):
+    """A combo box whose icon size survives a style change.
+
+    Qt clears an explicitly set ``iconSize`` when the widget is polished
+    under an application stylesheet — it comes back as 0x0, and a 0x0
+    icon is simply not drawn, so the colormap chip disappears from the
+    closed box. That happens on the first show and again on every theme
+    flip (``_set_theme`` re-polishes every widget), so the size has to be
+    re-applied rather than set once at construction.
+
+    The re-apply is deferred by a zero-timer: Qt clears the size *after*
+    the style change is delivered, so setting it from inside
+    ``changeEvent`` is undone immediately — the chip survived the first
+    show and then vanished on the first theme flip. (The QSS
+    ``icon-size`` property looks like the tidy answer but does not reach
+    this combo; it is nested inside the viewer, not a top-level widget.)
+    """
+
+    def __init__(self, icon_size: QSize, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._wanted_icon_size = icon_size
+        self.setIconSize(icon_size)
+
+    def _restore_icon_size(self) -> None:
+        if self.iconSize() != self._wanted_icon_size:
+            self.setIconSize(self._wanted_icon_size)
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.StyleChange:
+            QTimer.singleShot(0, self._restore_icon_size)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._restore_icon_size()
+
+
+def _segment_button(text: str, glyph: str, position: str) -> QToolButton:
+    """One half of a segmented, mutually exclusive pair.
+
+    ``position`` ("left" / "right") tells the skin which outer corners to
+    round and which inner border to drop, so the two halves meet on a
+    single shared edge instead of showing a double rule.
+    """
+    button = QToolButton()
+    button.setText(text)
+    button.setCheckable(True)
+    button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+    button.setProperty("segment", position)
+    icons.bind(button, glyph)
+    return button
 
 
 class GIWAXSImageViewer(
@@ -176,6 +242,10 @@ class GIWAXSImageViewer(
     # ``selectionChanged(SelectedPeak | None)``; multi-aware consumers
     # (copy handler, batch-fit button enable) subscribe here.
     selectionsChanged = Signal(list)          # list[SelectedPeak]
+    # (frame, ManualPeak) — quick select wants this box written to the
+    # file before it is dropped. Emitted only while the mode is armed,
+    # from every path that would otherwise discard a pending box.
+    manualPeakCommitRequested = Signal(int, object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -183,33 +253,82 @@ class GIWAXSImageViewer(
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        bar = QHBoxLayout()
-        bar.setContentsMargins(8, 4, 8, 4)
-        bar.addWidget(QLabel("View:"))
-        self._radio_cart = QRadioButton("Cartesian")
-        self._radio_polar = QRadioButton("Polar")
+        # The control strip wraps. It used to be one QHBoxLayout, whose
+        # minimum width is the sum of every control in it — that sum was
+        # the floor under how narrow the central column could be dragged.
+        # A FlowLayout breaks onto a second row instead, so the floor is
+        # the widest single cluster. Controls are grouped into clusters
+        # that wrap as a unit; see ``mlgidlab.flow_layout``.
+        bar_widget = wrapping_bar(self, margins=(8, 4, 8, 4))
+        bar = bar_widget.layout()
+
+        view_group = ToolGroup()
+        view_group.add(QLabel("View:"))
+        # A segmented pair rather than two radios: the choice is one
+        # exclusive view mode, and a segmented control shows the two
+        # options and the active one in the space two radios plus their
+        # labels took. Still a QButtonGroup, still named ``_radio_*``,
+        # so ``set_mode_radios_visible`` and the render path are
+        # unchanged.
+        self._radio_cart = _segment_button("Cartesian", "view-cartesian", "left")
+        self._radio_polar = _segment_button("Polar", "view-polar", "right")
         self._radio_polar.setChecked(True)
         self._radio_group = QButtonGroup(self)
+        self._radio_group.setExclusive(True)
         self._radio_group.addButton(self._radio_cart)
         self._radio_group.addButton(self._radio_polar)
         self._radio_cart.toggled.connect(self._on_radio_toggled)
-        bar.addWidget(self._radio_cart)
-        bar.addWidget(self._radio_polar)
-        bar.addSpacing(16)
-        bar.addWidget(QLabel("Colormap:"))
-        self._cmap_combo = QComboBox()
+        segmented = QHBoxLayout()
+        segmented.setContentsMargins(0, 0, 0, 0)
+        segmented.setSpacing(0)          # the two halves share one edge
+        segmented.addWidget(self._radio_cart)
+        segmented.addWidget(self._radio_polar)
+        view_group.add_layout(segmented)
+        bar.addWidget(view_group)
+
+        cmap_group = ToolGroup()
+        cmap_group.add(QLabel("Colormap:"))
+        self._cmap_combo = _SwatchCombo(
+            QSize(CMAP_ICON_SIZE, CMAP_ICON_SIZE))
+        # With an app-level stylesheet installed, QComboBox takes its
+        # width from the CSS box model and does not grow for the icon, so
+        # the name ends up clipped. Measure the widest name rather than
+        # hardcoding a width, so this survives a font change.
+        _metrics = self._cmap_combo.fontMetrics()
+        self._cmap_combo.setMinimumWidth(
+            max(_metrics.horizontalAdvance(n) for n in COLORMAPS)
+            + 56                       # chip, dropdown arrow, padding
+        )
         for name in COLORMAPS:
-            self._cmap_combo.addItem(name)
+            # The ramp itself, not just its name: a colormap is picked by
+            # how it ramps. Falls back to a bare name if the chip cannot
+            # be built (a null pixmap makes a text-only row, not a crash).
+            swatch = colormap_swatch(name, CMAP_SWATCH)
+            if swatch.isNull():
+                self._cmap_combo.addItem(name)
+            else:
+                self._cmap_combo.addItem(QIcon(swatch), name)
         self._cmap_combo.setCurrentText(DEFAULT_COLORMAP)
         self._cmap_combo.currentTextChanged.connect(self._on_cmap_changed)
-        bar.addWidget(self._cmap_combo)
-        bar.addSpacing(16)
+        cmap_group.add(self._cmap_combo)
+        bar.addWidget(cmap_group)
+
         # Log/linear contrast toggle. When checked, the displayed image
         # is log10(clip(data, floor, inf)) and the histogram levels are
         # recomputed on the transformed array so the LUT stays sensible.
         # Coordinates and overlays are unaffected — only the intensity
         # mapping changes.
-        self._log_check = QCheckBox("Log scale")
+        # A toggle button rather than a checkbox: it is a mode the image
+        # is in, and it reads as on/off at a glance next to the segmented
+        # view pair. Same name, same ``toggled`` signal, same persisted
+        # setting — ``setChecked`` still drives it.
+        self._log_check = QToolButton()
+        self._log_check.setText("Log scale")
+        self._log_check.setCheckable(True)
+        self._log_check.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._log_check.setProperty("variant", "toggle")
+        icons.bind(self._log_check, "log-scale")
         self._log_check.setChecked(False)
         self._log_check.setToolTip(
             "Display log10(intensity) instead of linear intensity. "
@@ -218,14 +337,15 @@ class GIWAXSImageViewer(
         )
         self._log_check.toggled.connect(self._on_log_toggled)
         bar.addWidget(self._log_check)
-        bar.addSpacing(16)
+
         # Aspect ratio of the shown image. "Fit" (default) stretches the
         # frame to fill the panel (setAspectLocked(False)); "Custom" locks
         # the y-to-x data-unit scale to the spin value — 1.00 is the
         # undistorted view (equal Å⁻¹ per axis, so q-space rings stay
         # round in Cartesian mode). The lock lives on the PlotItem and so
         # survives mode switches and re-renders. See _on_aspect_changed.
-        bar.addWidget(QLabel("Aspect:"))
+        aspect_group = ToolGroup()
+        aspect_group.add(QLabel("Aspect:"))
         self._aspect_combo = QComboBox()
         self._aspect_combo.addItems(["Fit", "Default", "Custom"])
         self._aspect_combo.setToolTip(
@@ -234,7 +354,7 @@ class GIWAXSImageViewer(
             "the ratio box. Scrolling over an axis switches to Custom."
         )
         self._aspect_combo.currentIndexChanged.connect(self._on_aspect_changed)
-        bar.addWidget(self._aspect_combo)
+        aspect_group.add(self._aspect_combo)
         self._aspect_spin = QDoubleSpinBox()
         self._aspect_spin.setRange(0.05, 20.0)
         self._aspect_spin.setSingleStep(0.05)
@@ -245,19 +365,19 @@ class GIWAXSImageViewer(
             "tall, <1 taller than wide."
         )
         self._aspect_spin.valueChanged.connect(self._on_aspect_changed)
-        bar.addWidget(self._aspect_spin)
+        aspect_group.add(self._aspect_spin)
+        bar.addWidget(aspect_group)
+
         # The frame-navigation controls (prev / play / next / slider /
         # label) used to live in the Display dock's Frame row. They
         # now sit here in the toolbar so the user can scrub frames
         # regardless of which right-dock tab is in front. The host
         # injects them via ``insert_frame_controls`` after the
         # Display dock builds them — see MainWindow.
-        bar.addStretch(1)
+        self._frames_group: ToolGroup | None = None
         # Keep a handle on the layout so the host can splice the
-        # frame-navigation widgets in just before the trailing stretch.
+        # frame-navigation widgets in.
         self._toolbar_layout = bar
-        bar_widget = QWidget(self)
-        bar_widget.setLayout(bar)
         outer.addWidget(bar_widget)
 
         self._plot = pg.PlotItem()
@@ -316,12 +436,32 @@ class GIWAXSImageViewer(
         self._fitted = _PeakShapeItem(**OVERLAY_STYLE["fitted"])
         self._manual = _PeakShapeItem(**OVERLAY_STYLE["manual"])
         self._selection = _PeakShapeItem(**SELECTION_STYLE)
+        # Pre-selection preview: outlines the box a bare click would
+        # take. Added before the selection item so a box that is both
+        # hovered and selected still shows the solid selection pen.
+        self._hover = _PeakShapeItem(**hover_style())
+        self._hover.setOpacity(HOVER_OPACITY)
+        # Explicit z, because the matched overlay items are rebuilt and
+        # re-added to the viewbox on *every* render, so they land above
+        # anything added once at construction. Without this the white
+        # highlight around a selected matched peak was painted over by
+        # the structure's own box, leaving only the sliver where the
+        # wider pen stuck out — while fitted and detected (added here,
+        # before the selection) looked correct.
+        self._hover.setZValue(40)
+        self._selection.setZValue(45)
         self._fitted_preview = _PeakShapeItem(**FITTED_PREVIEW_STYLE)
         self._fitted_preview.setOpacity(FITTED_PREVIEW_OPACITY)
+        # Above the selection, which is where insertion order used to
+        # put it: the preview is a *different* box (where the fit would
+        # land), not a highlight, and hiding it under the outline would
+        # lose information on the frames where the two nearly coincide.
+        self._fitted_preview.setZValue(46)
         vb = self._plot.getViewBox()
         vb.addItem(self._detected, ignoreBounds=True)
         vb.addItem(self._fitted, ignoreBounds=True)
         vb.addItem(self._manual, ignoreBounds=True)
+        vb.addItem(self._hover, ignoreBounds=True)
         vb.addItem(self._selection, ignoreBounds=True)
         vb.addItem(self._fitted_preview, ignoreBounds=True)
 
@@ -344,6 +484,11 @@ class GIWAXSImageViewer(
         self._label_filter.drawFinished.connect(self._on_draw_finished)
         self._label_filter.selectAt.connect(self._on_select_at)
         self._label_filter.doubleClicked.connect(self._reset_view_to_default)
+        # A double-click delivers a plain click first, which may have
+        # stepped the selection through a stack of boxes; take that
+        # step back now that the gesture is known.
+        self._label_filter.doubleClicked.connect(
+            self.revert_cycle_for_double_click)
         self._label_filter.cursorPos.connect(self._on_cursor_pos)
         self._label_filter.cursorLeft.connect(self._on_cursor_left)
 
@@ -469,6 +614,12 @@ class GIWAXSImageViewer(
         # without precomputing the full polar stack.
         self._polar_cache: "tuple[_LazyPolarStack, np.ndarray, np.ndarray] | None" = None  # type: ignore[name-defined]
         self._next_manual_id = -1  # negative IDs distinguish manual from detected
+        # Quick-select labelling: while True, a pending manual box is
+        # committed to the file instead of being dropped. Armed by the
+        # host from the Parameter panel's checkbox; the viewer only ever
+        # *asks* for the commit (``manualPeakCommitRequested``) — every
+        # file write stays on the host side.
+        self._quick_select = False
         self._selected: SelectedPeak | None = None
         # Secondary selections for the multi-select (Ctrl+click / Ctrl+A)
         # workflow. Restricted to ``kind == "detected"`` in this iteration
@@ -486,6 +637,22 @@ class GIWAXSImageViewer(
         # Set during a pipeline run so we don't allow concurrent ROI edits or
         # Delete keypresses while mlgidbase has the file open for writes.
         self._busy: bool = False
+
+        # Pre-selection preview state. ``_hover_pos`` is the last
+        # cursor point in data coordinates (so a re-render can redraw
+        # the outline without waiting for the next mouse move) and
+        # ``_hover_key`` identifies what is currently outlined, so a
+        # move inside the same box costs one hit test and no repaint.
+        self._hover_pos: tuple[float, float] | None = None
+        self._hover_key: tuple | None = None
+        # Click-through stepping: a click never hands back the box that
+        # is already selected, it takes the next one under the cursor.
+        # ``_cycle_prev`` is the selection to restore if the click that
+        # just stepped turns out to have been the first half of a
+        # double-click (which resets the zoom), and ``_cycle_time`` is
+        # when that step happened.
+        self._cycle_prev: SelectedPeak | None = None
+        self._cycle_time: float = 0.0
 
         # Geometry of the fitted-preview box for the current selection
         # (radius_center, fwhm_radial, angle_center, fwhm_angular). Cleared
@@ -750,6 +917,21 @@ class GIWAXSImageViewer(
                 hist_axis.setTextPen(pen)
         except Exception:
             logger.debug("suppressed exception recolouring histogram", exc_info=True)
+        # The selection highlight is drawn white on the dark plot ground
+        # and near-black on the light one; the overlay item was built at
+        # construction time, so re-pen it here. Overlay/matched colours
+        # are data, not chrome, and deliberately stay put.
+        try:
+            self._selection.set_pen_color(selection_style()["color"])
+            self._hover.set_pen_color(hover_style()["color"])
+        except Exception:
+            logger.debug("suppressed exception recolouring selection", exc_info=True)
+        # Re-render so the simulation overlay picks up its theme-visible
+        # "selected" colour on the next paint.
+        try:
+            self._render_simulation_overlays(self.current_frame)
+        except Exception:
+            logger.debug("suppressed exception refreshing sim overlay", exc_info=True)
 
     # -- Aspect ratio (toolbar "Aspect:" Fit / Default / Custom) --
 
@@ -965,43 +1147,29 @@ class GIWAXSImageViewer(
             self._render_overlays(frame)
 
     def insert_frame_controls(self, widgets: list[QWidget]) -> None:
-        """Splice ``widgets`` into the toolbar just before the
-        trailing stretch.
+        """Add the frame-navigation cluster to the end of the toolbar.
 
-        The host (MainWindow) owns the frame-navigation widgets
-        (previous, play, next, slider, label) so it can keep their
-        signal wiring intact when re-parenting them. The trailing
-        stretch added in ``__init__`` is **preserved** here — when
-        the slider is hidden (single-frame stack) the stretch is
-        the only expanding item left, which keeps the other toolbar
-        controls clustered to the left instead of being spread out
-        across the image width. When the slider is visible it
-        carries a much larger stretch factor so it dominates and
-        consumes the leftover horizontal space; the trailing
-        stretch only kicks in when the slider's stretch
-        contribution is zero (hidden widget).
+        The host (MainWindow) owns these widgets (previous, play, next,
+        slider, index, label) so it can keep their signal wiring intact
+        when re-parenting them. They go into one :class:`ToolGroup`, so
+        the strip wraps the transport as a block rather than splitting
+        it mid-cluster, and so the group vanishes entirely when the host
+        hides all six for a single-frame stack.
+
+        The slider carries the stretch inside the group and the group is
+        horizontally Expanding, which is what makes it swallow whatever
+        width its row has left over.
         """
-        bar = self._toolbar_layout
-        # Insert in front of the trailing stretch (always the last
-        # item from __init__). ``insert_at`` is updated after each
-        # call so widgets land in the order given.
-        insert_at = bar.count() - 1
-        if insert_at < 0:
-            insert_at = 0
-        bar.insertSpacing(insert_at, 16)
-        insert_at += 1
+        if self._frames_group is None:
+            group = ToolGroup()
+            group.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                QSizePolicy.Policy.Preferred)
+            self._frames_group = group
+            self._toolbar_layout.addWidget(group)
         for w in widgets:
-            if isinstance(w, QSlider):
-                # Slider gets a much larger stretch factor than the
-                # trailing stretch so it eats the leftover width
-                # when visible. When the slider is hidden, the
-                # trailing stretch (factor 1) absorbs the space
-                # alone and the other toolbar items stay packed
-                # against the left edge.
-                bar.insertWidget(insert_at, w, 100)
-            else:
-                bar.insertWidget(insert_at, w)
-            insert_at += 1
+            # The slider gets the stretch so it, not the buttons either
+            # side of it, absorbs the row's spare width.
+            self._frames_group.add(w, 100 if isinstance(w, QSlider) else 0)
 
     def set_overlay_visible(self, kind: str, visible: bool) -> None:
         if kind not in OVERLAY_KINDS:

@@ -4,6 +4,197 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## 0.1.0a17 — seventeenth alpha (2026-08-19)
+
+### Added
+
+- **Quick select: label without leaving the image.** A new checkbox in
+  the Display dock, with a dropdown beside it. While it is on, drawing
+  the next box commits the previous one — as a detected peak, a fitted
+  one, or both — so labelling a frame is draw, draw, draw instead of
+  draw, cross to the panel, press a button, come back. A box drawn on
+  top of the pending one replaces it instead, which is how you correct
+  an attempt. The last box is committed when you click away, press
+  Enter, change frame or turn the mode off; Esc still discards it. One
+  Ctrl+Z turns a committed peak back into the box it was drawn as. A fit
+  that will not converge never interrupts the run with a dialog — the
+  box is kept as a detected peak and the reason goes to the log.
+- **Select and delete peaks from the Peaks tables.** The Detected and
+  Fitted tabs now take Ctrl+click, Shift+click and Ctrl+A for several
+  rows at once, and the image follows along (and the other way round —
+  a multi-selection made on the image now highlights every one of its
+  rows in the table). Pressing Delete with rows selected removes them,
+  through exactly the same confirmation and undo as the Delete key on
+  the image. The Matched tab is unchanged: a row there is a whole
+  structure, not a peak.
+- **One fitted peak per detected peak.** A fit is now stored under the id
+  of the detected peak it came from, so fitting a peak again replaces its
+  fit instead of adding a second one, and the fitted peaks can no longer
+  outnumber the detected ones. Deleting a detected peak deletes its fit
+  too; deleting a fit leaves the detection alone unless you ask for that
+  as well. A hand-drawn box is added to the detected peaks first, so
+  every fit has a detection behind it. Both parts are switches in
+  Settings — the link is on by default, the reverse delete is off — and
+  with the link off everything behaves exactly as it did before.
+- **A hover preview for peak selection.** Moving over the image outlines
+  the box a click would take, and when boxes are stacked the status bar
+  says how many are under the cursor.
+- **A workflow rail.** A strip above the image showing the five stages
+  in order — Convert, Detect, Fit, Match, Track — with what each has
+  produced for the current frame. Clicking a stage brings its dock
+  forward; the run glyph presses that dock's own Run button, so nothing
+  about how a run is configured or queued changes.
+- **A welcome page.** With no file open the window used to be empty
+  axes and an empty tree. It now shows the mark, Open and Import, the
+  recent files, a reminder that files can be dropped anywhere on the
+  window, and — when the analysis backend is not installed — one line
+  saying so, which previously only surfaced when a run failed. The
+  empty Peaks and Scan-tracking tables say what would fill them.
+- **An application icon.** mlgidLAB now has a window / taskbar / Alt-Tab
+  icon, and a family-consistent `mlgidLAB` wordmark in the README and
+  the About dialog. Both are drawn from one description of the mlgid
+  family mark, whose geometry was measured off the family logo, so the
+  app icon is literally the same node graph the rest of mlgid-project
+  uses — recoloured to the detector colormap.
+- **Icons in the menus and on the controls.** 43 monochrome SVG glyphs,
+  recoloured to the live theme at load time, on the File / Edit / Tools
+  / View / Settings / Help entries, the dock toggles, the dock tabs,
+  the playback transport and the file-browser Refresh button.
+
+### Changed
+
+- **The right-hand docks open wide enough to read.** The column was
+  pinned to 350 px, which compressed the Pipeline form (its
+  "Config (yaml)" field showed as a stub) — the panels sit in scroll
+  areas with the horizontal scrollbar locked off, so a narrow column
+  elides rather than scrolls. The width is now measured from the
+  panels themselves, including the sections that start collapsed, and
+  the window opens at 1600x950 where the screen allows it so there is
+  room for it.
+
+- **The strips above the image wrap instead of setting a width floor.**
+  The viewer's control bar and the workflow rail were single rows whose
+  minimum width is the sum of everything in them, which stopped the
+  central column from being dragged narrower than about 740 px. Both now
+  reflow onto a second row, so the floor is the widest single cluster
+  (about 280 px) and the side docks can be pulled out much further.
+  Controls wrap as clusters, never between a label and its own control.
+
+- **Primary and destructive actions now look like what they are.** Run
+  detection / fitting / matching, Run full pipeline, Convert, Track
+  peaks, Save figure and the calibration "Add to conversion" buttons
+  carry an accent border and label; Delete peak and the metadata Remove
+  read as destructive. The six "Clear" buttons deliberately stay
+  neutral - they clear a path field, not analysis results.
+- **Progress bars fill with the accent.** The pipeline's two run bars,
+  the CIF parse bar, both status-bar bars and every progress dialog now
+  fill in the theme's accent instead of the default blue, so a run in
+  flight is the one moving, coloured thing on screen.
+- **The status bar reports activity, not just state.** Unsaved changes
+  show as a dot in front of the file name instead of a `*` glued to it;
+  a pipeline run in flight colours its cell and gets a live bar, and
+  clicking that cell opens the Logs dock; the cursor readout is
+  monospace and now carries `d` and, where the entry has a wavelength,
+  the scattering angle `2θ`. The polar map's azimuth is written `χ` so
+  it cannot be misread as `2θ` beside it.
+- **The viewer's control strip reads as controls.** Cartesian / Polar is
+  a segmented toggle instead of two radios, Log scale is an on/off
+  button, and the colormap dropdown shows each ramp as a colour chip
+  rather than only its name.
+- **Every section now has the same shape.** Sections were built three
+  ways (a hand-bolded label, a collapsible header, a group box), so the
+  Display, Pipeline and Conversion docks each read like a different
+  program. They share one card now: title, hairline, body. "Selected
+  peak" loses its box and joins the column it lives in.
+- **Section headers, tables and the status bar were restyled.**
+  Collapsible sections get a chevron and a hairline rule instead of
+  Qt's stock triangle; the peaks, scan-tracking and conversion tables
+  share one look; status-bar fields separate cleanly with the file name
+  carrying the emphasis.
+- Colours moved into a semantic token table (`mlgidlab/theme_tokens.py`)
+  behind a scoped stylesheet layer (`mlgidlab/skin.py`). Third-party
+  widgets - silx's tree and data viewer, pyqtgraph's plots, pyFAI's
+  calibration pages - are deliberately untouched.
+
+### Fixed
+
+- **The welcome page draws at cold start.** The page the window opens
+  on was empty: an unset label where the wordmark goes, and a "Recent"
+  heading with nothing under it. Everything visible on it is filled by
+  `_refresh_welcome_view`, which was only reachable from
+  `_apply_session_mode` — and that first runs when a file is opened, so
+  the state the page exists for was the one state it never ran in.
+
+- **The workflow rail no longer reports one run behind.** Run detection
+  and the Detect chip still said "not run"; run matching and Match said
+  "not run" next to three matched phases in the Display dock. The rail
+  counts what the viewer holds, and it was refreshed before the finished
+  run's results were loaded into the viewer, so it always described the
+  previous run. It now refreshes again after the reload.
+
+- **The 1D profile fit stops refusing narrow peaks and inventing
+  backgrounds.** It used to fit five parameters — peak plus a straight
+  line — inside a window that was exactly the box, where a straight
+  line cannot be identified at all. Narrow boxes got no fit (under
+  about 0.025 Å⁻¹ radially there were too few samples, and the curve
+  was simply cleared), and the ones that did converge could return a
+  background nothing like the data, taking the amplitude with it. Now
+  the window reaches beyond the box, the background is measured from
+  the parts outside it and held fixed, and the peak is fitted on the
+  box with three parameters. A neighbouring peak in that outside
+  region is recognised and left out of the background. The drawn curve
+  no longer extends past the data the fit was based on.
+- **A single-peak 2D fit no longer wanders onto its neighbour.** "Add to
+  fitted" and "Fit selected (2D)" handed pygidfit one box at a time.
+  pygidfit masks and joint-fits only the boxes it gets in one call, so
+  a neighbouring peak's intensity sat unmasked inside the target's fit
+  region and could pull the result out of the box that was drawn. Both
+  paths now pass the frame's nearby peak boxes along with the target,
+  which is the same input the pipeline fit gets for a whole frame. Far
+  boxes, rings and duplicates are filtered out, so a click still costs
+  one fit rather than a frame's worth.
+- **The hover outline no longer lingers.** It could survive the cursor
+  leaving: a re-render while a run was in flight left it painted, and a
+  re-render after the pointer had left the window redrew it. Every exit
+  now clears it — leaving the plot or the viewer, a run starting, a
+  view-mode switch, and closing the file.
+- **Highlights cover the box they mark, and look the same on every
+  kind.** The hover preview was translucent, so a detected box's dashed
+  red showed through it as pink while a fitted box's cyan did not. Both
+  the preview and the selection outline are now solid, opaque and wider
+  than any overlay pen; the preview is the accent colour and the
+  selection stays white, so "under the cursor" and "selected" remain
+  distinguishable.
+- **A small peak box inside a larger one is selectable.** Boxes had to
+  be hit exactly, so missing an 8 px detection by three pixels selected
+  the box around it — and with only that box in the stack there was
+  nothing to step to. Clicks now carry a few pixels of tolerance.
+- **A selected matched peak is highlighted like every other peak.** The
+  structure's own box was painted over the white selection outline (the
+  matched overlay is rebuilt on every render, so it ended up on top),
+  leaving a sliver of white instead of a highlight. Fitted and detected
+  were never affected.
+- **Clicking overlapping peak boxes now has a rule you can see.** Which
+  box a click took used to come down to table order, which is invisible
+  (each overlay kind is drawn as one path with one pen). The familiar
+  kind priority still comes first (manual, fitted, detected, matched),
+  and inside a kind the **smallest box wins**, so a box drawn inside
+  another is reachable instead of being shadowed by it. Clicking the
+  same spot again steps to the next box underneath, so the outer one is
+  still one click away: a click never hands back the box that is already
+  selected.
+- **Rings no longer swallow the peaks in their band.** A ring's box
+  spans every angle at its radius, so it used to compete with every spot
+  peak there. A ring is now picked by clicking within a few pixels of
+  its inner or outer radius.
+- **The light theme is correct again.** Roughly 30 colours were
+  hardcoded for the dark theme and never followed a theme switch: the
+  figure-export preview painted a dark rectangle inside a light window,
+  status-bar separators stayed dark grey, the CIF-cache line's four
+  states were washed out, table striping was near-invisible, and the
+  peak-selection highlight and profile curve were white on a white
+  plot ground.
+
 ## 0.1.0a16 — sixteenth alpha (2026-08-13)
 
 ### Changed

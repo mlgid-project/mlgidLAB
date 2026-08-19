@@ -1723,6 +1723,7 @@ def _add_peak_row(
     is_cut_qz: bool = False,
     is_cut_qxy: bool = False,
     visibility: int = 0,
+    peak_id: int | None = None,
 ) -> int:
     """Append a new row to ``{entry}/analysis/frameNNNNN/{dataset_name}``.
 
@@ -1731,6 +1732,14 @@ def _add_peak_row(
     write path is identical apart from the dataset name. q_xy/q_z are
     recomputed from polar; unset fields default to zero / False; the new
     peak's id is ``max(id)+1`` (or 0 for the first row). Returns the new id.
+
+    ``peak_id`` overrides that assignment and writes the row under the
+    id given. Two callers need it: the fitted/detected link (a fitted
+    row must carry its detected peak's id) and undo (a restored row
+    must come back under the id it had, or a link across tables would
+    not survive the undo). **The caller owns uniqueness** — this helper
+    appends, it does not check for or replace an existing row with the
+    same id; ``delete_peak_row`` first is the caller's job.
     """
     frame_key = FRAME_KEY_FMT.format(frame)
     with h5py.File(file_path, "r+") as f:
@@ -1743,7 +1752,10 @@ def _add_peak_row(
             )
         ds = f[ds_path]
         arr = ds[()]
-        new_id = int(arr["id"].max() + 1) if len(arr) > 0 else 0
+        if peak_id is not None:
+            new_id = int(peak_id)
+        else:
+            new_id = int(arr["id"].max() + 1) if len(arr) > 0 else 0
         # Build the new row by name to stay schema-resilient if the dtype
         # ever gains/loses a field.
         new_row = np.zeros(1, dtype=arr.dtype)
@@ -1801,6 +1813,7 @@ def add_fitted_peak_row(
     is_cut_qz: bool = False,
     is_cut_qxy: bool = False,
     visibility: int = 0,
+    peak_id: int | None = None,
 ) -> int:
     """Append a new row to the frame's ``fitted_peaks`` dataset.
 
@@ -1811,10 +1824,14 @@ def add_fitted_peak_row(
     Caller-supplied fields drive only the meaningful values; the 2D-shape
     params (A/B/C/theta) and score default to zero because a 1D-fit-derived
     row carries no 2D context. Returns the new peak's ``id``.
+
+    ``peak_id`` forces the row's id instead of letting it auto-assign;
+    see ``_add_peak_row`` for the uniqueness contract.
     """
     return _add_peak_row(
         file_path, entry, frame,
         dataset_name="fitted_peaks",
+        peak_id=peak_id,
         angle=angle, angle_width=angle_width,
         radius=radius, radius_width=radius_width,
         amplitude=amplitude, is_ring=is_ring,
@@ -1836,6 +1853,7 @@ def add_detected_peak_row(
     radius_width: float,
     score: float = 0.0,
     is_ring: bool = False,
+    peak_id: int | None = None,
 ) -> int:
     """Append a new row to the frame's ``detected_peaks`` dataset.
 
@@ -1852,7 +1870,8 @@ def add_detected_peak_row(
     forwards the snapshot's stored value. The ``0.0`` default is only a
     fallback for callers that have no score to carry.
 
-    Returns the new peak's ``id``.
+    Returns the new peak's ``id``. ``peak_id`` forces that id instead
+    of letting it auto-assign; see ``_add_peak_row``.
     """
     return _add_peak_row(
         file_path, entry, frame,
@@ -1860,6 +1879,7 @@ def add_detected_peak_row(
         angle=angle, angle_width=angle_width,
         radius=radius, radius_width=radius_width,
         score=score, is_ring=is_ring,
+        peak_id=peak_id,
     )
 
 
@@ -1961,6 +1981,7 @@ def read_peak_rows(
     frame: int,
     kind: str,
     peak_ids: list[int],
+    with_ids: bool = False,
 ) -> list[dict]:
     """Snapshot full field dicts for the given peak ids on one frame.
 
@@ -1971,8 +1992,17 @@ def read_peak_rows(
     rows verbatim via ``add_detected_peak_row`` / ``add_fitted_peak_row``
     (``id`` and ``q_xy``/``q_z`` are intentionally omitted: the add
     helpers assign a fresh id and recompute the q-fields from polar).
-    Ids not present in the dataset are skipped. ``kind`` is
-    ``"detected"`` or ``"fitted"``; read-only (mode ``"r"``).
+    Ids not present in the dataset are skipped — so the result can be
+    shorter than ``peak_ids`` and must not be zipped against it.
+
+    ``with_ids=True`` adds the row's ``"id"`` to each dict, for callers
+    that must restore a row under the id it had (the fitted/detected
+    link makes that necessary: a restored pair whose ids were
+    re-assigned would no longer be a pair). Such callers pop ``"id"``
+    and pass it as ``peak_id=`` rather than splatting it. It stays off
+    by default because every other caller splats the dict straight into
+    an add helper. ``kind`` is ``"detected"`` or ``"fitted"``;
+    read-only (mode ``"r"``).
     """
     if kind not in ("detected", "fitted"):
         raise ValueError(
@@ -2008,6 +2038,8 @@ def read_peak_rows(
                     d[nm] = int(val)
                 else:
                     d[nm] = float(val)
+            if with_ids:
+                d["id"] = int(row["id"])
             out.append(d)
     return out
 
@@ -2080,6 +2112,73 @@ def delete_peak_row(
         # do it here so the contract stays "this helper touches exactly
         # one kind".
         return int(arr.shape[0] - new_arr.shape[0])
+
+
+def rekey_fitted_ids_to_detected(
+    file_path: Path,
+    entry: str,
+    frame: int | None = None,
+) -> int:
+    """Give every fitted row the id of the detected row it came from.
+
+    The GUI can pair a fit with its detected peak by id (the
+    fitted/detected link setting), but a pipeline ``run_fitting`` does
+    not: pygidfit's container carries ``id = box.index`` — the position
+    of the box in the input array — and mlgidbase writes that straight
+    out, so a refit renumbers ``fitted_peaks`` 0..N-1. That equals the
+    detected ids only while ``detected_peaks`` has no gaps, and it gets
+    gaps the moment a detected peak is deleted (deletes here never
+    reindex). Without this pass, "delete detected 42 also deletes
+    fitted 42" would hit an unrelated peak after a run.
+
+    The mapping is positional and exact: pygidfit fits the boxes in the
+    order it receives them and emits one row per box, so fitted row *i*
+    is the fit of detected row *i*. Frames where the two counts differ
+    are skipped rather than guessed at.
+
+    Row count and row order are untouched — only the ``id`` column is
+    rewritten, in place — so ``matched_*`` ``peak_list``, which stores
+    *positions* into ``fitted_peaks``, is unaffected by construction.
+
+    ``frame`` restricts the pass to one frame; the default walks every
+    frame in the entry. Returns the number of frames actually
+    rewritten (frames already in agreement cost a read and no write).
+    """
+    changed = 0
+    with h5py.File(file_path, "r+") as f:
+        ana_path = f"{entry}/{ANALYSIS_REL}"
+        if ana_path not in f:
+            return 0
+        ana_group = f[ana_path]
+        if frame is None:
+            frame_names = list(ana_group.keys())
+        else:
+            target = FRAME_KEY_FMT.format(int(frame))
+            frame_names = [target] if target in ana_group else []
+        for frame_name in frame_names:
+            frame_group = ana_group[frame_name]
+            if not isinstance(frame_group, h5py.Group):
+                continue
+            if "detected_peaks" not in frame_group or "fitted_peaks" not in frame_group:
+                continue
+            det_ids = np.asarray(frame_group["detected_peaks"][()]["id"], dtype=int)
+            ds = frame_group["fitted_peaks"]
+            arr = ds[()]
+            if arr.shape[0] == 0 or arr.shape[0] != det_ids.shape[0]:
+                if arr.shape[0]:
+                    logger.info(
+                        "rekey_fitted_ids_to_detected: %s/%s has %d fitted "
+                        "row(s) against %d detected — leaving the ids alone "
+                        "(the positional pairing cannot be trusted).",
+                        entry, frame_name, int(arr.shape[0]), int(det_ids.shape[0]),
+                    )
+                continue
+            if np.array_equal(np.asarray(arr["id"], dtype=int), det_ids):
+                continue
+            arr["id"] = det_ids
+            ds[...] = arr
+            changed += 1
+    return changed
 
 
 def fitted_positions_for_ids(

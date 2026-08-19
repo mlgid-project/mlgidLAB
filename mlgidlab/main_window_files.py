@@ -646,6 +646,11 @@ class FilesMixin:
         was_active = session is self._active_session
         if session not in self._sessions:
             return
+        # Last chance for a pending quick-select box: after this the
+        # file it belongs to is gone. Runs before the save prompt the
+        # caller may still show, so the box counts as unsaved work.
+        if was_active:
+            self.viewer.commit_pending_manual()
         # Stop playback before pulling the file out from under the
         # viewer — the timer's next tick would otherwise read from a
         # released FrameSource.
@@ -891,6 +896,17 @@ class FilesMixin:
         Clear-peaks submenu. The user gets a clean canvas focused on
         the conversion workflow.
         """
+        # Central area: the welcome page whenever nothing is loaded, the
+        # Image / Data tabs otherwise. Refreshed on the way in so the
+        # recent list reflects the file that was just closed.
+        stack = getattr(self, "_central_stack", None)
+        if stack is not None:
+            if session is None:
+                self._refresh_welcome_view()
+                stack.setCurrentWidget(self.welcome_view)
+            else:
+                stack.setCurrentWidget(self.tabs)
+
         is_raw = session is not None and session.kind == "raw"
         self._pipeline_dock.setVisible(not is_raw)
         self._conversion_dock.setVisible(is_raw)
@@ -934,7 +950,12 @@ class FilesMixin:
         ):
             if kind_menu is not None:
                 kind_menu.menuAction().setEnabled(not is_raw)
+        self._refresh_workflow_rail()
         self._hide_stale_dock_tab_bars()
+        # Re-tabifying above rebuilds the tab entries, and a fresh tab
+        # comes up without an icon (Qt reads the dock's windowIcon only
+        # when it creates the tab), so the glyphs go back on here.
+        self._apply_dock_tab_icons()
 
     def _confirm_discard_changes(self, session: BaseSession | None = None) -> bool:
         target = session if session is not None else self._active_session

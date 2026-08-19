@@ -6,6 +6,8 @@ source split.
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -23,6 +25,9 @@ from mlgidlab import (
 from mlgidlab.image_viewer import SelectedPeak
 from mlgidlab.parameter_panel import ParameterPanel
 from mlgidlab.pipeline import PipelineCommand
+from mlgidlab.widgets import skin_progress
+
+logger = logging.getLogger(__name__)
 
 
 class _CallbackAction:
@@ -67,8 +72,29 @@ class PeaksMixin:
         entry = self.entry_combo.currentText()
         if sel is None or sel.kind != "manual" or sel.manual_ref is None or not entry:
             return
-        manual_peak = sel.manual_ref
-        frame = int(self.viewer.current_frame)
+        self._write_detected_from_manual(
+            entry, int(self.viewer.current_frame), sel.manual_ref,
+        )
+
+    def _write_detected_from_manual(
+        self, entry: str, frame: int, manual_peak, *,
+        select: bool = True, quiet: bool = False,
+    ) -> int | None:
+        """Write one manual box to ``detected_peaks``; return its id.
+
+        Split out of ``_on_add_to_detected`` so a caller that is not
+        acting on the current *selection* can use it — quick-select
+        commits the box the user drew **before** the one now selected,
+        which the button path could never name.
+
+        ``select`` and ``quiet`` let the quick-select caller keep the
+        selection where the user put it and stay off the modal path
+        (see ``_quick_commit``). The defaults reproduce the button
+        exactly.
+
+        Returns None when the write failed; the error has already been
+        surfaced.
+        """
         score = float(self.parameter_panel.confidence_score())
         geom = {
             "radius": float(manual_peak.radius),
@@ -83,18 +109,26 @@ class PeaksMixin:
                     self.session.temp_path, entry, frame,
                     score=score, **geom,
                 ))
-            except KeyError as exc:
-                QMessageBox.warning(self, "Add to detected", str(exc))
-                return
             except Exception as exc:
-                QMessageBox.critical(self, "Add to detected", str(exc))
-                return
+                if quiet:
+                    self.pipeline_panel.append_log(
+                        f"Quick select: could not add a detected peak — {exc}"
+                    )
+                    return None
+                box = (
+                    QMessageBox.warning if isinstance(exc, KeyError)
+                    else QMessageBox.critical
+                )
+                box(self, "Add to detected", str(exc))
+                return None
         self.session.mark_dirty()
         self._update_title()
         self._load_entry_into_viewer(entry, preserve_view=True)
-        self._add_detected_to_selection(entry, frame, [new_id])
+        if select:
+            self._add_detected_to_selection(entry, frame, [new_id])
         self._push_add_detected_undo(
-            entry=entry, frame=frame, peak_id=new_id, score=score, geom=geom,
+            entry=entry, frame=frame, peak_id=new_id,
+            score=score, geom=geom,
         )
         msg = (
             f"Added detected peak (score {score:.2f}) on "
@@ -102,6 +136,126 @@ class PeaksMixin:
         )
         self.statusBar().showMessage(msg, 4000)
         self.pipeline_panel.append_log(msg)
+        return new_id
+
+    # -- Quick select: drawing the next box commits the previous one --
+
+    def _on_quick_select_toggled(self, enabled: bool) -> None:
+        """Arm / disarm the viewer and repaint the status cell.
+
+        Disarming commits whatever is still pending — the viewer does
+        that inside ``set_quick_select`` — so the last box of a run is
+        never lost by simply switching the mode off.
+        """
+        self.viewer.set_quick_select(bool(enabled))
+        self._update_status_quick_select()
+
+    def _on_quick_commit_requested(self, frame: int, peak) -> None:
+        """Write one pending manual box to the file.
+
+        The viewer asks for this from every path that would otherwise
+        drop the box — the next box being drawn, the selection moving
+        away, a frame change, Enter, and the mode being switched off.
+        All of them land here so they cannot behave differently.
+
+        The write and the box's retirement are bundled into **one** undo
+        entry: the commit helpers push their own entries, which are
+        lifted off the stack and wrapped together with the removal of
+        the manual box. One Ctrl+Z therefore turns the committed peak
+        back into the box it was drawn as.
+        """
+        entry = self.entry_combo.currentText()
+        if (
+            self.session is None or not entry or peak is None
+            or self._is_busy()
+        ):
+            return
+        target = self.parameter_panel.quick_select_target()
+        stack = self.viewer._undo_stack
+        depth = len(stack)
+        written = self._quick_write(entry, int(frame), peak, target)
+        if not written:
+            # Nothing landed — leave the box alone so the user can retry
+            # or fix it rather than losing what they drew.
+            del stack[depth:]
+            return
+        actions = list(stack[depth:])
+        del stack[depth:]
+        self.viewer.retire_manual_peak(int(frame), peak)
+        self.viewer._push_undo(
+            _CallbackAction(
+                lambda: self._quick_commit_undo(int(frame), peak, actions),
+                lambda: self._quick_commit_redo(int(frame), peak, actions),
+            )
+        )
+        self._update_status_quick_select()
+
+    def _quick_write(self, entry: str, frame: int, peak, target: str) -> bool:
+        """Write the box at the chosen target. True if anything landed.
+
+        Detected is the cheap, cannot-fail path. Fitted runs the same
+        code the Add-to-fitted button runs — including, with the peak
+        link on, writing the detected partner — but **quietly**: no
+        modal is allowed to interrupt a labelling run.
+
+        A fit that will not converge therefore does not cost the user
+        the box. It is committed as detected instead, with a log line
+        naming what happened. That inverts the button's deliberate
+        strictness (physics-audit F-06, no silent fallback), and the
+        trade is different here on purpose: the button commits one peak
+        the user is watching, this commits a peak they have already
+        moved on from.
+        """
+        from mlgidlab.parameter_panel import ParameterPanel
+
+        sel = SelectedPeak.from_manual(peak, int(frame))
+        if target == ParameterPanel.QUICK_TARGET_DETECTED:
+            return self._write_detected_from_manual(
+                entry, frame, peak, select=False, quiet=True,
+            ) is not None
+
+        detected_id = None
+        if target == ParameterPanel.QUICK_TARGET_BOTH and not self._fitted_link_on():
+            # With the link on, the fitted path writes the detected
+            # partner itself, so writing one here would duplicate it.
+            detected_id = self._write_detected_from_manual(
+                entry, frame, peak, select=False, quiet=True,
+            )
+        fitted_id = self._write_fitted_from_selection(
+            sel, entry, frame, select=False, quiet=True,
+        )
+        if fitted_id is not None:
+            return True
+        if detected_id is not None:
+            self.pipeline_panel.append_log(
+                "Quick select: the fit failed — the box was kept as a "
+                "detected peak."
+            )
+            return True
+        # Fitted-only target with a failed fit: keep the box rather than
+        # discard the user's work.
+        fallback = self._write_detected_from_manual(
+            entry, frame, peak, select=False, quiet=True,
+        )
+        if fallback is None:
+            return False
+        msg = "Quick select: the fit failed — saved as a detected peak instead."
+        self.statusBar().showMessage(msg, 4000)
+        self.pipeline_panel.append_log(msg)
+        return True
+
+    def _quick_commit_undo(self, frame: int, peak, actions: list) -> None:
+        """Reverse one quick commit: unwrite the rows, restore the box."""
+        for action in reversed(actions):
+            action.undo(self.viewer)
+        self.viewer._undoable_add_manual(int(frame), peak)
+        self._update_status_quick_select()
+
+    def _quick_commit_redo(self, frame: int, peak, actions: list) -> None:
+        self.viewer.retire_manual_peak(int(frame), peak)
+        for action in actions:
+            action.redo(self.viewer)
+        self._update_status_quick_select()
 
     def _undoable_write_step(
         self, *, entry: str, frame: int | None, title: str,
@@ -192,6 +346,133 @@ class PeaksMixin:
 
         self.viewer._push_undo(_CallbackAction(_undo, _redo))
 
+    # -- Fitted rows, optionally linked to their detected peak -------
+
+    def _fitted_link_on(self) -> bool:
+        """Whether a fit should carry the id of its detected peak.
+
+        Read at the moment of use, so flipping the setting takes effect
+        on the next action with no wiring. With it off, every path below
+        keeps the behaviour it had before the setting existed.
+        """
+        from mlgidlab import peak_link
+
+        return peak_link.link_enabled()
+
+    def _undo_created_detected(
+        self, entry: str, frame: int,
+        created: "tuple[int, dict, float] | None",
+    ) -> None:
+        """Remove a detected row written for a fit that then failed.
+
+        The manual-box path writes the detected partner first, so a
+        failing fit would otherwise leave a detected peak the user never
+        asked for. Mirrors the injection path's "no orphan geometry"
+        cleanup. Best-effort: a failure here must not mask the error
+        being reported.
+        """
+        if created is None:
+            return
+        try:
+            file_model.delete_peak_row(
+                self.session.temp_path, entry, frame=int(frame),
+                kind="detected", peak_id=int(created[0]),
+            )
+        except Exception:
+            logger.debug(
+                "suppressed exception rolling back a detected row",
+                exc_info=True,
+            )
+
+    def _write_fitted_row(
+        self, entry: str, frame: int, add_kwargs: dict,
+        target_id: int | None,
+    ) -> tuple[int, list[dict]]:
+        """Write one fitted row, returning ``(new_id, replaced_rows)``.
+
+        ``target_id`` is the detected peak's id when the link is on, and
+        None otherwise — in which case this is exactly the old
+        ``add_fitted_peak_row`` call and ``replaced_rows`` is empty.
+
+        With a target, any existing fitted row under that id is removed
+        first, so a detected peak can never accumulate fits. The removal
+        is a normal fitted delete and gets the normal matched handling:
+        capture the row's position, delete, then
+        ``remap_matched_peak_lists``. Matched structures lose exactly
+        the replaced peak and keep everything else, which is what a
+        fitted delete has always done.
+
+        The removed row is returned so undo can put it back verbatim.
+        Caller must already hold the detached silx tree.
+        """
+        path = self.session.temp_path
+        replaced: list[dict] = []
+        if target_id is not None:
+            replaced = file_model.read_peak_rows(
+                path, entry, int(frame), "fitted", [int(target_id)],
+                with_ids=True,
+            )
+            if replaced:
+                positions = file_model.fitted_positions_for_ids(
+                    path, entry, int(frame), [int(target_id)],
+                )
+                file_model.delete_peak_row(
+                    path, entry, frame=int(frame), kind="fitted",
+                    peak_id=int(target_id),
+                )
+                file_model.remap_matched_peak_lists(
+                    path, entry, int(frame), positions,
+                )
+        new_id = int(file_model.add_fitted_peak_row(
+            path, entry, int(frame), peak_id=target_id, **add_kwargs,
+        ))
+        return new_id, replaced
+
+    def _restore_peak_rows(
+        self, entry: str, frame: int, kind: str, rows: list[dict],
+    ) -> None:
+        """Put snapshot rows back under the ids they had.
+
+        Used by undo wherever the link is involved. Restoring under a
+        fresh id would break the pair the undo is supposed to restore,
+        so ``read_peak_rows(with_ids=True)`` snapshots carry the id and
+        it is handed back through ``peak_id``. Caller must already hold
+        the detached silx tree.
+        """
+        for row in rows:
+            d = dict(row)
+            peak_id = d.pop("id", None)
+            self._readd_peak_row(entry, int(frame), kind, d, peak_id=peak_id)
+
+    def _detected_row_from_manual(
+        self, entry: str, frame: int, manual_peak,
+    ) -> tuple[int, dict, float]:
+        """Write a hand-drawn box to ``detected_peaks``.
+
+        With the link on, every fitted peak must have a detected
+        partner, so a manual box is committed to detected first and the
+        fit pairs to that new row — the same two rows the user would get
+        by pressing Add to detected and then Add to fitted. Score comes
+        from the Parameter panel's dropdown, exactly as
+        ``_on_add_to_detected`` reads it.
+
+        Returns ``(new_id, geom, score)`` so the undo closure can delete
+        and re-create the row. Caller must already hold the detached
+        silx tree.
+        """
+        geom = {
+            "radius": float(manual_peak.radius),
+            "angle": float(manual_peak.angle),
+            "radius_width": float(manual_peak.radius_width),
+            "angle_width": float(manual_peak.angle_width),
+            "is_ring": bool(manual_peak.is_ring),
+        }
+        score = float(self.parameter_panel.confidence_score())
+        new_id = int(file_model.add_detected_peak_row(
+            self.session.temp_path, entry, int(frame), score=score, **geom,
+        ))
+        return new_id, geom, score
+
     def _on_add_to_fitted(self) -> None:
         """Append a row to fitted_peaks for the active manual / detected box.
 
@@ -223,47 +504,100 @@ class PeaksMixin:
         entry = self.entry_combo.currentText()
         if sel is None or sel.kind not in ("manual", "detected") or not entry:
             return
+        self._write_fitted_from_selection(
+            sel, entry, int(self.viewer.current_frame),
+        )
+
+    def _write_fitted_from_selection(
+        self, sel: SelectedPeak, entry: str, frame: int, *,
+        select: bool = True, quiet: bool = False,
+    ) -> int | None:
+        """The body of Add-to-fitted, for an explicitly-named box.
+
+        Split out so quick-select can commit the box the user drew
+        *before* the current selection — which is exactly the box the
+        button path cannot name. A manual box arrives here as
+        ``SelectedPeak.from_manual(...)``, which is what
+        ``_build_fitted_row_2d`` needs anyway.
+
+        ``select`` and ``quiet`` are the same two knobs
+        ``_write_detected_from_manual`` takes: keep the selection where
+        the user put it, and stay off the modal path. The defaults
+        reproduce the button exactly, including its strict
+        no-silent-fallback failure (F-06) — the quiet path is the one
+        place that trade is inverted, and ``_quick_commit`` documents
+        why. The undo entry is pushed as usual; a caller that wants the
+        commit bundled with something else wraps it (see
+        ``_quick_commit``).
+
+        Returns the new fitted id, or None when nothing was written.
+        """
         save_as_ring = self.parameter_panel.save_as_ring()
-        frame = self.viewer.current_frame
         # ``fit_mode()`` already collapses to FIT_MODE_1D when ring is
         # checked, so the rest of this function just branches on the
         # token.
         mode = self.parameter_panel.fit_mode()
 
         if mode == ParameterPanel.FIT_MODE_2D:
-            row = self._build_fitted_row_2d(sel, entry, frame)
+            row = self._build_fitted_row_2d(sel, entry, frame, quiet=quiet)
         else:
-            row = self._build_fitted_row_1d(sel, save_as_ring)
+            row = self._build_fitted_row_1d(sel, save_as_ring, quiet=quiet)
         if row is None:
             # The helper already showed a QMessageBox / log line.
-            return
+            return None
 
+        add_kwargs = {
+            "radius": row["radius"],
+            "radius_width": row["radius_width"],
+            "angle": row["angle"],
+            "angle_width": row["angle_width"],
+            "amplitude": row["amplitude"],
+            "is_ring": save_as_ring,
+            "theta": row["theta"],
+            "A": row["A"], "B": row["B"], "C": row["C"],
+        }
+        # With the link on the row carries its detected peak's id, which
+        # replaces any previous fit of that peak. A hand-drawn box has
+        # no detected peak yet, so one is written first and the fit
+        # pairs to it. With the link off, target_id stays None and this
+        # is the plain append it always was.
+        link = self._fitted_link_on()
+        target_id: int | None = None
+        created_detected: tuple[int, dict, float] | None = None
         with self._detached_silx_tree():
             try:
-                new_id = file_model.add_fitted_peak_row(
-                    self.session.temp_path, entry, frame,
-                    radius=row["radius"],
-                    radius_width=row["radius_width"],
-                    angle=row["angle"],
-                    angle_width=row["angle_width"],
-                    amplitude=row["amplitude"],
-                    is_ring=save_as_ring,
-                    theta=row["theta"],
-                    A=row["A"],
-                    B=row["B"],
-                    C=row["C"],
+                if link and sel.kind == "detected" and sel.peak_id is not None:
+                    target_id = int(sel.peak_id)
+                elif link and sel.kind == "manual" and sel.manual_ref is not None:
+                    created_detected = self._detected_row_from_manual(
+                        entry, frame, sel.manual_ref,
+                    )
+                    target_id = created_detected[0]
+                new_id, replaced = self._write_fitted_row(
+                    entry, frame, add_kwargs, target_id,
                 )
-            except KeyError as exc:
-                QMessageBox.warning(self, "Add to fitted", str(exc))
-                return
             except Exception as exc:
-                QMessageBox.critical(self, "Add to fitted", str(exc))
-                return
+                # Never leave a detected row behind for a fit that did
+                # not land — same rule the injection path follows.
+                self._undo_created_detected(entry, frame, created_detected)
+                if quiet:
+                    self.pipeline_panel.append_log(
+                        f"Quick select: could not add a fitted peak — {exc}"
+                    )
+                    return None
+                box = (
+                    QMessageBox.warning if isinstance(exc, KeyError)
+                    else QMessageBox.critical
+                )
+                box(self, "Add to fitted", str(exc))
+                return None
 
         self.session.mark_dirty()
         self._update_title()
-        # Add-to-fitted only appends a fitted row (fresh id); no existing
-        # id is invalidated, so prior undo history is preserved.
+        # Add-to-fitted appends a fitted row; with the link on it may
+        # first remove the previous fit of the same detected peak, which
+        # the undo entry restores. Prior undo history stays valid either
+        # way (no other row's id changes).
         # Pull the fresh fitted_peaks (and matched, which references it) back
         # into the viewer — same entry, so preserve the user's zoom + frame.
         self._load_entry_into_viewer(entry, preserve_view=True)
@@ -274,7 +608,7 @@ class PeaksMixin:
         # immediately visible (cyan box + profile fits both update to
         # the fitted-kind selection). 1D mode is unchanged because the
         # pink curves already previewed what was saved.
-        if mode == ParameterPanel.FIT_MODE_2D:
+        if select and mode == ParameterPanel.FIT_MODE_2D:
             fitted_sel = SelectedPeak(
                 kind="fitted",
                 frame=int(frame),
@@ -302,17 +636,11 @@ class PeaksMixin:
         # stacks with any prior undoable edits.
         self._push_fitted_add_undo(
             entry=entry, frame=int(frame), new_id=int(new_id),
-            add_kwargs={
-                "radius": row["radius"],
-                "radius_width": row["radius_width"],
-                "angle": row["angle"],
-                "angle_width": row["angle_width"],
-                "amplitude": row["amplitude"],
-                "is_ring": save_as_ring,
-                "theta": row["theta"],
-                "A": row["A"], "B": row["B"], "C": row["C"],
-            },
+            add_kwargs=add_kwargs,
             source_sel=sel,
+            target_id=target_id,
+            replaced=replaced,
+            created_detected=created_detected,
         )
         # Ring toggle is sticky across selections but reset on commit so
         # the next Add-to-fitted defaults back to segment unless the user
@@ -322,11 +650,20 @@ class PeaksMixin:
             f"Added fitted peak id={new_id} "
             f"({'ring' if save_as_ring else 'segment'} from {sel.kind}) on "
             f"{entry}/frame{frame:05d}"
+            + (" — replaced the previous fit of that peak" if replaced else "")
+            + (
+                f" (also added detected id={created_detected[0]})"
+                if created_detected else ""
+            )
         )
+        return int(new_id)
 
     def _push_fitted_add_undo(
         self, *, entry: str, frame: int, new_id: int,
         add_kwargs: dict, source_sel: SelectedPeak,
+        target_id: int | None = None,
+        replaced: list[dict] | None = None,
+        created_detected: "tuple[int, dict, float] | None" = None,
     ) -> None:
         """Push a Ctrl+Z entry for an Add-to-fitted commit.
 
@@ -345,7 +682,17 @@ class PeaksMixin:
         ``file_model.add_fitted_peak_row`` assigns a fresh id on
         each call (``max(id)+1``), so the post-redo id may differ
         from the original; ``state["current_id"]`` is updated so
-        a follow-on undo deletes the correct row.
+        a follow-on undo deletes the correct row. With the link on
+        the id is pinned to ``target_id`` instead and does not move.
+
+        The link adds two more things to reverse, both threaded
+        through here so one Ctrl+Z still undoes the whole commit:
+
+        * ``replaced`` — the fit of that detected peak that this
+          commit displaced, restored under its own id.
+        * ``created_detected`` — the detected row written for a
+          hand-drawn box, removed again (and re-created under the
+          same id on redo, so the pair survives the round trip).
 
         On either side, any file error surfaces a QMessageBox and
         leaves the stack alone — the caller's downstream slot
@@ -354,7 +701,10 @@ class PeaksMixin:
         """
         # Closure state for the rotating fitted-row id across
         # repeated undo/redo cycles.
-        state = {"current_id": int(new_id)}
+        state: dict = {
+            "current_id": int(new_id),
+            "replaced": [dict(d) for d in (replaced or [])],
+        }
         source_kind = source_sel.kind
         source_peak_id = (
             int(source_sel.peak_id)
@@ -380,6 +730,19 @@ class PeaksMixin:
                             self.session.temp_path, entry,
                             kind="matched", frame=int(frame),
                         )
+                        # Put back the fit this commit displaced, and
+                        # drop the detected row it created for a
+                        # hand-drawn box, so one Ctrl+Z returns the file
+                        # to exactly what it held before.
+                        self._restore_peak_rows(
+                            entry, int(frame), "fitted", state["replaced"],
+                        )
+                        if created_detected is not None:
+                            file_model.delete_peak_row(
+                                self.session.temp_path, entry,
+                                frame=int(frame), kind="detected",
+                                peak_id=int(created_detected[0]),
+                            )
                 except Exception as exc:
                     QMessageBox.critical(
                         self, "Undo Add to fitted", str(exc)
@@ -428,9 +791,14 @@ class PeaksMixin:
                 self.viewer.set_frame(int(frame))
             with self._detached_silx_tree():
                 try:
-                    readded_id = file_model.add_fitted_peak_row(
-                        self.session.temp_path, entry, int(frame),
-                        **add_kwargs,
+                    if created_detected is not None:
+                        det_id, det_geom, det_score = created_detected
+                        file_model.add_detected_peak_row(
+                            self.session.temp_path, entry, int(frame),
+                            score=det_score, peak_id=int(det_id), **det_geom,
+                        )
+                    readded_id, re_replaced = self._write_fitted_row(
+                        entry, int(frame), add_kwargs, target_id,
                     )
                 except Exception as exc:
                     QMessageBox.critical(
@@ -438,6 +806,7 @@ class PeaksMixin:
                     )
                     return
             state["current_id"] = int(readded_id)
+            state["replaced"] = [dict(d) for d in re_replaced]
             self.session.mark_dirty()
             self._update_title()
             self._load_entry_into_viewer(entry, preserve_view=True)
@@ -828,10 +1197,10 @@ class PeaksMixin:
             return
 
         n_frames_to_write = len(valid)
-        dialog = QProgressDialog(
+        dialog = skin_progress(QProgressDialog(
             f"Pasting to {n_frames_to_write} frame(s)…",
             "Cancel", 0, n_frames_to_write, self,
-        )
+        ))
         dialog.setWindowTitle("Paste to frames")
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
         dialog.setMinimumDuration(0)
@@ -1079,9 +1448,9 @@ class PeaksMixin:
         if not entry:
             return
         n = len(sels)
-        dialog = QProgressDialog(
+        dialog = skin_progress(QProgressDialog(
             f"Fitting {n} peak(s) (2D)…", "Cancel", 0, n, self,
-        )
+        ))
         dialog.setWindowTitle("Fit selected (2D)")
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
         dialog.setMinimumDuration(0)
@@ -1112,7 +1481,10 @@ class PeaksMixin:
         # whole batch — h5py detach is the expensive bit.
         added_ids: list[int] = []
         added_kwargs: list[dict] = []
+        target_ids: list[int | None] = []
+        replaced_rows: list[dict] = []
         failures: list[tuple[int, str]] = []
+        link = self._fitted_link_on()
         with self._detached_silx_tree():
             for sel, fit_2d, err in fit_results:
                 if fit_2d is None:
@@ -1130,16 +1502,25 @@ class PeaksMixin:
                     "B": float(fit_2d.B),
                     "C": float(fit_2d.C),
                 }
+                # With the link on each fit takes its detected peak's
+                # id and replaces that peak's previous fit; with it off
+                # this is the plain append it always was.
+                target_id = int(sel.peak_id) if link else None
                 try:
-                    new_id = file_model.add_fitted_peak_row(
-                        self.session.temp_path, entry, int(sel.frame),
-                        **row,
+                    new_id, replaced = self._write_fitted_row(
+                        entry, int(sel.frame), row, target_id,
                     )
                 except Exception as exc:
                     failures.append((int(sel.peak_id), f"write failed: {exc}"))
                     continue
                 added_ids.append(int(new_id))
                 added_kwargs.append({**row, "frame": int(sel.frame)})
+                target_ids.append(target_id)
+                # Stamp the frame: a batch selection can span frames, and
+                # undo has to put each displaced fit back on its own.
+                replaced_rows.extend(
+                    {**d, "frame": int(sel.frame)} for d in replaced
+                )
         dialog.close()
 
         if not added_ids:
@@ -1152,8 +1533,10 @@ class PeaksMixin:
 
         self.session.mark_dirty()
         self._update_title()
-        # Batch fit only appends fitted rows (fresh ids); the detected
-        # ids it fit from are untouched, so prior undo history stays valid.
+        # Batch fit appends fitted rows; with the link on each takes its
+        # detected peak's id and displaces that peak's previous fit,
+        # which the undo entry restores. The detected rows themselves
+        # are untouched either way, so prior undo history stays valid.
         self._load_entry_into_viewer(entry, preserve_view=True)
         # Multi-select the newly-added fitted rows. They may span
         # multiple frames if the original detected selection did
@@ -1171,6 +1554,7 @@ class PeaksMixin:
             )
         self._push_batch_fit_undo(
             entry=entry, added_ids=added_ids, added_kwargs=added_kwargs,
+            target_ids=target_ids, replaced_rows=replaced_rows,
         )
 
         summary = (
@@ -1219,15 +1603,27 @@ class PeaksMixin:
 
     def _push_batch_fit_undo(
         self, *, entry: str, added_ids: list[int], added_kwargs: list[dict],
+        target_ids: "list[int | None] | None" = None,
+        replaced_rows: list[dict] | None = None,
     ) -> None:
         """Undo / redo for a batch-fit run — one grouped action.
 
         Mirrors ``_push_fitted_add_undo`` extended to N rows. The
         rotating ``state["ids"]`` keeps undo correct after a redo
-        re-assigns ids (one per redo'd row).
+        re-assigns ids (one per redo'd row); with the link on the ids
+        are pinned to the detected peaks and do not move.
+
+        ``replaced_rows`` are the fits this run displaced (one per
+        already-fitted detected peak in the selection). Undo puts them
+        back under their own ids, so a batch refit is as reversible as a
+        single one.
         """
-        state = {"ids": list(added_ids)}
+        state: dict = {
+            "ids": list(added_ids),
+            "replaced": [dict(d) for d in (replaced_rows or [])],
+        }
         snapshot_kwargs = [dict(kw) for kw in added_kwargs]
+        targets = list(target_ids or [None] * len(added_kwargs))
 
         def _undo() -> None:
             def write():
@@ -1244,6 +1640,15 @@ class PeaksMixin:
                         self.session.temp_path, entry,
                         kind="matched", frame=f,
                     )
+                # Restore the fits this run displaced, under their own
+                # ids so each is paired with its detected peak again.
+                for d in state["replaced"]:
+                    row = dict(d)
+                    peak_id = row.pop("id", None)
+                    row_frame = int(row.pop("frame"))
+                    self._readd_peak_row(
+                        entry, row_frame, "fitted", row, peak_id=peak_id,
+                    )
 
             def after(_result) -> None:
                 self.pipeline_panel.append_log(
@@ -1259,13 +1664,16 @@ class PeaksMixin:
         def _redo() -> None:
             def write():
                 new_ids: list[int] = []
-                for kw in snapshot_kwargs:
+                re_replaced: list[dict] = []
+                for kw, target in zip(snapshot_kwargs, targets):
                     write_kw = {k: v for k, v in kw.items() if k != "frame"}
-                    new_id = file_model.add_fitted_peak_row(
-                        self.session.temp_path, entry, int(kw["frame"]),
-                        **write_kw,
+                    new_id, replaced = self._write_fitted_row(
+                        entry, int(kw["frame"]), write_kw, target,
                     )
                     new_ids.append(int(new_id))
+                    for d in replaced:
+                        re_replaced.append({**d, "frame": int(kw["frame"])})
+                state["replaced"] = re_replaced
                 return new_ids
 
             def after(new_ids) -> None:
@@ -1350,6 +1758,7 @@ class PeaksMixin:
                 clustering_distance_peaks=cdp,
                 clustering_distance_rings=cdr,
                 clustering_extend=ce,
+                neighbours=self._neighbour_boxes(entry, int(frame), sel),
                 **geom,
             )
         except ManualFitError as exc:
@@ -1358,17 +1767,66 @@ class PeaksMixin:
             return None, f"Unexpected 2D fit error: {exc!r}"
         return fit_2d, None
 
+    def _neighbour_boxes(
+        self, entry: str, frame: int, sel: SelectedPeak,
+    ) -> list:
+        """The frame's other peak boxes, for pygidfit to mask or
+        joint-fit alongside ``sel``.
+
+        pygidfit only reasons about the boxes in one ``fit_data``
+        call, so handing it just the user's box left neighbouring
+        intensity unmasked in the ROI (see ``manual_fit``). Detected
+        and fitted rows both count; ``select_neighbour_boxes`` inside
+        the wrapper drops rings, duplicates and everything too far
+        away to touch the target's ROI.
+
+        Source is the viewer's per-frame peak cache — the tables the
+        overlays already hold, so a click costs no I/O. Only when the
+        frame is not cached (a batch fit reaching a frame the user
+        never opened) does this fall back to a read, and a failed
+        read means no neighbours rather than a failed fit.
+        """
+        from mlgidlab.manual_fit import neighbour_boxes_from_tables
+
+        tables = (getattr(self.viewer, "_frame_peaks", None) or {}).get(frame)
+        if not tables:
+            if self.session is None:
+                return []
+            try:
+                tables = file_model.load_peaks(
+                    self.session.temp_path, entry, int(frame),
+                )
+            except Exception:
+                return []
+        return neighbour_boxes_from_tables(
+            tables,
+            exclude_kind=sel.kind,
+            exclude_id=getattr(sel, "peak_id", None),
+        )
+
     def _build_fitted_row_2d(
         self, sel: SelectedPeak, entry: str, frame: int,
+        *, quiet: bool = False,
     ) -> dict | None:
         """Run pygidfit on ``sel`` and shape the result into an
         ``add_fitted_peak_row`` kwarg dict. Surfaces a QMessageBox
         on failure — strict, no silent fall-back to the 1D path.
         Delegates the actual fit to ``_run_pygidfit_for_selection``
         so the live-preview path can reuse the same code.
+
+        ``quiet`` downgrades that dialog to a log line, for the
+        quick-select commit: the user has already moved on to the next
+        box, and a modal in the middle of a labelling run stops the
+        run dead. The caller then decides what to do with the failure
+        (``_quick_write`` keeps the box as a detected peak).
         """
         fit_2d, err = self._run_pygidfit_for_selection(sel, entry, frame)
         if fit_2d is None:
+            if quiet:
+                self.pipeline_panel.append_log(
+                    f"Quick select: pygidfit could not fit this box — {err}"
+                )
+                return None
             QMessageBox.warning(
                 self, "Add to fitted (2D)",
                 f"pygidfit could not fit this box: {err}\n\n"
@@ -1387,7 +1845,7 @@ class PeaksMixin:
         }
 
     def _build_fitted_row_1d(
-        self, sel: SelectedPeak, save_as_ring: bool,
+        self, sel: SelectedPeak, save_as_ring: bool, *, quiet: bool = False,
     ) -> dict | None:
         """Build the row from the profile viewer's cached 1D scipy fits.
 
@@ -1411,23 +1869,28 @@ class PeaksMixin:
         fits = self.profile_viewer.last_fit_params()
         rfit = fits.get("radial")
         afit = fits.get("angular")
+        missing = None
         if rfit is None:
-            QMessageBox.warning(
-                self, "Add to fitted (1D)",
+            missing = (
                 "No radial Gaussian fit is available. Drag the box "
                 "until the pink fit curve appears in the radial "
-                "profile, or switch to '2D fit (pygidfit)' mode.",
+                "profile, or switch to '2D fit (pygidfit)' mode."
             )
-            return None
-        if not save_as_ring and afit is None:
-            QMessageBox.warning(
-                self, "Add to fitted (1D)",
+        elif not save_as_ring and afit is None:
+            missing = (
                 "No angular Gaussian fit is available — required for "
                 "segment peaks in 1D mode. Drag the box until the "
                 "pink fit curve appears in the angular profile, "
                 "check 'Save fitted as ring' if this is a ring, or "
-                "switch to '2D fit (pygidfit)' mode.",
+                "switch to '2D fit (pygidfit)' mode."
             )
+        if missing is not None:
+            if quiet:
+                self.pipeline_panel.append_log(
+                    f"Quick select: no 1D fit for this box — {missing}"
+                )
+            else:
+                QMessageBox.warning(self, "Add to fitted (1D)", missing)
             return None
         fwhm_to_2sigma = 1.0 / float(np.sqrt(2.0 * np.log(2.0)))
         if save_as_ring:
@@ -1453,9 +1916,13 @@ class PeaksMixin:
         one shot, leaving the user unable to delete just the fitted
         prediction without also wiping its detected source). Now:
 
-        * ``sel.kind == "detected"`` → delete only the detected row.
-          Leaves fitted / matched alone.
-        * ``sel.kind == "fitted"`` → delete only the fitted row, then
+        * ``sel.kind == "detected"`` → delete the detected row, plus
+          its fit when the fitted/detected link is on (the fit belongs
+          to the detection; keeping it would leave a prediction with
+          nothing behind it).
+        * ``sel.kind == "fitted"`` → delete only the fitted row — and
+          the detected row too, but only when the user has explicitly
+          asked for that second setting. Then
           reindex ``matched_*`` ``peak_list`` so each surviving
           structure keeps its other peaks (the deleted peak is dropped
           from any structure that referenced it; structures that didn't
@@ -1574,15 +2041,34 @@ class PeaksMixin:
         ids = [int(s.peak_id) for s in on_frame]
         n = len(ids)
         kind_human = "detected" if kind == "detected" else "fitted"
+        # The link pairs a fit with its detected peak by id, so a
+        # delete on one side can take the other with it. Deleting a
+        # detection always takes its fit; the reverse needs the second
+        # setting, which is off by default. With the link off, partner
+        # is None and this is the kind-scoped delete it always was.
+        from mlgidlab import peak_link
+
+        link = peak_link.link_enabled()
+        partner: str | None = None
+        if link and kind == "detected":
+            partner = "fitted"
+        elif kind == "fitted" and peak_link.reverse_delete_enabled():
+            partner = "detected"
+        matched_msg = (
+            "Matched structures that include the deleted peak(s) lose "
+            "just those peaks; structures that don't reference them are "
+            "left unchanged."
+        )
         if kind == "detected":
             siblings_msg = (
-                "Fitted and matched rows stay intact."
+                "The matching fitted peak(s) go too. " + matched_msg
+                if partner else "Fitted and matched rows stay intact."
             )
         else:
             siblings_msg = (
-                "Detected rows stay intact. Matched structures that "
-                "include the deleted peak(s) lose just those peaks; "
-                "structures that don't reference them are left unchanged."
+                "The matching detected peak(s) go too. " + matched_msg
+                if partner
+                else "Detected rows stay intact. " + matched_msg
             )
         target = (
             f"id={ids[0]} on frame {frame}" if n == 1
@@ -1600,16 +2086,29 @@ class PeaksMixin:
             return
 
         removed = 0
+        partner_removed = 0
         snapshot: list[dict] = []
+        partner_snapshot: list[dict] = []
         matched_changed = 0
+        # Whichever side is the fitted one — the kind being deleted or
+        # its partner — needs the matched reindex.
+        fitted_involved = kind == "fitted" or partner == "fitted"
         with self._detached_silx_tree():
             try:
                 # Snapshot full rows (incl. theta/A/B/C for fitted) so
                 # undo can re-create them. Read inside the detached
-                # scope so no handle contends with silx.
+                # scope so no handle contends with silx. Ids come along
+                # when the link is on: a pair restored under fresh ids
+                # would no longer be a pair.
                 snapshot = file_model.read_peak_rows(
                     self.session.temp_path, entry, frame, kind, ids,
+                    with_ids=link,
                 )
+                if partner is not None:
+                    partner_snapshot = file_model.read_peak_rows(
+                        self.session.temp_path, entry, frame, partner, ids,
+                        with_ids=True,
+                    )
                 # matched_* peak_list stores positions into fitted_peaks,
                 # not ids, and deleting compacts the array — capture the
                 # rows' positions BEFORE deleting so matched can be
@@ -1618,14 +2117,20 @@ class PeaksMixin:
                     file_model.fitted_positions_for_ids(
                         self.session.temp_path, entry, frame, ids,
                     )
-                    if kind == "fitted" else []
+                    if fitted_involved else []
                 )
                 for peak_id in ids:
                     removed += file_model.delete_peak_row(
                         self.session.temp_path, entry,
                         frame=frame, kind=kind, peak_id=peak_id,
                     )
-                if kind == "fitted" and removed > 0:
+                if partner is not None:
+                    for peak_id in ids:
+                        partner_removed += file_model.delete_peak_row(
+                            self.session.temp_path, entry,
+                            frame=frame, kind=partner, peak_id=peak_id,
+                        )
+                if fitted_involved and (removed + partner_removed) > 0:
                     # Drop the deleted peaks from any matched structure
                     # that referenced them and shift the surviving
                     # indices down; structures are kept (the old code
@@ -1652,15 +2157,23 @@ class PeaksMixin:
         # off rows that no longer exist); prior undoable ops stay on the
         # stack so a run of deletes remains fully undoable / redoable.
         self.viewer.prune_file_geom_history(frame, kind, ids)
+        if partner is not None:
+            self.viewer.prune_file_geom_history(frame, partner, ids)
         self.viewer.clear_selection()
         self._load_entry_into_viewer(entry, preserve_view=True)
         self._push_delete_undo(
             entry=entry, frame=frame, kind=kind, snapshot=snapshot,
-            cascade_matched=(kind == "fitted"),
+            cascade_matched=fitted_involved,
+            partner_kind=partner, partner_snapshot=partner_snapshot,
+            keep_ids=link,
         )
         msg = (
             f"Deleted {removed} {kind_human} peak(s) on "
             f"{entry}/frame{frame:05d}"
+            + (
+                f" (+{partner_removed} linked {partner} peak(s))"
+                if partner_removed else ""
+            )
             + (
                 f" ({matched_changed} matched structure(s) updated)"
                 if matched_changed else ""
@@ -1669,18 +2182,28 @@ class PeaksMixin:
         self.statusBar().showMessage(msg, 4000)
         self.pipeline_panel.append_log(msg)
 
-    def _readd_peak_row(self, entry: str, frame: int, kind: str, d: dict) -> int:
+    def _readd_peak_row(
+        self, entry: str, frame: int, kind: str, d: dict,
+        peak_id: int | None = None,
+    ) -> int:
         """Re-create one detected/fitted row from a ``read_peak_rows``
-        snapshot dict. Returns the new (freshly-assigned) id."""
+        snapshot dict. Returns the new id — freshly assigned unless
+        ``peak_id`` names one.
+
+        Undo passes the original id whenever the fitted/detected link is
+        on: a restored pair whose ids were re-assigned would no longer
+        be a pair, so the undo would not actually undo."""
         if kind == "detected":
             return file_model.add_detected_peak_row(
                 self.session.temp_path, entry, int(frame),
                 radius=d["radius"], angle=d["angle"],
                 radius_width=d["radius_width"], angle_width=d["angle_width"],
                 score=d.get("score", 0.0), is_ring=d.get("is_ring", False),
+                peak_id=peak_id,
             )
         return file_model.add_fitted_peak_row(
             self.session.temp_path, entry, int(frame),
+            peak_id=peak_id,
             angle=d["angle"], angle_width=d["angle_width"],
             radius=d["radius"], radius_width=d["radius_width"],
             amplitude=d.get("amplitude", 0.0), is_ring=d.get("is_ring", False),
@@ -1694,27 +2217,46 @@ class PeaksMixin:
     def _push_delete_undo(
         self, *, entry: str, frame: int, kind: str,
         snapshot: list[dict], cascade_matched: bool,
+        partner_kind: str | None = None,
+        partner_snapshot: list[dict] | None = None,
+        keep_ids: bool = False,
     ) -> None:
         """Undo / redo for a (single or bulk) detected/fitted delete.
 
-        The delete already happened, so ``undo`` re-adds the rows (fresh
-        ids) and ``redo`` deletes them again. ``state["ids"]`` rotates:
-        populated by ``undo`` with the re-assigned ids so a following
+        The delete already happened, so ``undo`` re-adds the rows and
+        ``redo`` deletes them again. ``state["ids"]`` rotates: populated
+        by ``undo`` with the ids the rows came back under so a following
         ``redo`` deletes the right rows. For fitted, ``redo`` re-applies
         the ``matched_*`` reindex (recomputing the deleted rows'
         positions from the current ids first, since the re-added rows
-        sit at fresh positions); ``undo`` leaves ``matched_*`` as-is —
-        see ``_delete_peaks_scoped``.
+        may sit at fresh positions); ``undo`` leaves ``matched_*`` as-is
+        — see ``_delete_peaks_scoped``.
+
+        ``partner_kind`` / ``partner_snapshot`` carry the other side of
+        a linked delete, restored and re-deleted alongside the first.
+        ``keep_ids`` restores every row under the id it had, which the
+        link requires: a pair that came back under fresh ids would not
+        be a pair, and the undo would not have undone. Without the link
+        both are absent and the fresh-id behaviour is unchanged.
         """
         snap = [dict(d) for d in snapshot]
+        partner_snap = [dict(d) for d in (partner_snapshot or [])]
         state: dict[str, list[int]] = {"ids": []}
 
         def _undo() -> None:
             def write():
                 new_ids: list[int] = []
                 for d in snap:
-                    new_ids.append(
-                        int(self._readd_peak_row(entry, frame, kind, d))
+                    row = dict(d)
+                    peak_id = row.pop("id", None) if keep_ids else None
+                    new_ids.append(int(self._readd_peak_row(
+                        entry, frame, kind, row, peak_id=peak_id,
+                    )))
+                for d in partner_snap:
+                    row = dict(d)
+                    self._readd_peak_row(
+                        entry, frame, partner_kind, row,
+                        peak_id=row.pop("id", None),
                     )
                 return new_ids
 
@@ -1748,6 +2290,12 @@ class PeaksMixin:
                         frame=int(frame), kind=kind,
                         peak_id=int(peak_id),
                     )
+                    if partner_kind is not None:
+                        file_model.delete_peak_row(
+                            self.session.temp_path, entry,
+                            frame=int(frame), kind=partner_kind,
+                            peak_id=int(peak_id),
+                        )
                 if cascade_matched and state["ids"]:
                     file_model.remap_matched_peak_lists(
                         self.session.temp_path, entry, int(frame),
@@ -1798,6 +2346,40 @@ class PeaksMixin:
         index since ``_refresh_peaks_table`` re-reads it from the
         viewer."""
         self._refresh_peaks_table()
+
+    def _on_peaks_selected_from_table(self, sels: list) -> None:
+        """Route a table multi-selection into the image viewer.
+
+        Same stamping as the single-row path — the panel has no viewer
+        context, so it builds every row with ``frame=0``. The list
+        order is the panel's: the row the user touched last comes
+        first and becomes the primary, so the Parameter panel and the
+        resize ROI follow the same peak they would after a Ctrl+click
+        on the image.
+        """
+        if not sels:
+            return
+        for sel in sels:
+            sel.frame = self.viewer.current_frame
+        self.viewer.set_selected_peaks(list(sels))
+
+    def _on_delete_peaks_from_table(self, sels: list) -> None:
+        """Delete pressed in the Peaks dock.
+
+        Hands straight over to the image-side handlers so the two
+        routes cannot diverge: one confirmation dialog, one write
+        path, one undo entry. The bulk handler wants two or more
+        peaks of one kind and the single handler wants exactly one,
+        which is the only reason this splits at all.
+        """
+        if not sels or self._is_busy():
+            return
+        for sel in sels:
+            sel.frame = self.viewer.current_frame
+        if len(sels) == 1:
+            self._on_delete_peak_requested(sels[0])
+        else:
+            self._on_delete_peaks_requested(list(sels))
 
     def _on_peak_selected_from_table(self, sel: SelectedPeak | None) -> None:
         """Route a table-row click back into the image viewer.

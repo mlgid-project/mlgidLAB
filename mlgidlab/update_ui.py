@@ -9,6 +9,7 @@ from PySide6.QtCore import QObject, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QToolButton
 from mlgidlab import update_check
+from mlgidlab import icons, theme_tokens
 
 import logging
 
@@ -91,15 +92,14 @@ class _UpdateBanner(QFrame):
         super().__init__(parent)
         self.setObjectName("UpdateBanner")
         self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setStyleSheet(
-            "#UpdateBanner { background: #2d5a88; }"
-            "#UpdateBanner QLabel { color: #f5f7fa; }"
-        )
         self._url = update_check.RELEASES_PAGE
         row = QHBoxLayout(self)
         row.setContentsMargins(12, 6, 8, 6)
         row.setSpacing(10)
         self._label = QLabel(self)
+        # Named so the skin can colour it; the banner sits on its own
+        # accent ground, so its text cannot use the panel text token.
+        self._label.setObjectName("UpdateBannerText")
         self._label.setWordWrap(True)
         row.addWidget(self._label, 1)
         self._update_btn = QToolButton(self)
@@ -117,7 +117,10 @@ class _UpdateBanner(QFrame):
         )
         row.addWidget(view_btn)
         close_btn = QToolButton(self)
-        close_btn.setText("✕")
+        # The banner sits on its own accent ground, so its glyph
+        # takes the banner's foreground rather than the panel text token.
+        close_btn.setIcon(icons.icon(
+            "close", color=theme_tokens.color("banner_fg")))
         close_btn.setToolTip("Dismiss")
         close_btn.clicked.connect(self.hide)
         row.addWidget(close_btn)

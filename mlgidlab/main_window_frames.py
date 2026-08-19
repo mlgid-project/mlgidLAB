@@ -19,6 +19,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import QApplication, QMessageBox
 from mlgidlab import file_model
+from mlgidlab import icons
 from mlgidlab.browser_widgets import _ImageFileNode
 from mlgidlab.image_viewer import OVERLAY_KINDS
 from mlgidlab.main_window_constants import (
@@ -279,6 +280,10 @@ class FramesMixin:
     def _on_entry_changed(self, entry: str) -> None:
         if not entry or self.session is None:
             return
+        # A pending quick-select box belongs to the entry it was drawn
+        # on. Commit it before the switch, while the entry combo still
+        # names that entry — the commit reads it from there.
+        self.viewer.commit_pending_manual()
         if self.session.kind == "raw":
             self._load_raw_entry_into_viewer(entry)
             self._update_status_entry()
@@ -378,7 +383,7 @@ class FramesMixin:
             interval, step = self._compute_play_schedule()
             self._play_timer.setInterval(interval)
             self._play_step = step
-            self.play_button.setIcon(self._icon_pause)
+            self.play_button.setIcon(icons.icon("pause"))
             self.play_button.setToolTip("Pause playback")
             self._play_timer.start()
             # Activate the background prefetch worker — it'll start
@@ -392,7 +397,7 @@ class FramesMixin:
         else:
             self._play_timer.stop()
             self._play_step = 1
-            self.play_button.setIcon(self._icon_play)
+            self.play_button.setIcon(icons.icon("play"))
             self.play_button.setToolTip(
                 "Play frames from the current position to the end.\n"
                 "Stops at the last frame; click again to pause."

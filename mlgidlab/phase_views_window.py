@@ -65,6 +65,7 @@ from mlgidlab.phase_tracking import (
     smooth_normalize_amplitude,
 )
 from mlgidlab.widgets import make_debounced_timer
+from mlgidlab.widgets import PRIMARY as _PRIMARY, set_variant as _set_variant
 from mlgidlab.workers import RoiTraceWorker, ScanProfileWorker, stop_worker_thread
 
 logger = logging.getLogger(__name__)
@@ -308,7 +309,8 @@ class PhaseViewsWindow(QMainWindow):
         for spin in (self.qmap_lo, self.qmap_hi):
             spin.setRange(0, 0)
             controls.addWidget(spin)
-        self.btn_mean_image = QPushButton("Compute mean image", tab)
+        self.btn_mean_image = _set_variant(
+            QPushButton("Compute mean image", tab), _PRIMARY)
         self.btn_mean_image.setToolTip(
             "Average the Cartesian frames in the chosen window "
             "(nan-aware) and draw it under the trajectories."
@@ -508,7 +510,8 @@ class PhaseViewsWindow(QMainWindow):
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
         controls = self._controls_row()
-        self.btn_waterfall = QPushButton("Compute waterfall", tab)
+        self.btn_waterfall = _set_variant(
+            QPushButton("Compute waterfall", tab), _PRIMARY)
         self.btn_waterfall.setToolTip(
             "Resample every frame to polar and stack the angular-mean "
             "radial profiles into a frame × |q| heatmap. Independent "

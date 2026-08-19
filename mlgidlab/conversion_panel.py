@@ -70,6 +70,9 @@ from mlgidlab.conversion_config import (
 )
 from mlgidlab.widgets import CollapsibleSection as _CollapsibleSection
 from mlgidlab.widgets import make_form as _make_form
+from mlgidlab.widgets import skin_item_view as _skin_item_view
+from mlgidlab.widgets import section_label as _section_label
+from mlgidlab.widgets import DANGER as _DANGER, PRIMARY as _PRIMARY, set_variant as _set_variant
 
 
 
@@ -477,7 +480,7 @@ class ConversionPanel(QWidget):
         button_layout = QVBoxLayout(button_row)
         button_layout.setContentsMargins(8, 4, 8, 8)
         button_layout.setSpacing(0)
-        self.btn_convert = QPushButton("Convert")
+        self.btn_convert = _set_variant(QPushButton("Convert"), _PRIMARY)
         self.btn_convert.setEnabled(False)
         self.btn_convert.clicked.connect(self._on_convert_clicked)
         button_layout.addWidget(self.btn_convert)
@@ -975,7 +978,7 @@ class ConversionPanel(QWidget):
     def _build_metadata_section(self) -> _CollapsibleSection:
         section = _CollapsibleSection("Metadata", expanded=False)
 
-        smpl_label = QLabel("<b>Sample metadata</b> (YAML)")
+        smpl_label = _section_label("Sample metadata (YAML)")
         section.body_layout.addWidget(smpl_label)
 
         smpl_buttons = QHBoxLayout()
@@ -1003,10 +1006,10 @@ class ConversionPanel(QWidget):
         section.body_layout.addWidget(self.smpl_yaml)
 
         section.body_layout.addSpacing(8)
-        exp_label = QLabel("<b>Experimental metadata</b>")
+        exp_label = _section_label("Experimental metadata")
         section.body_layout.addWidget(exp_label)
 
-        self.exp_meta_table = QTableWidget(0, 3)
+        self.exp_meta_table = _skin_item_view(QTableWidget(0, 3))
         self.exp_meta_table.setHorizontalHeaderLabels(["Key", "Value", "Source"])
         self.exp_meta_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.Stretch
@@ -1028,7 +1031,7 @@ class ConversionPanel(QWidget):
         # Wired in Step 6 — opens a dataset picker rooted at the active
         # raw file's tree.
         from_hdf5_btn.clicked.connect(self._add_meta_from_hdf5)
-        del_btn = QPushButton("Remove")
+        del_btn = _set_variant(QPushButton("Remove"), _DANGER)
         del_btn.clicked.connect(self._remove_meta_row)
         meta_buttons.addWidget(add_btn)
         meta_buttons.addWidget(from_hdf5_btn)

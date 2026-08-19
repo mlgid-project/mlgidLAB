@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlgidlab"
-version = "0.1.0a16"
+version = "0.1.0a17"
 description = "mlgidLAB: graphical interface for the mlgidBASE GIWAXS analysis pipeline"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -117,3 +117,10 @@ markers = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["mlgidlab*"]
+
+# `packages.find` finds packages, it does not ship data files. Without
+# this stanza the SVG glyphs are missing from the wheel and every icon
+# silently falls back to nothing — tests/test_icons.py checks the assets
+# are importable so a broken wheel fails CI rather than a user's install.
+[tool.setuptools.package-data]
+mlgidlab = ["assets/icons/*.svg", "assets/app/*.png", "assets/app/*.ico"]

@@ -7,6 +7,8 @@ os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
 
 import numpy as np
 import pyqtgraph as pg
+
+from mlgidlab import theme_tokens
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QCheckBox, QFrame, QHBoxLayout, QVBoxLayout, QWidget
@@ -108,7 +110,8 @@ class ProfileViewer(QWidget):
         layout.setSpacing(4)
         outer.addLayout(layout, 1)
 
-        pen = pg.mkPen(PROFILE_PEN_COLOR, width=PROFILE_PEN_WIDTH)
+        pen = pg.mkPen(theme_tokens.color("profile_curve"),
+                       width=PROFILE_PEN_WIDTH)
         region_pen = pg.mkPen(REGION_COLOR, width=1.5)
         region_pen.setCosmetic(True)
         region_brush = pg.mkBrush(QColor(*_hex_to_rgb(REGION_COLOR), REGION_BRUSH_ALPHA))
@@ -232,6 +235,17 @@ class ProfileViewer(QWidget):
         switch (pyqtgraph bakes colours in at creation, so an explicit
         push is needed for the already-built plots)."""
         pen = pg.mkPen(foreground)
+        # The data curves are the reason this matters: a #e8e8e8 trace on
+        # the light theme's #fafafa ground is invisible.
+        curve_pen = pg.mkPen(theme_tokens.color("profile_curve"),
+                             width=PROFILE_PEN_WIDTH)
+        for curve in (getattr(self, "_radial_curve", None),
+                      getattr(self, "_angular_curve", None)):
+            if curve is not None:
+                try:
+                    curve.setPen(curve_pen)
+                except Exception:
+                    pass
         for plot in (self._radial_plot, self._angular_plot):
             try:
                 plot.setBackground(background)

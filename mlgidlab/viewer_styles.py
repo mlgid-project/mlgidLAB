@@ -8,6 +8,7 @@ import json
 
 import numpy as np
 from PySide6.QtCore import QSettings, Qt
+from mlgidlab import theme_tokens
 
 
 OVERLAY_KINDS = ("detected", "fitted", "manual")
@@ -40,7 +41,37 @@ OVERLAY_STYLE: dict[str, dict] = {
     "manual":   {"color": "#ffeb3b", "style": Qt.PenStyle.SolidLine, "width": 1.6},
 }
 
-SELECTION_STYLE = {"color": "#ffffff", "style": Qt.PenStyle.SolidLine, "width": 2.5}
+SELECTION_STYLE = {"color": "#ffffff", "style": Qt.PenStyle.SolidLine, "width": 3.0}
+
+
+def selection_style(theme: str | None = None) -> dict:
+    """``SELECTION_STYLE`` with a colour visible on this theme's plot.
+
+    The constant keeps its dark value so every existing import still
+    resolves; only the colour is swapped, because a white highlight on
+    the light theme's #fafafa plot ground is invisible.
+    """
+    return {**SELECTION_STYLE,
+            "color": theme_tokens.color("overlay_selection", theme)}
+
+# Pre-selection preview: the box a bare click would take, outlined
+# while the cursor is over it. Solid, opaque and wider than every
+# overlay pen (1.2 detected / fitted, 1.6 manual / matched), so it
+# *covers* the box underneath instead of blending with it — a
+# translucent preview over the dashed red detection read as pink, and
+# looked different on every overlay kind. The accent colour rather than
+# the selection white, so "under the cursor" and "selected" stay
+# distinguishable at a glance.
+HOVER_STYLE = {"color": "#fc8961",
+               "style": Qt.PenStyle.SolidLine,
+               "width": 2.6}
+HOVER_OPACITY = 1.0
+
+
+def hover_style(theme: str | None = None) -> dict:
+    """``HOVER_STYLE`` with this theme's accent."""
+    return {**HOVER_STYLE, "color": theme_tokens.color("accent", theme)}
+
 
 # Faint preview of the would-be fitted_peaks box for the currently selected
 # manual peak. Same hue as the fitted overlay so the user reads the
@@ -125,6 +156,16 @@ _SIM_STATE_COLORS = {
     "explained": SIM_EXPLAINED_COLOR,
     "selected": SIM_SELECTED_COLOR,
 }
+
+
+def sim_state_colors(theme: str | None = None) -> dict:
+    """``_SIM_STATE_COLORS`` with a theme-visible "selected" entry.
+
+    Missed (orange) and explained (green) read on both grounds and are
+    left alone; only the white selection highlight needs flipping.
+    """
+    return {**_SIM_STATE_COLORS,
+            "selected": theme_tokens.color("sim_selected", theme)}
 SIM_OVERLAY_OPACITY = 0.55
 # Marker diameter encodes relative simulated intensity, log-scaled
 # across three decades (rel=1 -> MAX, rel<=1e-3 -> MIN).
@@ -190,3 +231,47 @@ def _save_matched_color_overrides(overrides: dict[tuple, str]) -> None:
 # is a transitive dep via silx.
 COLORMAPS = ("viridis", "inferno", "plasma", "magma", "cividis", "gray")
 DEFAULT_COLORMAP = "magma"
+
+
+def resolve_colormap(name: str):
+    """The pyqtgraph ``ColorMap`` for ``name``, or None.
+
+    matplotlib first (always present via silx), then pyqtgraph's own
+    registry for anything matplotlib does not know. Shared by the render
+    path and the dropdown swatches so the strip cannot advertise a ramp
+    the image does not use.
+    """
+    import pyqtgraph as pg
+
+    for source in ("matplotlib", None):
+        try:
+            return (pg.colormap.get(name, source=source) if source
+                    else pg.colormap.get(name))
+        except Exception:
+            continue
+    return None
+
+
+def colormap_swatch(name: str, size: int = 32):
+    """A square gradient chip for ``name`` as a QPixmap (null if unknown).
+
+    The dropdown used to list six words; a GIWAXS user picks a colormap
+    by how it ramps, not by its name.
+
+    Square on purpose. A wide strip is the nicer picture, but Qt sizes
+    item icons from a single length — ``iconSize`` and the QSS
+    ``icon-size`` property are both one number — so a 56x12 strip is
+    either squeezed to the style's 16 px box or forces 58 px rows. A
+    square chip renders correctly at whatever size the style asks for.
+    """
+    from PySide6.QtGui import QColor, QImage, QPixmap
+
+    cmap = resolve_colormap(name)
+    if cmap is None:
+        return QPixmap()
+    lut = cmap.getLookupTable(nPts=size, alpha=False)
+    strip = QImage(size, 1, QImage.Format.Format_RGB32)
+    for x in range(size):
+        r, g, b = (int(v) for v in lut[x][:3])
+        strip.setPixelColor(x, 0, QColor(r, g, b))
+    return QPixmap.fromImage(strip).scaled(size, size)

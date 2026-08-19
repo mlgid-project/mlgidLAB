@@ -25,6 +25,7 @@ from mlgidlab.viewer_styles import (
     UNMATCHED_KEY,
     UNMATCHED_UID,
     _SIM_STATE_COLORS,
+    sim_state_colors,
     _save_matched_color_overrides,
     _sim_intensity_scale,
     _sim_marker_size,
@@ -435,7 +436,7 @@ class ViewerOverlaysMixin:
         the spots, one dashed curve per ring (state-coloured)."""
         items: list = []
         polar = self._mode == MODE_POLAR
-        for state, color in _SIM_STATE_COLORS.items():
+        for state, color in sim_state_colors().items():
             spots = [
                 r for r, s in zip(reflections, states)
                 if s == state and not r.is_ring
@@ -467,7 +468,7 @@ class ViewerOverlaysMixin:
             selected = state == "selected"
             width = 1.0 + 1.5 * _sim_intensity_scale(r.rel_intensity)
             pen = pg.mkPen(
-                QColor(_SIM_STATE_COLORS[state]),
+                QColor(sim_state_colors()[state]),
                 width=width + (1.0 if selected else 0.0),
                 style=Qt.PenStyle.DashLine,
             )
@@ -496,7 +497,7 @@ class ViewerOverlaysMixin:
         rw, aw = simulation_pattern.default_box_size(tables.get("fitted"))
         extent = self.angular_extent()
         items: list = []
-        for state, color in _SIM_STATE_COLORS.items():
+        for state, color in sim_state_colors().items():
             rows = [
                 r for r, s in zip(reflections, states) if s == state
             ]
@@ -755,6 +756,11 @@ class ViewerOverlaysMixin:
         else:
             self._radio_cart.setChecked(True)
         self._sync_roi()  # ROI exists only in polar mode
+        # The remembered cursor point is in the space we just left
+        # (polar is (r, angle), Cartesian is (q_xy, q_z)), so re-running
+        # the hover on it would outline nonsense. The next mouse move
+        # re-establishes it.
+        self._clear_hover()
         self._render_active_mode()
 
     @property
@@ -767,6 +773,7 @@ class ViewerOverlaysMixin:
         self._fitted.clear_path()
         self._manual.clear_path()
         self._selection.clear_path()
+        self._clear_hover()
         self._fitted_preview.clear_path()
         self._fitted_preview_geom = None
         self._fitted_preview_extras_geoms = []

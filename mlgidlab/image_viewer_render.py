@@ -28,6 +28,7 @@ from mlgidlab.viewer_styles import (
     MODE_RAW,
     UNMATCHED_COLOR,
     UNMATCHED_UID,
+    resolve_colormap,
 )
 
 import logging
@@ -537,6 +538,9 @@ class ViewerRenderMixin:
 
         # Matched overlays: rebuild items for whatever the current frame has.
         self._render_matched_overlays(frame)
+        # The hover outline is drawn outside this path (per mouse move),
+        # so re-point it at whatever now sits under a stationary cursor.
+        self._refresh_hover()
         # Simulated "expected pattern" overlay (frame-independent data,
         # but rebuilt here so it follows every mode/stack transition).
         self._render_simulation_overlays(frame)
@@ -644,27 +648,26 @@ class ViewerRenderMixin:
         self._apply_cmap(name)
 
     def _apply_cmap(self, name: str) -> None:
-        # Try matplotlib first (always present via silx); fall back to the
-        # internal pyqtgraph maps if the user picked something not in mpl.
-        cmap = None
-        for source in ("matplotlib", None):
-            try:
-                cmap = pg.colormap.get(name, source=source) if source else pg.colormap.get(name)
-            except Exception:
-                logger.debug("suppressed exception in GIWAXSImageViewer._apply_cmap", exc_info=True)
-                cmap = None
-            if cmap is not None:
-                break
+        # One resolver, shared with the dropdown's gradient swatches, so
+        # the strip cannot advertise a ramp the image does not use.
+        cmap = resolve_colormap(name)
         if cmap is not None:
             self._view.setColorMap(cmap)
 
     # -- Cursor readout (status bar) --
 
     def _on_cursor_pos(self, pt: QPointF) -> None:
+        # Hover first: it both draws the pre-selection outline and
+        # reports how many boxes are stacked here, which the status bar
+        # shows so the user knows a second click has somewhere to go.
+        depth = self._update_hover(float(pt.x()), float(pt.y()))
         info = self._compute_cursor_info(pt)
+        if info is not None and depth > 1:
+            info["overlapping"] = depth
         self.cursorMoved.emit(info)
 
     def _on_cursor_left(self) -> None:
+        self._clear_hover()
         self.cursorMoved.emit(None)
 
     def _compute_cursor_info(self, pt: QPointF) -> dict | None:

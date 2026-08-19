@@ -41,6 +41,9 @@ from mlgidlab.peaks_table_panel import (
     _text_item,
 )
 from mlgidlab.phase_tracking import TrackingPayload, member_ids  # noqa: F401 (member_ids re-exported for the host)
+from mlgidlab.widgets import PRIMARY as _PRIMARY, set_variant as _set_variant
+from mlgidlab.widgets import skin_item_view as _skin_item_view
+from mlgidlab.widgets import attach_empty_hint as _attach_empty_hint
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +85,8 @@ class ScanTrackingPanel(QWidget):
         controls = QHBoxLayout()
         controls.setSpacing(6)
 
-        self.btn_track = QPushButton("Track peaks (mlgidBASE)", self)
+        self.btn_track = _set_variant(
+            QPushButton("Track peaks (mlgidBASE)", self), _PRIMARY)
         self.btn_track.setToolTip(
             "Run mlgidBASE's peak tracking on the active entry: fitted "
             "peaks of every frame are linked into tracks by IoU graph "
@@ -199,14 +203,15 @@ class ScanTrackingPanel(QWidget):
             QTableView.SelectionMode.SingleSelection
         )
         self._table.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
-        self._table.setAlternatingRowColors(True)
+        _skin_item_view(self._table)
+        _attach_empty_hint(
+            self._table,
+            "No tracks yet.\nRun \"Track peaks\" to follow peaks across "
+            "the frames of this scan."
+        )
         self._table.verticalHeader().setVisible(False)
         self._table.horizontalHeader().setStretchLastSection(False)
         self._table.horizontalHeader().setMinimumSectionSize(18)
-        self._table.setStyleSheet(
-            "QTableView::item { padding: 1px 3px; }"
-            " QHeaderView::section { padding: 1px 3px; }"
-        )
         self._table.selectionModel().currentRowChanged.connect(
             self._on_row_changed
         )

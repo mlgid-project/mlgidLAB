@@ -1,5 +1,9 @@
 # mlgidLAB
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mlgid-project/mlgidLAB/main/docs/images/mlgid_logo_mlgidlab.png" width="400" alt="mlgidLAB">
+</p>
+
 A desktop GUI for the
 [mlgidBASE](https://github.com/mlgid-project/mlgidBASE) GIWAXS analysis
 pipeline. It drives the full
@@ -8,12 +12,12 @@ window: convert raw detector images to NeXus, then **detect / fit /
 match**, **review and edit** peaks, and **export** — same algorithms,
 visual control.
 
-> **Alpha (`v0.1.0a16`).** The detect → fit → match → edit loop works end-to-end; expect
+> **Alpha (`v0.1.0a17`).** The detect → fit → match → edit loop works end-to-end; expect
 > rough edges and report issues. See [`CHANGELOG.md`](CHANGELOG.md) for
 > highlights.
 
-A short walktrough: raw detector image to reciprocal space, then ML analysis pipeline (detect, fit, match).
-<video src="https://github.com/user-attachments/assets/8f4bd640-8166-4d55-af1a-60055fc953c8" controls muted width="100%"></video>
+A short walkthrough: raw detector image to reciprocal space, then the ML analysis pipeline (detect, fit, match).
+<video src="https://github.com/mlgid-project/mlgidLAB/releases/latest/download/mlgidlab_demo_combined_1080p.mp4" controls muted width="100%"></video>
 
 ## Install & launch
 
@@ -27,7 +31,7 @@ conda create -n mlgidlab python=3.12 -y
 conda activate mlgidlab
 
 # full pipeline (detection / fitting / matching + raw conversion)
-pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a16"
+pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a17"
 mlgidlab
 ```
 
@@ -49,13 +53,19 @@ install, a first-file walkthrough, and shortcuts are in
 - **Detect / fit / match** from the Pipeline dock (every mlgidBASE
   parameter exposed), at frame / entry / all-entries scope.
 - **Edit peaks**: manual boxes, Add-to-fitted (2D pygidfit or 1D);
-  multi-select detected *or* fitted (`Ctrl+click`, `Ctrl+A`);
-  copy/paste detected (`Ctrl+C` / `Ctrl+V`, `Ctrl+Shift+V` for a frame
-  range); batch 2D fit; bulk delete; full undo/redo (`Ctrl+Z` /
-  `Ctrl+Shift+Z`).
+  multi-select detected *or* fitted (`Ctrl+click`, `Ctrl+A`), on the
+  image or in the tables; copy/paste detected (`Ctrl+C` / `Ctrl+V`,
+  `Ctrl+Shift+V` for a frame range); batch 2D fit; bulk delete; full
+  undo/redo (`Ctrl+Z` / `Ctrl+Shift+Z`).
+- **Label fast**: *Quick select* commits each hand-drawn box as you
+  draw the next one, as a detected peak, a fitted one, or both. Each
+  fit is stored under its detected peak's id, so a peak has one fit and
+  deleting the detection takes the fit with it (both switchable in
+  Settings).
 - **Inspect**: sortable Detected / Fitted / Matched tables with
   click-sync to the image; live radial + angular profile fits; overlay
-  filters.
+  filters; a workflow rail above the image showing what each pipeline
+  stage has produced for the current frame.
 - **Export** figures (matplotlib) and peaks as CSV.
 
 ## Documentation

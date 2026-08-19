@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QMessageBox,
     QSpinBox,
+    QTabBar,
 )
 from mlgidlab import file_model
 from mlgidlab.image_viewer import SelectedPeak
@@ -24,6 +25,7 @@ from mlgidlab.main_window_dialogs import (
     _ExportPeaksDialog,
     _SettingsDialog,
 )
+from mlgidlab.main_window_build import _dirty_dot
 from mlgidlab.session import NexusSession
 from pathlib import Path
 
@@ -335,6 +337,11 @@ class MenusMixin:
         Cascade rule (one-way):
         - clearing ``fitted`` also clears ``matched`` (matched rows
           reference fitted ids; orphaned matched_* groups can't render).
+        - clearing ``detected`` also clears fitted (and so matched)
+          while the fitted/detected link is on — a fit belongs to its
+          detection, and clearing every detection on a scope would
+          otherwise leave every fit behind with nothing behind it. With
+          the link off, detected clears alone, as it always did.
         - clearing ``matched`` clears matched only; detected and fitted
           are left intact (re-match without re-fitting). See the
           Tools-menu wiring above.
@@ -358,12 +365,17 @@ class MenusMixin:
             return
         targets, scope_label = resolved
 
-        if not self._confirm_clear(kind, scope_label):
+        from mlgidlab.peak_link import link_enabled
+
+        linked = kind == "detected" and link_enabled()
+        if not self._confirm_clear(kind, scope_label, linked=linked):
             return
 
         kinds_to_clear = [kind]
-        if kind == "fitted":
+        if kind == "fitted" or linked:
             kinds_to_clear.append("matched")
+        if linked:
+            kinds_to_clear.insert(1, "fitted")
 
         with self._detached_silx_tree():
             try:
@@ -585,10 +597,24 @@ class MenusMixin:
             f"Exported {n} {kind} peak rows ({scope}) to {path}"
         )
 
-    def _confirm_clear(self, kind: str, scope_label: str = "") -> bool:
+    def _confirm_clear(
+        self, kind: str, scope_label: str = "", linked: bool = False,
+    ) -> bool:
+        """Confirm a clear, naming exactly what it will remove.
+
+        ``linked`` says the fitted/detected link will widen a detected
+        clear to fitted (and so matched) — the dialog has to say so
+        before anything goes, since no clear is undoable.
+        """
         descriptions = {
-            "detected": ("detected peaks",
-                         "every row of detected_peaks"),
+            "detected": (
+                ("detected + fitted + matched peaks",
+                 "every row of detected_peaks AND fitted_peaks AND every "
+                 "matched_* solution (each fit belongs to the detected "
+                 "peak it came from, and matched references fitted)")
+                if linked else
+                ("detected peaks", "every row of detected_peaks")
+            ),
             "fitted":   ("fitted + matched peaks",
                          "every row of fitted_peaks AND every matched_* "
                          "solution (matched references fitted, so it has "
@@ -760,6 +786,31 @@ class MenusMixin:
                     w.update()
                 except Exception:
                     logger.debug("suppressed exception repolishing widget", exc_info=True)
+        # Repaint the SVG icons. A QIcon is a value, so the widgets
+        # holding one keep the old colour until it is re-set; icons.bind
+        # recorded them, and this walks that registry rather than every
+        # widget in the app.
+        try:
+            from mlgidlab import icons
+            icons.retheme(theme)
+            # The wordmark is a coloured asset with a per-theme variant,
+            # not a recolourable glyph, so it is swapped rather than
+            # retinted.
+            view = getattr(self, "welcome_view", None)
+            if view is not None:
+                view.set_theme(theme)
+            # Same for the status bar's unsaved-changes dot: it is a
+            # pixmap painted in the accent, so it has to be repainted
+            # rather than restyled.
+            dot = getattr(self, "_sb_dirty", None)
+            if dot is not None:
+                dot.setPixmap(_dirty_dot())
+            # Dock tab icons are not in that registry: Qt owns those
+            # QTabBars and only reads a dock's windowIcon when it builds
+            # the tab, so they have to be re-pushed by hand.
+            self._apply_dock_tab_icons()
+        except Exception:
+            logger.debug("suppressed exception rethemeing icons", exc_info=True)
         # Recolour the live pyqtgraph plots (config options only affect
         # newly-created items, so existing axes/backgrounds need an
         # explicit push).
@@ -829,13 +880,15 @@ class MenusMixin:
         Settings in cross-platform apps.
         """
         settings_menu = self.menuBar().addMenu("&Settings")
+        # Attribute name kept: it is the key this action's icon is
+        # registered under in ``_MENU_ICONS``.
         self.action_playback_settings = QAction(
-            "&Playback settings…", self
+            "&Settings…", self
         )
         self.action_playback_settings.setToolTip(
-            "Configure how the Display-dock Play button drives frame "
-            "advance — either fixed time per frame or fixed total "
-            "duration regardless of frame count."
+            "Application settings: how the Display-dock Play button "
+            "drives frame advance, and whether each fitted peak is "
+            "linked to the detected peak it came from."
         )
         self.action_playback_settings.triggered.connect(
             self._action_playback_settings
@@ -843,13 +896,16 @@ class MenusMixin:
         settings_menu.addAction(self.action_playback_settings)
 
     def _action_playback_settings(self) -> None:
-        """Open the playback-settings dialog.
+        """Open the application settings dialog.
 
         On accept, persist the dialog's values via QSettings and, if
         the play timer is currently running, re-apply the new
         interval mid-flight so the change is felt immediately. The
         next press of Play also re-reads via ``_compute_play_schedule``
         so a setting change applied while paused still takes effect.
+
+        The peak-link settings need no re-apply: every consumer reads
+        them at the moment it acts (see ``mlgidlab.peak_link``).
         """
         dlg = _SettingsDialog(self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -988,6 +1044,110 @@ class MenusMixin:
         )
         self.viewer._set_selected(sel)
 
+    # Menu action -> shipped glyph. Applied in one pass after the menus
+    # are built rather than at each construction site: the actions live
+    # in three modules, and a single table is what makes it obvious which
+    # entries deliberately have no icon (the clear/reset scope submenus,
+    # where an icon per scope would be noise).
+    _MENU_ICONS = {
+        "action_open": "file-open",
+        "action_import_converted": "file-open",
+        "action_save": "save",
+        "action_save_as": "save-as",
+        "action_close_file": "file-close",
+        "action_exit": "exit",
+        "action_undo": "undo",
+        "action_redo": "redo",
+        "action_copy_peaks": "export-csv",
+        "action_find_peak": "find-peak",
+        "action_reset_all": "reset-peaks",
+        "action_export_figure": "export-figure",
+        "action_export_csv": "export-csv",
+        "action_toggle_cursor_readout": "cursor-readout",
+        "action_reset_layout": "reset-layout",
+        "action_fullscreen": "fullscreen",
+        "action_theme_dark": "theme-dark",
+        "action_theme_light": "theme-light",
+        "action_playback_settings": "playback-settings",
+        "action_controls": "help-controls",
+        "action_about": "about",
+        "action_copy_diagnostics": "copy-diagnostics",
+    }
+
+    #: Dock toggle actions carry the dock's own glyph, so the View menu
+    #: reads as a list of places rather than a list of checkboxes.
+    _DOCK_ICONS = {
+        "_tree_dock": "dock-tree",
+        "_display_dock": "dock-display",
+        "_pipeline_dock": "dock-pipeline",
+        "_conversion_dock": "dock-conversion",
+        "_logs_dock": "dock-logs",
+        "_profile_dock": "dock-profiles",
+        "_peaks_dock": "dock-peaks",
+        "_sim_dock": "dock-expected",
+        "_scan_tracking_dock": "dock-tracking",
+    }
+
+    def _apply_menu_icons(self) -> None:
+        """Give every mapped menu action its glyph.
+
+        ``icons.bind`` registers each action, so View -> Theme repaints
+        them all; an unmapped or missing glyph simply leaves the entry
+        text-only.
+        """
+        from mlgidlab import icons
+
+        for attr, glyph in self._MENU_ICONS.items():
+            action = getattr(self, attr, None)
+            if action is not None:
+                icons.bind(action, glyph)
+        recent = getattr(self, "_recent_menu", None)
+        if recent is not None:
+            icons.bind(recent.menuAction(), "file-recent")
+        for attr, glyph in self._DOCK_ICONS.items():
+            dock = getattr(self, attr, None)
+            if dock is not None:
+                icons.bind(dock.toggleViewAction(), glyph)
+        self._apply_dock_tab_icons()
+
+    def _apply_dock_tab_icons(self) -> None:
+        """Put each dock's glyph on its tab in the tabified rows.
+
+        Both tab rows ("Display | Pipeline | Expected pattern | Logs" and
+        "Profiles | Peaks | Scan tracking") are text-only otherwise, which
+        makes the docks easy to miss.
+
+        Qt copies a ``QDockWidget``'s ``windowIcon`` onto its tab only
+        when that tab is *created*, so a later ``setWindowIcon`` — from a
+        theme flip, or from this call, which runs long after the docks
+        are built — never reaches an existing tab. The glyph is therefore
+        pushed onto the ``QTabBar`` directly, keyed by tab text (which is
+        the dock's ``windowTitle``). Widgets whose tab text is not a dock
+        title, notably the central Image/Data pair, are left alone.
+
+        Cheap and idempotent, so it is safe to re-run whenever the tab
+        set changes: a mode switch re-tabifies, and ``restoreState``
+        rebuilds the bars outright.
+        """
+        from mlgidlab import icons
+
+        wanted = {}
+        for attr, glyph in self._DOCK_ICONS.items():
+            dock = getattr(self, attr, None)
+            if dock is None:
+                continue
+            glyph_icon = icons.icon(glyph)
+            if glyph_icon.isNull():
+                continue
+            # Also on the dock itself, for when it is floated out.
+            dock.setWindowIcon(glyph_icon)
+            wanted[dock.windowTitle()] = glyph_icon
+        for bar in self.findChildren(QTabBar):
+            for index in range(bar.count()):
+                glyph_icon = wanted.get(bar.tabText(index))
+                if glyph_icon is not None:
+                    bar.setTabIcon(index, glyph_icon)
+
     def _build_file_menu(self, file_menu) -> None:
 
         # Single Open action — file content is auto-classified as
@@ -1039,7 +1199,7 @@ class MenusMixin:
 
         file_menu.addSeparator()
 
-        action_exit = QAction("E&xit", self)
+        self.action_exit = action_exit = QAction("E&xit", self)
         action_exit.setShortcut(QKeySequence.StandardKey.Quit)
         action_exit.triggered.connect(self.close)
         file_menu.addAction(action_exit)

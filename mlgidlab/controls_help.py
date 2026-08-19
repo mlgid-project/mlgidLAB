@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import html
 
+from mlgidlab import theme_tokens
+
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -111,12 +113,18 @@ CONTROL_SECTIONS: tuple[Section, ...] = (
     )),
     ("Manual peak workflow", (
         (("Ctrl+Alt-drag",), "mouse",
-         "Draw a manual peak rectangle (works in polar and Cartesian "
-         "mode)."),
+         "Draw a manual peak rectangle (polar mode only)."),
         (("Add to detected / Add to fitted",), "ui",
          "Commit the box as a detected peak, or 1D-Gaussian-fit it into "
          "fitted. Tick <b>Save fitted as ring</b> first to widen the "
          "angular extent to the full sweep (ring peaks only)."),
+        (("Quick select",), "ui",
+         "Label without leaving the image: drawing the next box commits "
+         "the previous one as the kind chosen beside the checkbox. A box "
+         "drawn on top of the pending one replaces it instead — that is "
+         "how you correct an attempt. The last box commits when you "
+         "click away, press <b>Enter</b>, change frame or turn the mode "
+         "off."),
         (("Esc",), "key",
          "Delete the selected <b>manual</b> peak (in-memory, no "
          "confirmation; Ctrl+Z restores)."),
@@ -164,23 +172,27 @@ CONTROL_SECTIONS: tuple[Section, ...] = (
 # Hand-picked to sit with the qdarkstyle chrome (#19232d/#dfe1e2 dark,
 # #fafafa/#000000 light). Qt rich text cannot read the app palette, so
 # the renderer bakes these in and the dialog re-renders on theme flips.
+def _palette(theme: str) -> dict[str, str]:
+    """The rich-text colours for ``theme``, read from the design tokens.
+
+    Qt rich text cannot resolve the app palette, so the renderer bakes
+    hexes into the HTML and re-renders on a theme flip. Those hexes used
+    to be a literal table here; they now come from ``theme_tokens`` so
+    this dialog cannot drift away from the rest of the chrome.
+    """
+    t = theme_tokens.tokens(theme)
+    return {
+        "band_bg": t["band_bg"],
+        "band_fg": t["band_fg"],
+        "badge_bg": t["badge_bg"],
+        "badge_fg": t["badge_fg"],
+        "text_fg": t["text"],
+        "muted_fg": t["text_muted"],
+    }
+
+
 _COLORS: dict[str, dict[str, str]] = {
-    "dark": {
-        "band_bg": "#22303f",
-        "band_fg": "#7fb3dd",
-        "badge_bg": "#2e4157",
-        "badge_fg": "#eaf2fa",
-        "text_fg": "#dfe1e2",
-        "muted_fg": "#93a1ad",
-    },
-    "light": {
-        "band_bg": "#e8edf2",
-        "band_fg": "#1c5d99",
-        "badge_bg": "#dde4ea",
-        "badge_fg": "#19232d",
-        "text_fg": "#1a1a1a",
-        "muted_fg": "#5c6770",
-    },
+    theme: _palette(theme) for theme in ("dark", "light")
 }
 
 

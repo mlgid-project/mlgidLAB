@@ -6,11 +6,22 @@ source split.
 """
 from __future__ import annotations
 
+import math
+import time
+
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor
+from PySide6.QtWidgets import QApplication
+
+from mlgidlab import peak_picking
 from mlgidlab.file_model import PeakTable, _LazyPolarStack
+from mlgidlab.peak_picking import (
+    HIT_TOL_PX,
+    RING_EDGE_TOL_FALLBACK,
+    RING_EDGE_TOL_PX,
+)
 from mlgidlab.polar import polar_to_qxyz
 from mlgidlab.viewer_items import (
     FileGeomAction,
@@ -20,17 +31,47 @@ from mlgidlab.viewer_items import (
     ManualRemoveAction,
     ManualReplaceAction,
     SelectedPeak,
-    _cart_box_contains,
-    _cart_table_row_contains,
-    _polar_box_contains,
-    _polar_table_row_contains,
+    _box_of,
+    _box_of_row,
+    _cart_to_polar,
+    _peaks_from_manual,
 )
 from mlgidlab.viewer_styles import (
     MODE_CARTESIAN,
     MODE_POLAR,
     MODE_RAW,
     SELECTION_STYLE,
+    selection_style,
 )
+
+
+def _double_click_ms() -> float:
+    """The platform's double-click interval, in milliseconds.
+
+    Read live rather than cached: it is a desktop setting the user can
+    change while the app runs, and the fallback keeps the picker working
+    in a headless test where no QApplication exists yet.
+    """
+    app = QApplication.instance()
+    return float(app.doubleClickInterval()) if app is not None else 400.0
+
+
+def _boxes_overlap(a: ManualPeak, b: ManualPeak) -> bool:
+    """True when two hand-drawn boxes describe the same peak.
+
+    Quick select commits the pending box when the next one is drawn
+    *somewhere else*; a box drawn on top of the pending one is the user
+    correcting an attempt they were not happy with, and must replace it
+    silently. The test is the same one the fitted/detected link uses for
+    "the same peak under another name": either centre inside the other
+    box.
+    """
+    def inside(inner: ManualPeak, outer: ManualPeak) -> bool:
+        return (
+            abs(inner.radius - outer.radius) <= abs(outer.radius_width) / 2.0
+            and abs(inner.angle - outer.angle) <= abs(outer.angle_width) / 2.0
+        )
+    return inside(a, b) or inside(b, a)
 
 
 class ViewerInteractMixin:
@@ -48,6 +89,65 @@ class ViewerInteractMixin:
             return
         self._undoable_remove_manual(frame, peak)
         self._push_undo(ManualRemoveAction(frame=frame, peak=peak))
+
+    def retire_manual_peak(self, frame: int, peak: ManualPeak) -> bool:
+        """Remove a manual box **without** an undo entry of its own.
+
+        For a caller that has just turned the box into a file-resident
+        peak and owns one undo entry covering both halves — quick
+        select. ``remove_manual_peak`` would push a second entry and
+        cost the user two Ctrl+Z presses to reverse one action.
+
+        Returns whether the box was there to remove.
+        """
+        if peak not in self._manual_peaks.get(frame, []):
+            return False
+        self._undoable_remove_manual(frame, peak)
+        return True
+
+    def set_quick_select(self, enabled: bool) -> None:
+        """Arm / disarm quick-select labelling.
+
+        While armed, every path that would silently drop the pending
+        manual box instead emits ``manualPeakCommitRequested`` so the
+        host can write it to the file first. Disarming commits whatever
+        is still pending, so turning the mode off never loses the last
+        box.
+        """
+        enabled = bool(enabled)
+        if enabled == self._quick_select:
+            return
+        if not enabled:
+            self.commit_pending_manual()
+        self._quick_select = enabled
+
+    @property
+    def quick_select(self) -> bool:
+        return self._quick_select
+
+    def pending_manual_peak(self, frame: int | None = None) -> ManualPeak | None:
+        """The manual box awaiting a quick-select commit, if any."""
+        if not self._quick_select:
+            return None
+        bucket = self._manual_peaks.get(
+            self.current_frame if frame is None else int(frame), []
+        )
+        return bucket[0] if bucket else None
+
+    def commit_pending_manual(self, frame: int | None = None) -> None:
+        """Ask the host to commit the pending box, if there is one.
+
+        The single funnel for every trigger — the next box, the
+        selection moving away, a frame or entry change, Enter, and the
+        mode being turned off — so they cannot drift apart. Emitting
+        with nothing pending is a no-op, which is why callers need no
+        guard of their own.
+        """
+        target_frame = self.current_frame if frame is None else int(frame)
+        peak = self.pending_manual_peak(target_frame)
+        if peak is None:
+            return
+        self.manualPeakCommitRequested.emit(int(target_frame), peak)
 
     def angular_extent(self) -> tuple[float, float] | None:
         """Return ``(angle_min_deg, angle_max_deg)`` for the active polar
@@ -295,6 +395,12 @@ class ViewerInteractMixin:
     def set_busy(self, busy: bool) -> None:
         """Disable interactive editing while a pipeline run is in flight."""
         self._busy = busy
+        if busy:
+            # Hit-testing is off for the duration, so an outline left
+            # up would promise a click that does nothing. Waiting for
+            # the next mouse move to notice is not good enough — the
+            # user is watching a run, not moving the mouse.
+            self._clear_hover()
         self._sync_roi()
 
     @property
@@ -333,6 +439,12 @@ class ViewerInteractMixin:
         idx = max(0, min(int(frame), n - 1))
         if idx == self._frame_index:
             return
+        # Manual boxes survive a frame switch, so a pending quick-select
+        # box would otherwise sit on a frame the user has left and be
+        # committed later against whatever frame they end on. Commit it
+        # here, against the frame it was actually drawn on.
+        if self._quick_select:
+            self.commit_pending_manual(self._frame_index)
         self._frame_index = idx
         self._prune_off_frame_selections(idx)
         self._render_frame(idx, auto_range=False)
@@ -623,6 +735,24 @@ class ViewerInteractMixin:
         frame = self.current_frame
         existing = self._manual_peaks.get(frame, [])
         old_peak = existing[0] if existing else None
+        # Quick select turns that replace into a commit: the box the
+        # user is done with goes to the file instead of the bin. Unless
+        # the new box sits on top of it — that is a correction, not the
+        # next peak, and replaces exactly as it always did.
+        if (
+            self._quick_select
+            and old_peak is not None
+            and not _boxes_overlap(old_peak, peak)
+        ):
+            self.manualPeakCommitRequested.emit(int(frame), old_peak)
+            # The host retires the committed box, so by now the frame
+            # is empty and there is nothing left to replace. Falling
+            # through with old_peak still set would make undo restore a
+            # box that is now a detected peak.
+            old_peak = (
+                self._manual_peaks.get(frame, [None])[0]
+                if self._manual_peaks.get(frame) else None
+            )
         if old_peak is not None:
             self._undoable_remove_manual(frame, old_peak)
         # _undoable_add_manual auto-selects on the current frame, so no
@@ -632,19 +762,363 @@ class ViewerInteractMixin:
             ManualReplaceAction(frame=frame, old_peak=old_peak, new_peak=peak)
         )
 
+    # -- Picking: what is under the cursor -----------------------------
+    #
+    # ``_hit_candidates`` is the one place that answers "which boxes are
+    # here, and in what order do we want them?". Bare clicks, Ctrl+click
+    # and the hover preview all go through it, so they can never
+    # disagree about what the cursor is on. The ordering rules live in
+    # ``mlgidlab.peak_picking``: kind priority first, smallest box
+    # inside a kind, rings only on their radial edges.
+
+    def _ring_edge_tol(self) -> float:
+        """Half-width of a ring's clickable edge, in data units.
+
+        Constant on screen rather than in q: a ring 6 px wide to click
+        stays 6 px wide at any zoom, which is what the hand expects.
+        """
+        try:
+            x_per_px = float(self._plot.getViewBox().viewPixelSize()[0])
+        except Exception:                      # no geometry yet
+            return RING_EDGE_TOL_FALLBACK
+        if not math.isfinite(x_per_px) or x_per_px <= 0.0:
+            return RING_EDGE_TOL_FALLBACK
+        return RING_EDGE_TOL_PX * x_per_px
+
+    def _hit_pads(self, radius: float) -> tuple[float, float]:
+        """``HIT_TOL_PX`` as (radial, angular) tolerances at ``radius``.
+
+        In polar mode the axes *are* radius and angle, so the pixel
+        sizes convert directly. In Cartesian both axes are q, so the
+        angular pad is the angle a few pixels subtend at this radius —
+        which is why it takes the radius at all.
+        """
+        x_per_px, y_per_px = self._pixel_slop(HIT_TOL_PX)
+        if self._mode == MODE_POLAR:
+            return x_per_px, y_per_px
+        span = max(abs(radius), 1e-6)
+        return x_per_px, min(180.0, math.degrees(y_per_px / span))
+
+    def _pixel_slop(self, pixels: float) -> tuple[float, float]:
+        """``pixels`` as (x, y) data-unit tolerances at the current zoom."""
+        try:
+            x_per_px, y_per_px = self._plot.getViewBox().viewPixelSize()
+        except Exception:
+            return (RING_EDGE_TOL_FALLBACK, RING_EDGE_TOL_FALLBACK)
+        return (pixels * float(x_per_px), pixels * float(y_per_px))
+
+    @staticmethod
+    def _sel_key(sel: SelectedPeak) -> tuple:
+        """Identity of a candidate, stable across re-hit-testing.
+
+        Includes the structure id because one fitted peak can appear in
+        several matched structures, each its own candidate.
+        """
+        return (sel.kind, int(sel.peak_id), sel.structure_uid)
+
+    def _row_selection(
+        self, kind: str, table: PeakTable, i: int, frame: int,
+    ) -> SelectedPeak:
+        return SelectedPeak(
+            kind=kind,
+            frame=frame,
+            peak_id=int(table.ids[i]),
+            radius=float(table.radius[i]),
+            angle=float(table.angle[i]),
+            radius_width=float(table.radius_width[i]),
+            angle_width=float(table.angle_width[i]),
+            is_ring=bool(table.is_ring[i]),
+            score=float(table.score[i]),
+            amplitude=float(table.amplitude[i]),
+        )
+
+    def _hit_candidates(
+        self, x: float, y: float,
+        kinds: tuple[str, ...] = ("manual", "fitted", "detected", "matched"),
+    ) -> list[SelectedPeak]:
+        """Every overlay box under ``(x, y)``, best candidate first.
+
+        ``kinds`` is both the filter and the priority order, so the
+        Ctrl+click path can ask for just detected/fitted in the order it
+        wants. Within one kind the smallest box comes first; equal-sized
+        boxes keep reverse table order, which is what the code did
+        before candidates existed.
+        """
+        if self._mode not in (MODE_POLAR, MODE_CARTESIAN):
+            return []
+        if self._mode == MODE_CARTESIAN:
+            r, a = _cart_to_polar(x, y)
+        else:
+            r, a = float(x), float(y)
+        tol = self._ring_edge_tol()
+        pad_r, pad_a = self._hit_pads(r)
+        frame = self.current_frame
+        peaks_for_frame = self._frame_peaks.get(frame) or {}
+        out: list[SelectedPeak] = []
+
+        for kind in kinds:
+            hits: list[tuple[SelectedPeak, peak_picking.Box]] = []
+
+            if kind == "manual":
+                if not self._visibility.get("manual", True):
+                    continue
+                for peak in reversed(self._manual_peaks.get(frame, [])):
+                    box = _box_of(peak)
+                    if peak_picking.contains(
+                        box, r, a, ring_edge_tol=tol,
+                        pad_radius=pad_r, pad_angle=pad_a,
+                    ):
+                        hits.append(
+                            (SelectedPeak.from_manual(peak, frame), box))
+
+            elif kind in ("fitted", "detected"):
+                if not self._visibility.get(kind, True):
+                    continue
+                table = peaks_for_frame.get(kind)
+                if table is None or len(table) == 0:
+                    continue
+                for i in reversed(range(len(table))):
+                    if kind == "fitted" and self._fitted_row_hidden(
+                        frame, int(table.ids[i])
+                    ):
+                        continue
+                    box = _box_of_row(table, i)
+                    if peak_picking.contains(
+                        box, r, a, ring_edge_tol=tol,
+                        pad_radius=pad_r, pad_angle=pad_a,
+                    ):
+                        hits.append(
+                            (self._row_selection(kind, table, i, frame), box))
+
+            elif kind == "matched":
+                if not self._matched_master_visible:
+                    continue
+                for s in reversed(self._matched_per_frame.get(frame, [])):
+                    if not self._is_matched_item_visible(s.unique_id):
+                        continue
+                    tbl = s.peaks
+                    color = self._pen_for_key(s.color_key)["color"]
+                    # Under "show only tracked peaks" only this
+                    # structure's tracked peaks are drawn, so only they
+                    # are clickable and the structure-level highlight
+                    # covers just them.
+                    visible_ids = [
+                        int(v) for v in tbl.ids
+                        if not self._fitted_row_hidden(frame, int(v))
+                    ]
+                    for i in reversed(range(len(tbl))):
+                        if self._fitted_row_hidden(frame, int(tbl.ids[i])):
+                            continue
+                        box = _box_of_row(tbl, i)
+                        if not peak_picking.contains(
+                            box, r, a, ring_edge_tol=tol,
+                            pad_radius=pad_r, pad_angle=pad_a,
+                        ):
+                            continue
+                        sel = self._row_selection("matched", tbl, i, frame)
+                        sel.structure_uid = s.unique_id
+                        sel.structure_label = s.label
+                        sel.structure_color = color
+                        # Clicking any peak of the structure promotes the
+                        # whole (visible) structure into the selection.
+                        sel.multi_peak_ids = visible_ids
+                        hits.append((sel, box))
+
+            out.extend(peak_picking.rank_hits(hits))
+        return out
+
+    def _cycle_pick(self, candidates: list[SelectedPeak]) -> SelectedPeak:
+        """Pick from ``candidates``: the box *after* the current
+        selection, or the innermost one.
+
+        The whole rule is "a click never hands back the box you already
+        have": if what is selected is among the boxes under the cursor,
+        the click takes the next one and wraps at the end. That is what
+        makes a box nested inside another reachable — click once for the
+        innermost, again for the one around it — without a gesture to
+        remember or a "same spot" test to satisfy.
+        """
+        keys = tuple(self._sel_key(c) for c in candidates)
+        previous = self._selected
+        index = self._next_index(keys)
+        self._cycle_time = time.monotonic()
+        self._cycle_prev = previous if index else None
+        return candidates[index]
+
+    def _next_index(self, keys: tuple) -> int:
+        """Index of the candidate after the current selection."""
+        current = (
+            self._sel_key(self._selected)
+            if self._selected is not None else None
+        )
+        if current in keys:
+            return (keys.index(current) + 1) % len(keys)
+        return 0
+
+    def revert_cycle_for_double_click(self) -> None:
+        """Undo a cycle step that a double-click caused on its way past.
+
+        Qt delivers press/release (which we read as a click) before the
+        double-click event that resets the zoom, so a double-click on a
+        stack of boxes would quietly step the selection. Rather than
+        refuse to cycle on fast clicks — which broke deliberate ones —
+        the step is taken back here, once we know the gesture was a
+        double-click after all.
+        """
+        if self._cycle_prev is None:
+            return
+        elapsed_ms = (time.monotonic() - self._cycle_time) * 1000.0
+        restore, self._cycle_prev = self._cycle_prev, None
+        if elapsed_ms <= _double_click_ms():
+            self._set_selected(restore)
+            self._reset_cycle()
+
+    def _reset_cycle(self) -> None:
+        self._cycle_prev = None
+
+    # -- Hover preview -------------------------------------------------
+
+    def _update_hover(self, x: float, y: float) -> int:
+        """Outline the box a bare click would take. Returns the stack depth.
+
+        The count is what makes cycling discoverable: the status bar
+        says how many boxes are under the cursor, so "click again" is a
+        visible offer rather than folklore.
+        """
+        if (
+            self._mode not in (MODE_POLAR, MODE_CARTESIAN)
+            or self._busy
+            or self.is_dragging
+            or self._preview_item.isVisible()      # mid draw-drag
+        ):
+            self._clear_hover()
+            return 0
+        self._hover_pos = (float(x), float(y))
+        candidates = self._hit_candidates(x, y)
+        top = candidates[0] if candidates else None
+        key = None if top is None else self._sel_key(top)
+        # Already outlined by the selection highlight: previewing it
+        # again would just thicken the line.
+        if (
+            top is not None
+            and self._selected is not None
+            and key == self._sel_key(self._selected)
+        ):
+            top, key = None, None
+        if key != self._hover_key:
+            self._hover_key = key
+            self._draw_hover(top)
+        return len(candidates)
+
+    def _draw_hover(self, sel: SelectedPeak | None) -> None:
+        if sel is None:
+            self._hover.clear_path()
+            return
+        table = _peaks_from_manual(self._hover_boxes(sel))
+        extent = self.angular_extent()
+        if self._mode == MODE_CARTESIAN:
+            self._hover.set_cartesian(table, extent=extent)
+        else:
+            self._hover.set_polar(table, extent=extent)
+
+    def _hover_boxes(self, sel: SelectedPeak) -> list[ManualPeak]:
+        """The boxes to outline for ``sel``.
+
+        Clicking a matched peak selects the whole structure (the
+        selection highlight draws every visible peak in it), so the
+        preview has to promise the same thing — otherwise it outlines
+        one box and the click lights up five.
+        """
+        if sel.multi_peak_ids:
+            fitted = (self._frame_peaks.get(sel.frame) or {}).get("fitted")
+            if fitted is not None and len(fitted):
+                wanted = set(int(v) for v in sel.multi_peak_ids)
+                boxes = [
+                    ManualPeak(
+                        radius=float(fitted.radius[i]),
+                        angle=float(fitted.angle[i]),
+                        radius_width=float(fitted.radius_width[i]),
+                        angle_width=float(fitted.angle_width[i]),
+                        is_ring=bool(fitted.is_ring[i]),
+                        temp_id=int(fitted.ids[i]),
+                    )
+                    for i in range(len(fitted))
+                    if int(fitted.ids[i]) in wanted
+                ]
+                if boxes:
+                    return boxes
+        return [
+            ManualPeak(
+                radius=sel.radius,
+                angle=sel.angle,
+                radius_width=sel.radius_width,
+                angle_width=sel.angle_width,
+                is_ring=sel.is_ring,
+                temp_id=sel.peak_id,
+            )
+        ]
+
+    def _clear_hover(self) -> None:
+        """Drop the outline, unconditionally.
+
+        It used to skip the repaint when ``_hover_key`` was already
+        None, which looked like a cheap guard and was a leak:
+        ``_refresh_hover`` zeroes the key *before* re-running the hover,
+        so any early return in ``_update_hover`` (busy, dragging, mid
+        draw-drag) reached this with the key already cleared and left
+        the outline painted on screen.
+        """
+        self._hover_pos = None
+        self._hover_key = None
+        self._hover.clear_path()
+
+    def _refresh_hover(self) -> None:
+        """Recompute the outline after a re-render.
+
+        Overlays are rebuilt on frame changes, pipeline results and
+        theme flips while the cursor sits still; without this the
+        outline would point at whatever used to be under it.
+
+        ``underMouse`` is the guard that keeps this honest. A Leave
+        event is not guaranteed — the pointer can exit fast, the window
+        can be switched from the keyboard, a popup can grab it — and
+        without the check a re-render would faithfully redraw an
+        outline for a cursor that left minutes ago.
+        """
+        pos = self._hover_pos
+        if pos is None:
+            return
+        if not self._view.ui.graphicsView.underMouse():
+            self._clear_hover()
+            return
+        self._hover_key = None
+        self._update_hover(*pos)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        """Second net for the hover outline.
+
+        The event filter clears it on the graphics view's Leave, but a
+        Leave is not guaranteed to arrive there: the pointer can exit
+        through a child widget, or the window can lose it to a popup or
+        a keyboard-driven switch. This one fires on the viewer itself.
+        """
+        super().leaveEvent(event)
+        self._clear_hover()
+
     def _on_select_at(self, pos: QPointF, mods=Qt.KeyboardModifier.NoModifier) -> None:
         # Raw mode has no q-space overlays to hit-test. Polar and
         # Cartesian both run the same hit-test pipeline; the click
         # coordinates arrive in whatever space the viewbox is currently
-        # showing (polar = (r, a), cartesian = (q_xy, q_z)), and the
-        # mode-specific helpers below normalise to polar before
-        # checking containment.
+        # showing (polar = (r, a), cartesian = (q_xy, q_z)), and
+        # ``_hit_candidates`` normalises to polar before checking
+        # containment.
         #
         # ``mods``: keyboard modifiers held at press time.
         #
-        # * Bare click (no modifiers): walks the full priority list
-        #   ``manual > fitted > detected > matched`` and routes the
-        #   first hit through ``_set_selected``.
+        # * Bare click (no modifiers): takes the best candidate from the
+        #   full priority list ``manual > fitted > detected > matched``,
+        #   unless that box is already selected — then it takes the next
+        #   one under the cursor, so a nested box is one more click away.
         # * Ctrl+click: multi-select. Hit-tests the detected and fitted
         #   overlays (only — manual / matched stay single-select) and
         #   routes through ``_toggle_selected``. The search prefers the
@@ -676,23 +1150,10 @@ class ViewerInteractMixin:
             and self._sim_toggle_at(x, y)
         ):
             return
-        cart = self._mode == MODE_CARTESIAN
-        frame = self.current_frame
-        peaks_for_frame = self._frame_peaks.get(frame) or {}
         ctrl_only = (
             bool(mods & Qt.KeyboardModifier.ControlModifier)
             and not bool(mods & Qt.KeyboardModifier.AltModifier)
         )
-
-        def hit_manual(peak: ManualPeak) -> bool:
-            return _cart_box_contains(peak, x, y) if cart else _polar_box_contains(peak, x, y)
-
-        def hit_table(tbl: PeakTable, i: int) -> bool:
-            return (
-                _cart_table_row_contains(tbl, i, x, y) if cart
-                else _polar_table_row_contains(tbl, i, x, y)
-            )
-
         # Ctrl+click multi-selects detected OR fitted peaks. Search the
         # current multi-selection's kind first (so the user keeps
         # building one kind even where detected/fitted overlap), then
@@ -701,127 +1162,25 @@ class ViewerInteractMixin:
         # multi-selected.
         if ctrl_only:
             primary = self._selected
-            if primary is not None and primary.kind in ("detected", "fitted"):
-                order = (
-                    ["detected", "fitted"] if primary.kind == "detected"
-                    else ["fitted", "detected"]
-                )
+            if primary is not None and primary.kind == "detected":
+                order = ("detected", "fitted")
             else:
-                order = ["fitted", "detected"]
-            for kind in order:
-                if not self._visibility.get(kind, True):
-                    continue
-                table = peaks_for_frame.get(kind)
-                if table is None or len(table) == 0:
-                    continue
-                for i in reversed(range(len(table))):
-                    if kind == "fitted" and self._fitted_row_hidden(
-                        frame, int(table.ids[i])
-                    ):
-                        continue
-                    if hit_table(table, i):
-                        self._toggle_selected(SelectedPeak(
-                            kind=kind,
-                            frame=frame,
-                            peak_id=int(table.ids[i]),
-                            radius=float(table.radius[i]),
-                            angle=float(table.angle[i]),
-                            radius_width=float(table.radius_width[i]),
-                            angle_width=float(table.angle_width[i]),
-                            is_ring=bool(table.is_ring[i]),
-                            score=float(table.score[i]),
-                            amplitude=float(table.amplitude[i]),
-                        ))
-                        return
+                order = ("fitted", "detected")
+            hits = self._hit_candidates(x, y, kinds=order)
+            if hits:
+                self._toggle_selected(hits[0])
             # Ctrl+click on empty space (or only manual/matched under
             # the cursor) = no-op; the existing selection stays put.
             return
 
-        # Priority order: manual > fitted > detected > matched. Matched is
-        # last because it's a subset of fitted; the rare case where the user
-        # wants the matched-context selection is still reachable by hiding
-        # the fitted overlay.
-        # 1) manual
-        if self._visibility.get("manual", True):
-            for peak in reversed(self._manual_peaks.get(frame, [])):
-                if hit_manual(peak):
-                    self._set_selected(SelectedPeak.from_manual(peak, frame))
-                    return
-
-        # 2) fitted, 3) detected — same hit-test against the PeakTable rows.
-        for kind in ("fitted", "detected"):
-            if not self._visibility.get(kind, True):
-                continue
-            table = peaks_for_frame.get(kind)
-            if table is None or len(table) == 0:
-                continue
-            for i in reversed(range(len(table))):
-                if kind == "fitted" and self._fitted_row_hidden(
-                    frame, int(table.ids[i])
-                ):
-                    continue
-                if hit_table(table, i):
-                    self._set_selected(SelectedPeak(
-                        kind=kind,
-                        frame=frame,
-                        peak_id=int(table.ids[i]),
-                        radius=float(table.radius[i]),
-                        angle=float(table.angle[i]),
-                        radius_width=float(table.radius_width[i]),
-                        angle_width=float(table.angle_width[i]),
-                        is_ring=bool(table.is_ring[i]),
-                        score=float(table.score[i]),
-                        amplitude=float(table.amplitude[i]),
-                    ))
-                    return
-
-        # 4) matched — only when the master toggle is on. The hit's peak_id
-        # is the underlying fitted id (which is what delete_peak consumes).
-        if self._matched_master_visible:
-            structures = self._matched_per_frame.get(frame, [])
-            for s in reversed(structures):
-                if not self._is_matched_item_visible(s.unique_id):
-                    continue
-                tbl = s.peaks
-                color = self._pen_for_key(s.color_key)["color"]
-                # Under "show only tracked peaks", only this structure's
-                # tracked peaks are drawn — so only they are clickable,
-                # and the structure-level highlight covers just them.
-                visible_ids = [
-                    int(x) for x in tbl.ids
-                    if not self._fitted_row_hidden(frame, int(x))
-                ]
-                for i in reversed(range(len(tbl))):
-                    if self._fitted_row_hidden(frame, int(tbl.ids[i])):
-                        continue
-                    if hit_table(tbl, i):
-                        self._set_selected(SelectedPeak(
-                            kind="matched",
-                            frame=frame,
-                            peak_id=int(tbl.ids[i]),
-                            radius=float(tbl.radius[i]),
-                            angle=float(tbl.angle[i]),
-                            radius_width=float(tbl.radius_width[i]),
-                            angle_width=float(tbl.angle_width[i]),
-                            is_ring=bool(tbl.is_ring[i]),
-                            structure_uid=s.unique_id,
-                            structure_label=s.label,
-                            structure_color=color,
-                            score=float(tbl.score[i]),
-                            amplitude=float(tbl.amplitude[i]),
-                            # Clicking any peak of the structure
-                            # promotes the whole (visible) structure
-                            # into the selection — overlay highlights
-                            # every visible peak in it, table syncs the
-                            # structure row.
-                            multi_peak_ids=visible_ids,
-                        ))
-                        return
-
-        # Click on empty space → deselect (the Ctrl branch already
-        # early-returned above, so this only runs on bare clicks).
-        if self._selected is not None:
-            self._set_selected(None)
+        candidates = self._hit_candidates(x, y)
+        if not candidates:
+            # Click on empty space → deselect.
+            self._reset_cycle()
+            if self._selected is not None:
+                self._set_selected(None)
+            return
+        self._set_selected(self._cycle_pick(candidates))
 
     def _set_selected(
         self, sel: SelectedPeak | None, *, preserve_manual: bool = False,
@@ -875,6 +1234,11 @@ class ViewerInteractMixin:
             and prev.manual_ref is not None
             and (sel is None or sel.manual_ref is not prev.manual_ref)
         )
+        if transitioning_away_from_manual and self._quick_select:
+            # Quick select: clicking away is one of the ways to say
+            # "this box is done". Commit it rather than dropping it.
+            # The host retires it, so the removal below finds nothing.
+            self.commit_pending_manual(prev.frame)
         if transitioning_away_from_manual:
             bucket = self._manual_peaks.get(prev.frame, [])
             if prev.manual_ref in bucket:
@@ -992,6 +1356,17 @@ class ViewerInteractMixin:
             self.remove_manual_peak(self.current_frame, self._selected.manual_ref)
             ev.accept()
             return
+        # Enter commits the pending quick-select box on the spot — the
+        # explicit version of clicking away, for a user whose hands are
+        # on the keyboard. Esc above still discards instead.
+        if (
+            ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and self._quick_select
+            and not self._busy
+        ):
+            self.commit_pending_manual()
+            ev.accept()
+            return
         # Ctrl+A: select every peak of the *current kind* on the current
         # frame. If a fitted peak is the primary, select all fitted;
         # otherwise (detected primary, or nothing selected) select all
@@ -1048,11 +1423,26 @@ class ViewerInteractMixin:
         ]
         if not indices:
             return
-        sels = [_sel(i) for i in indices]
-        # Bypass _set_selected (which would clear extras) and write
-        # the multi-selection in one shot.
+        self.set_selected_peaks([_sel(i) for i in indices])
+
+    def set_selected_peaks(self, sels: list[SelectedPeak]) -> None:
+        """Replace the whole selection with ``sels`` in one shot.
+
+        ``sels[0]`` becomes the primary and the rest the extras, so the
+        caller decides which peak the Parameter panel and the ROI
+        follow. Bypasses ``_set_selected``, which clears extras by
+        design, and emits both selection signals once rather than once
+        per peak — which is what a caller handing over a ready-made
+        list wants (Ctrl+A on the image, a Ctrl-multi-selection in the
+        Peaks table).
+
+        An empty list clears the selection.
+        """
+        if not sels:
+            self.clear_selection()
+            return
         self._selected = sels[0]
-        self._selected_extras = sels[1:]
+        self._selected_extras = list(sels[1:])
         self._sync_roi()
         self._render_overlays(self.current_frame)
         self.selectionChanged.emit(self._selected)
@@ -1119,17 +1509,19 @@ class ViewerInteractMixin:
         # static overlay items (red dashed for detected, yellow
         # solid for manual) — those stay visible behind the white
         # outline + ROI handles.
+        # Asked for per draw: the highlight colour follows the theme
+        # (white on the dark plot ground, near-black on the light one).
+        style = selection_style()
         pen = pg.mkPen(
-            QColor(SELECTION_STYLE["color"]),
-            width=SELECTION_STYLE["width"],
+            QColor(style["color"]),
+            width=style["width"],
         )
-        pen.setStyle(SELECTION_STYLE["style"])
+        pen.setStyle(style["style"])
         pen.setCosmetic(True)
-        # Hover keeps the same white pen so there's no flicker on
-        # mouseover.
+        # Hover keeps the same pen so there's no flicker on mouseover.
         hover_pen = pg.mkPen(
-            QColor(SELECTION_STYLE["color"]),
-            width=SELECTION_STYLE["width"],
+            QColor(style["color"]),
+            width=style["width"],
         )
         hover_pen.setCosmetic(True)
 

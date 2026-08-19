@@ -219,6 +219,11 @@ def _execute_peak_injection(
     entry = str(kwargs.get("entry") or "")
     plan = kwargs.get("plan") or {}
     fit_params = dict(kwargs.get("fit_params") or {})
+    # The GUI reads the fitted/detected link setting and passes the
+    # answer in; a worker has no business touching QSettings. Each spec
+    # here writes a detected box and its fit as a pair, so when the link
+    # is on the fit simply takes the detected row's id.
+    link_ids = bool(kwargs.get("link_ids", False))
     if not entry or not plan:
         return []
 
@@ -355,6 +360,7 @@ def _execute_peak_injection(
                 fit_aw = float(spec["angle_width"])
             new_fid = int(file_model.add_fitted_peak_row(
                 file_path, entry, frame,
+                peak_id=det_id if link_ids else None,
                 radius=fit.radius, radius_width=fit.radius_width,
                 angle=fit_angle, angle_width=fit_aw,
                 amplitude=fit.amplitude, is_ring=is_ring,

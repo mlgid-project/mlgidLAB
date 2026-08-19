@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
 
@@ -15,7 +16,7 @@ os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 from PySide6.QtWidgets import QApplication
 
-__version__ = "0.1.0a16"
+__version__ = "0.1.0a17"
 
 
 def main() -> int:
@@ -43,6 +44,28 @@ def main() -> int:
     # persisted preferences over time).
     app.setOrganizationName("mlgidLAB")
     app.setApplicationName("mlgidLAB")
+    # Window, taskbar and Alt-Tab icon. Set on the application so every
+    # window inherits it (main window, figure export, phase views, the
+    # dialogs). Guarded: a packaging slip should cost an icon, not a
+    # startup.
+    try:
+        from mlgidlab.icons import app_icon
+        app.setWindowIcon(app_icon())
+    except Exception:
+        logging.getLogger("mlgidlab").debug(
+            "could not set the application icon", exc_info=True)
+    if sys.platform == "win32":
+        # Without an explicit AppUserModelID, Windows groups the app
+        # under python.exe's icon in the taskbar no matter what
+        # setWindowIcon says.
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "mlgidLAB.mlgidLAB")
+        except Exception:
+            logging.getLogger("mlgidlab").debug(
+                "could not set the Windows AppUserModelID", exc_info=True)
     # Honor the persisted theme choice (View → Theme). Defaults to
     # dark; the menu sync inside MainWindow reads the same key.
     theme = str(QSettings().value("theme", "dark")).lower()
@@ -61,6 +84,9 @@ def main() -> int:
         window.action_theme_light.setChecked(True)
     else:
         window.action_theme_dark.setChecked(True)
+    # The welcome page was seeded during __init__, before the theme above
+    # was known; re-seed so a light-theme user gets the light wordmark.
+    window._refresh_welcome_view()
     window.show()
     # Post-update changelog (offline) + async "newer release available"
     # check. Deferred into the event loop so it runs after the window is up
