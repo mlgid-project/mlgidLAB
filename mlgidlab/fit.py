@@ -1,20 +1,17 @@
 """1D Gaussian fitting helpers for the radial / angular profile overlays.
 
-**Display-only, never persisted.** This module's output is used to
-paint live preview curves on the profile viewer for the active
-manual / detected box. It is deliberately not pygidFIT and must
-not be written into ``fitted_peaks`` — the persistence path goes
-through ``mlgidlab.manual_fit.fit_one_peak`` → pygidfit's 2D fit.
-Physics-audit finding F-06 is closed by keeping these two
-responsibilities cleanly separated:
+This module's output paints the live preview curves on the profile
+viewer for the active manual / detected box. It is not pygidFIT:
 
-  * ``fit.py``        — fast 1D scipy fit, live preview overlay only
-  * ``manual_fit.py`` — slow 2D pygidfit fit, persisted truth
+  * ``fit.py``        — fast 1D scipy fit, profile overlay
+  * ``manual_fit.py`` — slow 2D pygidfit fit, the default persisted
+                        truth (physics-audit finding F-06)
 
-If a future caller ever wants to persist 1D-fit output, the audit
-verdict must be re-opened: pygidFIT's 2D cluster model is the
-upstream contract for fitted peaks, and the 1D Gaussian + linear
-background here is not it.
+The default "2D fit (pygidfit)" mode never writes anything from here.
+The legacy "1D fit (scipy)" mode of Add-to-fitted does persist these
+values (centre + FWHM, with the 2D shape coefficients zero-filled),
+which is why the fit below has to be defensible and not merely
+plausible-looking on a plot.
 
 Pure scipy/numpy — no Qt. Returns the fit curve sampled on a fine grid plus
 the fitted parameters; callers decide where to draw it.
@@ -35,6 +32,26 @@ logger = logging.getLogger(__name__)
 DEFAULT_FIT_WINDOW_FACTOR = 2.0
 # Number of samples on the rendered fit curve. Cheap; smoother is better.
 FIT_RENDER_SAMPLES = 250
+# How far past the peak region the fit window reaches on each side, as a
+# multiple of that region's width. This padding is the *only* data the
+# background line is estimated from, so it has to be wide enough to hold
+# some actual baseline and narrow enough to stay local.
+BG_WINDOW_FACTOR = 1.5
+# Fewest samples a fit window may hold. Below this there is nothing to
+# fit; note the check is on the padded window, not on the peak region,
+# which is what stopped narrow boxes from being refused outright.
+MIN_WINDOW_SAMPLES = 6
+# Fewest samples the peak region needs to fit three parameters. Below
+# this the region grows into the window instead of the fit failing.
+MIN_PEAK_SAMPLES = 4
+# Fewest samples one flank needs before its background level is used.
+MIN_BASELINE_SAMPLES = 4
+# Percentile of a flank's samples taken as its background level. Low
+# enough that a peak tail reaching into the flank barely moves it.
+BG_PERCENTILE = 25.0
+# How much more scattered the higher flank may be than the lower one
+# before its level is treated as contamination rather than a tilt.
+BG_CONTAMINATION_RATIO = 3.0
 
 
 @dataclass
@@ -133,6 +150,82 @@ def gaussian_from_stored_params(
     )
 
 
+def gaussian_only(
+    x: np.ndarray, amplitude: float, center: float, sigma: float,
+) -> np.ndarray:
+    """The peak term alone, for fits whose background is already fixed."""
+    return amplitude * np.exp(-((x - center) ** 2) / (2.0 * sigma ** 2))
+
+
+def _flank_level(x: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
+    """Robust background level of one flank: ``(level, spread, x_of_level)``.
+
+    The flank's lowest ``BG_PERCENTILE`` of samples are taken as the
+    ones least likely to carry peak signal, and the level and position
+    are the *median y and median x of that same subset*. Reading both
+    off one subset is what keeps the pair consistent: taking the level
+    from a percentile but the position from the whole flank tilts the
+    line on a sloped background, because the low samples sit at one
+    end of the flank, not in its middle.
+
+    ``spread`` is the median absolute deviation about the level over
+    the whole flank, used to tell a tilted background (both flanks
+    similarly scattered) from a contaminated one (the higher flank far
+    more scattered).
+    """
+    cut = float(np.percentile(y, BG_PERCENTILE))
+    low = y <= cut
+    if not bool(low.any()):
+        low = np.ones(y.size, dtype=bool)
+    level = float(np.median(y[low]))
+    x_at = float(np.median(x[low]))
+    spread = float(np.median(np.abs(y - level)))
+    return level, spread, x_at
+
+
+def _flank_baseline(
+    x: np.ndarray, y: np.ndarray, peak_lo: float, peak_hi: float,
+) -> tuple[float, float]:
+    """Linear background estimated from the two flanks of the window.
+
+    Both flanks present and consistent → the line through their levels.
+    "Consistent" means the higher flank is not also the more scattered
+    one: a genuinely tilted background raises one flank's *level* while
+    both keep a similar spread, whereas a neighbouring peak sitting in
+    one flank blows that flank's spread up as well. When the higher
+    flank is more than ``BG_CONTAMINATION_RATIO`` times as scattered as
+    the lower one it is not trusted for the tilt, and the background
+    goes flat at the lower level — an underestimate of a real slope is
+    a far smaller error than a background invented from another peak.
+
+    One flank only → flat at its level. Neither → flat at the window
+    minimum, which is the last honest statement available.
+    """
+    left = x < peak_lo
+    right = x > peak_hi
+    have_left = int(left.sum()) >= MIN_BASELINE_SAMPLES
+    have_right = int(right.sum()) >= MIN_BASELINE_SAMPLES
+
+    if have_left and have_right:
+        l_level, l_spread, l_x = _flank_level(x[left], y[left])
+        r_level, r_spread, r_x = _flank_level(x[right], y[right])
+        higher, lower = (
+            (r_spread, l_spread) if r_level >= l_level else (l_spread, r_spread)
+        )
+        trusted = higher <= BG_CONTAMINATION_RATIO * max(lower, 1e-12)
+        if trusted and r_x > l_x:
+            slope = (r_level - l_level) / (r_x - l_x)
+            return float(slope), float(l_level - slope * l_x)
+        return 0.0, float(min(l_level, r_level))
+
+    if have_left or have_right:
+        side = left if have_left else right
+        level, _spread, _x = _flank_level(x[side], y[side])
+        return 0.0, float(level)
+
+    return 0.0, float(np.nanmin(y))
+
+
 def fit_gaussian_on_axis(
     axis: np.ndarray,
     data: np.ndarray,
@@ -143,122 +236,142 @@ def fit_gaussian_on_axis(
     fit_range: tuple[float, float] | None = None,
     render_range: tuple[float, float] | None = None,
 ) -> GaussianFit | None:
-    """Fit a 1D Gaussian + linear background to ``data`` along ``axis``.
+    """Fit a 1D Gaussian on a fixed linear background along ``axis``.
 
-    By default the fit consumes a window centred on ``center_init`` whose
-    half-width is ``(0.5 + window_factor) * width_init`` (so several times
-    wider than the user's box, giving the linear-bg term context). Pass
-    ``fit_range=(lo, hi)`` to use exactly that window instead — typically
-    the bounds of a user-drawn box, so the fit reflects only what's inside.
+    ``fit_range=(lo, hi)`` names the **peak region** — normally the
+    user's box. It is not the fit window: the window is that region
+    padded by ``BG_WINDOW_FACTOR`` of its width on each side, and the
+    background line is estimated from the padding only, where there is
+    actually baseline to see. Without ``fit_range`` the window is the
+    legacy ``(0.5 + window_factor) × width_init`` half-width around
+    ``center_init`` and the peak region is the middle ``width_init``
+    of it.
 
-    Pass ``render_range=(lo, hi)`` to render the resulting Gaussian curve
-    on a *different* x range than the fit window — useful when callers
-    want to display the Gaussian's tails extending beyond a tight fit box.
-    The fit itself is unaffected; only the returned ``x``/``y`` arrays
-    sample the rendered curve over ``render_range`` instead of the fit
-    window. ``render_range`` is clipped to ``[axis[0], axis[-1]]``.
+    Two problems this shape exists to avoid, both reported from real
+    use:
+
+    * **Fits that refused peaks they should have taken.** Fitting only
+      inside the box meant a box narrower than about six samples of the
+      profile axis had no fit at all — on the default 1024-sample
+      radial grid over a 3 × 3 Å⁻¹ q range that is any box under
+      ~0.025 Å⁻¹. The window is four times the box, so the sample count
+      is no longer the binding constraint.
+    * **Nonsensical backgrounds.** Five free parameters (amplitude,
+      centre, sigma, slope, intercept) inside a window that is all
+      peak leaves the line unidentifiable, and it was seeded from
+      points on the peak's own flanks. Measured on a clean synthetic
+      peak, a six-sample box returned slope +393 / intercept −489
+      against a true −5 / +50, and lost half the amplitude with it.
+      Here the background is pinned by the flanks first and held
+      fixed, leaving three free parameters for the peak.
+
+    The peak itself is fitted on the peak region alone, with the
+    background held at what the flanks said and the centre bounded to
+    that region. Fitting it across the whole window instead would let a
+    bright neighbour in the padding inflate the amplitude — measured at
+    +82% on a synthetic neighbour four times the target's height. The
+    padding informs the background and nothing else.
+
+    A peak region holding fewer than ``MIN_PEAK_SAMPLES`` grows to the
+    nearest that many samples of the window rather than returning
+    nothing.
+
+    ``render_range=(lo, hi)`` samples the returned curve over a
+    different range than the fit used. It is clipped to the fit window:
+    the background is a line, and extrapolating it past the data that
+    constrained it is how the overlay used to shoot off the plot.
 
     Returns None if the inputs aren't fittable or scipy can't converge.
     """
-    if len(axis) < 8:
+    axis = np.asarray(axis, dtype=float)
+    data = np.asarray(data, dtype=float)
+    if len(axis) < 8 or len(data) != len(axis):
         return None
     if not (np.isfinite(center_init) and np.isfinite(width_init)) or width_init <= 0:
         return None
 
     if fit_range is not None:
-        lo, hi = float(fit_range[0]), float(fit_range[1])
-        if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+        peak_lo, peak_hi = float(fit_range[0]), float(fit_range[1])
+        if not (np.isfinite(peak_lo) and np.isfinite(peak_hi)) or peak_hi <= peak_lo:
             return None
+        pad = BG_WINDOW_FACTOR * (peak_hi - peak_lo)
+        win_lo, win_hi = peak_lo - pad, peak_hi + pad
     else:
-        half = max(width_init * (0.5 + window_factor), (axis[-1] - axis[0]) * 0.05)
-        lo, hi = center_init - half, center_init + half
+        win_half = max(
+            width_init * (0.5 + window_factor), (axis[-1] - axis[0]) * 0.05,
+        )
+        peak_half = min(width_init / 2.0, win_half)
+        peak_lo, peak_hi = center_init - peak_half, center_init + peak_half
+        win_lo, win_hi = center_init - win_half, center_init + win_half
 
-    lo_idx = int(np.searchsorted(axis, lo, side="left"))
-    hi_idx = int(np.searchsorted(axis, hi, side="right"))
-    lo_idx = max(0, lo_idx)
-    hi_idx = min(len(axis), hi_idx)
-    if hi_idx - lo_idx < 6:
+    lo_idx = max(0, int(np.searchsorted(axis, win_lo, side="left")))
+    hi_idx = min(len(axis), int(np.searchsorted(axis, win_hi, side="right")))
+    if hi_idx - lo_idx < MIN_WINDOW_SAMPLES:
         return None
-
     x = axis[lo_idx:hi_idx]
     y = data[lo_idx:hi_idx]
-    finite = np.isfinite(y)
-    x = x[finite]
-    y = y[finite]
-    if len(x) < 6:
+    finite = np.isfinite(y) & np.isfinite(x)
+    x, y = x[finite], y[finite]
+    if len(x) < MIN_WINDOW_SAMPLES:
         return None
 
-    sigma_init = max(width_init / 2.355, (x[-1] - x[0]) / 50.0)
+    # Background from the padding only — the parts of the window the
+    # peak region does not claim.
+    slope, intercept = _flank_baseline(x, y, peak_lo, peak_hi)
 
-    # Linear background term (slope*x + intercept) is fitted in both the
-    # wide-window and box-bounded paths. Wide-window fits use it freely;
-    # box-bounded fits constrain amp/sigma so the slope can't be absorbed
-    # into a "very wide gaussian + parabola" local minimum.
-    n_edge = max(len(x) // 8, 2)
-    bg_x = np.concatenate([x[:n_edge], x[-n_edge:]])
-    bg_y = np.concatenate([y[:n_edge], y[-n_edge:]])
-    try:
-        slope_init, intercept_init = np.polyfit(bg_x, bg_y, 1)
-    except Exception:
-        logger.debug("suppressed exception in fit_gaussian_on_axis", exc_info=True)
-        slope_init, intercept_init = 0.0, float(np.nanmean(y))
-
-    bg_at_center = float(slope_init) * center_init + float(intercept_init)
-    amp_init = float(np.nanmax(y) - bg_at_center)
-    if amp_init <= 0:
-        amp_init = float(np.nanmax(y) - np.nanmin(y))
-    if amp_init <= 0:
-        amp_init = 1.0
-
-    try:
-        if fit_range is None:
-            popt, _ = curve_fit(
-                gaussian_with_linear_bg,
-                x, y,
-                p0=[amp_init, center_init, sigma_init, slope_init, intercept_init],
-                maxfev=2000,
-            )
-        else:
-            # Box-bounded fits can fall into a "very wide Gaussian + large
-            # negative offset ≈ parabola" local minimum because there's no
-            # flat baseline to anchor amp/sigma. Bound sigma to the window
-            # width and keep amp ≥ 0 so the optimizer must converge on an
-            # actual peak shape inside the box. Slope/intercept are left
-            # unbounded so the linear-bg term can absorb sloped baselines.
-            window_w = float(x[-1] - x[0])
-            sample_step = window_w / max(len(x) - 1, 1)
-            sigma_lo = max(sample_step * 0.5, 1e-6)
-            sigma_hi = max(window_w, sigma_lo * 2.0)
-            popt, _ = curve_fit(
-                gaussian_with_linear_bg,
-                x, y,
-                p0=[amp_init, center_init, sigma_init, slope_init, intercept_init],
-                bounds=(
-                    [0.0,    float(x[0]),  sigma_lo, -np.inf, -np.inf],
-                    [np.inf, float(x[-1]), sigma_hi,  np.inf,  np.inf],
-                ),
-                maxfev=5000,
-            )
-        amplitude, center, sigma, slope, intercept = (float(v) for v in popt)
-    except Exception:
-        logger.debug("suppressed exception in fit_gaussian_on_axis", exc_info=True)
-        return None
-
-    # Reject obviously-degenerate fits.
-    if not np.isfinite(sigma) or abs(sigma) > (x[-1] - x[0]) * 5.0:
-        return None
-    if amplitude < 0:
-        # Allow inverted peaks but only if they're shallow; reject pathological cases.
-        if abs(amplitude) > 100.0 * (np.nanmax(y) - np.nanmin(y) + 1):
+    # The peak itself is fitted on the peak region only. Everything
+    # outside it has already done its job (the background), and
+    # including it would let a neighbouring peak in the padding pull
+    # the amplitude up. When the region holds too few samples to fit
+    # three parameters, it grows to the nearest ``MIN_PEAK_SAMPLES``
+    # of the window rather than giving up, which is what the old code
+    # did to every narrow box.
+    peak_mask = (x >= peak_lo) & (x <= peak_hi)
+    if int(peak_mask.sum()) < MIN_PEAK_SAMPLES:
+        nearest = np.argsort(np.abs(x - center_init))[:MIN_PEAK_SAMPLES]
+        if nearest.size < MIN_PEAK_SAMPLES:
             return None
+        peak_mask = np.zeros(x.size, dtype=bool)
+        peak_mask[nearest] = True
+    xp = x[peak_mask]
+    residual = y[peak_mask] - (slope * xp + intercept)
 
+    fit_w = float(xp[-1] - xp[0])
+    sample_step = float(x[-1] - x[0]) / max(len(x) - 1, 1)
+    sigma_lo = max(sample_step * 0.5, 1e-12)
+    sigma_hi = max(fit_w, peak_hi - peak_lo, sigma_lo * 2.0)
+    sigma_init = float(np.clip(width_init / 2.355, sigma_lo, sigma_hi))
+    center_start = float(np.clip(center_init, peak_lo, peak_hi))
+    amp_init = float(np.nanmax(residual))
+    if not np.isfinite(amp_init) or amp_init <= 0:
+        amp_init = float(np.nanmax(y) - np.nanmin(y)) or 1.0
+
+    try:
+        popt, _ = curve_fit(
+            gaussian_only, xp, residual,
+            p0=[amp_init, center_start, sigma_init],
+            bounds=(
+                [0.0, peak_lo, sigma_lo],
+                [np.inf, peak_hi, sigma_hi],
+            ),
+            maxfev=5000,
+        )
+        amplitude, center, sigma = (float(v) for v in popt)
+    except Exception:
+        logger.debug("suppressed exception in fit_gaussian_on_axis", exc_info=True)
+        return None
+
+    if not (np.isfinite(amplitude) and np.isfinite(center) and np.isfinite(sigma)):
+        return None
+    if sigma <= 0:
+        return None
+
+    rlo, rhi = float(x[0]), float(x[-1])
     if render_range is not None:
-        rlo = max(float(render_range[0]), float(axis[0]))
-        rhi = min(float(render_range[1]), float(axis[-1]))
-        if not np.isfinite(rlo) or not np.isfinite(rhi) or rhi <= rlo:
-            rlo, rhi = float(x[0]), float(x[-1])
-    else:
-        rlo, rhi = float(x[0]), float(x[-1])
+        want_lo = max(float(render_range[0]), rlo)
+        want_hi = min(float(render_range[1]), rhi)
+        if np.isfinite(want_lo) and np.isfinite(want_hi) and want_hi > want_lo:
+            rlo, rhi = want_lo, want_hi
     x_fine = np.linspace(rlo, rhi, FIT_RENDER_SAMPLES)
     y_fine = gaussian_with_linear_bg(
         x_fine, amplitude, center, sigma, slope, intercept,

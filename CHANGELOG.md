@@ -90,6 +90,18 @@ pre-releases.
 
 ### Fixed
 
+- **The 1D profile fit stops refusing narrow peaks and inventing
+  backgrounds.** It used to fit five parameters — peak plus a straight
+  line — inside a window that was exactly the box, where a straight
+  line cannot be identified at all. Narrow boxes got no fit (under
+  about 0.025 Å⁻¹ radially there were too few samples, and the curve
+  was simply cleared), and the ones that did converge could return a
+  background nothing like the data, taking the amplitude with it. Now
+  the window reaches beyond the box, the background is measured from
+  the parts outside it and held fixed, and the peak is fitted on the
+  box with three parameters. A neighbouring peak in that outside
+  region is recognised and left out of the background. The drawn curve
+  no longer extends past the data the fit was based on.
 - **A single-peak 2D fit no longer wanders onto its neighbour.** "Add to
   fitted" and "Fit selected (2D)" handed pygidfit one box at a time.
   pygidfit masks and joint-fits only the boxes it gets in one call, so
