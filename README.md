@@ -16,8 +16,13 @@ visual control.
 > rough edges and report issues. See [`CHANGELOG.md`](CHANGELOG.md) for
 > highlights.
 
-A short walkthrough: raw detector image to reciprocal space, then the ML analysis pipeline (detect, fit, match).
-<video src="https://github.com/mlgid-project/mlgidLAB/releases/latest/download/mlgidlab_demo_combined_1080p.mp4" controls muted width="100%"></video>
+A short walkthrough: raw detector image to reciprocal space, then the ML analysis
+pipeline (detect, fit, match).
+<video src="https://github.com/user-attachments/assets/d63db8b7-ff1b-4fdc-9408-4cb618d72905" controls muted width="100%"></video>
+
+<sub>Recorded against `v0.1.0a17`. The same reel is attached to every release as
+[`mlgidlab_demo_combined_1080p.mp4`](https://github.com/mlgid-project/mlgidLAB/releases/latest/download/mlgidlab_demo_combined_1080p.mp4)
+if you would rather download it.</sub>
 
 ## Install & launch
 
