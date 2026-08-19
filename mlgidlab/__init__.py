@@ -84,6 +84,9 @@ def main() -> int:
         window.action_theme_light.setChecked(True)
     else:
         window.action_theme_dark.setChecked(True)
+    # The welcome page was seeded during __init__, before the theme above
+    # was known; re-seed so a light-theme user gets the light wordmark.
+    window._refresh_welcome_view()
     window.show()
     # Post-update changelog (offline) + async "newer release available"
     # check. Deferred into the event loop so it runs after the window is up

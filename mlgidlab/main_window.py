@@ -477,6 +477,13 @@ class MainWindow(
         self._build_status_bar()
         self._update_title()
         self._update_actions()
+        # Seed the welcome page. Its wordmark, recent list and backend
+        # notice are all filled by _refresh_welcome_view, which is
+        # otherwise only reached through _apply_session_mode — and that
+        # first runs when a file is opened. Without this call the page
+        # the user sees at cold start is an empty label under a "Recent"
+        # heading with nothing beneath it.
+        self._refresh_welcome_view()
         # Accept dropped files anywhere on the main window so the user
         # can drag NeXus / raw paths in from a file manager. The drop
         # handler classifies each file by content and dispatches.
