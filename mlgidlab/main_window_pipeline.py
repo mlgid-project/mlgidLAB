@@ -614,3 +614,10 @@ class PipelineMixin:
                 # frame across the overlay refresh.
                 self._load_entry_into_viewer(entry, preserve_view=True)
             self._update_title()
+            # The rail counts what the viewer holds, and what the viewer
+            # holds only changes on the reload above — the refresh inside
+            # _update_status_pipeline ran before it and therefore against
+            # the previous run's tables. Without this the chip for the run
+            # that just finished still reads "not run" until the user
+            # steps to another frame.
+            self._refresh_workflow_rail()
