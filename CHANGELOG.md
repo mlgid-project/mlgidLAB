@@ -4,7 +4,7 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
-## Unreleased
+## 0.1.0a17 — seventeenth alpha (2026-08-19)
 
 ### Added
 

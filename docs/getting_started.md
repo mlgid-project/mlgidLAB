@@ -31,10 +31,10 @@ conda create -n mlgidlab python=3.12 -y
 conda activate mlgidlab
 
 # GUI only
-pip install "git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a16"
+pip install "git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a17"
 
 # or, full pipeline (detection / fitting / matching + raw conversion)
-pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a16"
+pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a17"
 ```
 
 ### From a local clone (for development)
@@ -95,9 +95,14 @@ is kept across an update when it is installed.
    images). Selecting several images — or dropping a folder of them —
    opens each as its own entry, switchable from the entry combo and the
    file browser.
-2. **Look around**: left = HDF5 tree; centre = q-image (toggle
-   Cartesian / Polar); right-top = Pipeline / Conversion; right-bottom
-   = Profiles / Peaks tabs; status bar = file / entry / frame / cursor.
+2. **Look around**: with nothing open the window shows a welcome page
+   (Open, Import images, recent files). Once a file is loaded: left =
+   HDF5 tree; centre = q-image (toggle Cartesian / Polar) under a
+   workflow rail showing what Convert / Detect / Fit / Match / Track
+   have produced for the current frame; right-top = Pipeline /
+   Conversion; right-bottom = Profiles / Peaks / Scan tracking tabs;
+   status bar = file / entry / frame / pipeline activity / cursor
+   (`q`, `d` and `2θ`).
 3. **Raw → NeXus** (raw file): in the Conversion dock set PONI, mask,
    angle of incidence (the **Create…** buttons open the embedded pyFAI
    calibration), choose geometry + output, click **Convert**. The
@@ -107,16 +112,32 @@ is kept across an update when it is installed.
    `example/prepr_cifs.pickle`) → **Run Matching**. Overlays and the
    Peaks tables populate.
 5. **Edit peaks**: click a peak to select; drag ROI edges to resize;
-   `Ctrl+Alt`-drag a new manual box and **Add to fitted**. Multi-select
-   detected/fitted peaks with `Ctrl+click` / `Ctrl+A`; copy/paste
-   detected peaks with `Ctrl+C` / `Ctrl+V` (or `Ctrl+Shift+V` to paste
-   to a frame range); **Fit selected (2D)** batch-fits; `Delete`
-   removes (bulk for a multi-selection). `Ctrl+Z` / `Ctrl+Shift+Z`
-   undo / redo every edit.
-6. **Save**: edits live on a temp copy; `File → Save` / `Save As`
+   `Ctrl+Alt`-drag a new manual box (polar mode) and **Add to
+   detected** / **Add to fitted**. Overlapping boxes follow one rule:
+   the smallest box under the cursor wins, and clicking again steps to
+   the next one underneath. Multi-select detected/fitted peaks with
+   `Ctrl+click` / `Ctrl+A`, on the image **or** in the Peaks tables;
+   copy/paste detected peaks with `Ctrl+C` / `Ctrl+V` (or
+   `Ctrl+Shift+V` to paste to a frame range); **Fit selected (2D)**
+   batch-fits; `Delete` removes (bulk for a multi-selection, from
+   either the image or the tables). `Ctrl+Z` / `Ctrl+Shift+Z` undo /
+   redo every edit.
+6. **Label a frame quickly**: tick **Quick select** in the Display
+   dock and pick what each box becomes (detected, fitted, or both).
+   Drawing the next box commits the previous one, so labelling is
+   draw-draw-draw; a box drawn on top of the pending one replaces it
+   instead. The last box commits when you click away, press `Enter`,
+   change frame or switch the mode off — `Esc` discards it.
+
+   By default each fit is stored under the id of the detected peak it
+   came from: one fit per detection, refitting replaces rather than
+   appends, and deleting a detected peak deletes its fit. Both that
+   link and the reverse (a fitted delete removing the detection) are
+   switches under `Settings → Settings…`.
+7. **Save**: edits live on a temp copy; `File → Save` / `Save As`
    writes back. The title bar shows a `*` while there are unsaved
    changes.
-7. **Export**: `Tools → Export figure…` (matplotlib) or `Export peaks
+8. **Export**: `Tools → Export figure…` (matplotlib) or `Export peaks
    as CSV…`.
 
 A working sample is bundled under `example/` (`organic_labeled.h5`,
@@ -131,7 +152,9 @@ A working sample is bundled under `example/` (`organic_labeled.h5`,
 | `Ctrl+click`, `Ctrl+A` | multi-select detected/fitted peaks |
 | `Ctrl+C` / `Ctrl+V` | copy / paste detected peaks |
 | `Ctrl+Shift+V` | paste detected peaks to a frame range |
-| `Delete` | delete selected peak(s) |
+| `Delete` | delete selected peak(s) — on the image or in the Peaks tables |
+| `Enter` | commit the pending Quick-select box |
+| `Esc` | discard the selected manual box |
 | `Ctrl+Z` / `Ctrl+Shift+Z` (or `Ctrl+Y`) | undo / redo |
 | `Ctrl+F` | find peak by id |
 | `F1` | controls & shortcuts reference |
