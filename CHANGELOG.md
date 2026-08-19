@@ -90,6 +90,15 @@ pre-releases.
 
 ### Fixed
 
+- **A single-peak 2D fit no longer wanders onto its neighbour.** "Add to
+  fitted" and "Fit selected (2D)" handed pygidfit one box at a time.
+  pygidfit masks and joint-fits only the boxes it gets in one call, so
+  a neighbouring peak's intensity sat unmasked inside the target's fit
+  region and could pull the result out of the box that was drawn. Both
+  paths now pass the frame's nearby peak boxes along with the target,
+  which is the same input the pipeline fit gets for a whole frame. Far
+  boxes, rings and duplicates are filtered out, so a click still costs
+  one fit rather than a frame's worth.
 - **The hover outline no longer lingers.** It could survive the cursor
   leaving: a re-render while a run was in flight left it painted, and a
   re-render after the pointer had left the window redrew it. Every exit

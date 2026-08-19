@@ -1351,6 +1351,7 @@ class PeaksMixin:
                 clustering_distance_peaks=cdp,
                 clustering_distance_rings=cdr,
                 clustering_extend=ce,
+                neighbours=self._neighbour_boxes(entry, int(frame), sel),
                 **geom,
             )
         except ManualFitError as exc:
@@ -1358,6 +1359,43 @@ class PeaksMixin:
         except Exception as exc:
             return None, f"Unexpected 2D fit error: {exc!r}"
         return fit_2d, None
+
+    def _neighbour_boxes(
+        self, entry: str, frame: int, sel: SelectedPeak,
+    ) -> list:
+        """The frame's other peak boxes, for pygidfit to mask or
+        joint-fit alongside ``sel``.
+
+        pygidfit only reasons about the boxes in one ``fit_data``
+        call, so handing it just the user's box left neighbouring
+        intensity unmasked in the ROI (see ``manual_fit``). Detected
+        and fitted rows both count; ``select_neighbour_boxes`` inside
+        the wrapper drops rings, duplicates and everything too far
+        away to touch the target's ROI.
+
+        Source is the viewer's per-frame peak cache — the tables the
+        overlays already hold, so a click costs no I/O. Only when the
+        frame is not cached (a batch fit reaching a frame the user
+        never opened) does this fall back to a read, and a failed
+        read means no neighbours rather than a failed fit.
+        """
+        from mlgidlab.manual_fit import neighbour_boxes_from_tables
+
+        tables = (getattr(self.viewer, "_frame_peaks", None) or {}).get(frame)
+        if not tables:
+            if self.session is None:
+                return []
+            try:
+                tables = file_model.load_peaks(
+                    self.session.temp_path, entry, int(frame),
+                )
+            except Exception:
+                return []
+        return neighbour_boxes_from_tables(
+            tables,
+            exclude_kind=sel.kind,
+            exclude_id=getattr(sel, "peak_id", None),
+        )
 
     def _build_fitted_row_2d(
         self, sel: SelectedPeak, entry: str, frame: int,

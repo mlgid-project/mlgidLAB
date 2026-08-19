@@ -322,3 +322,101 @@ def test_gaussian_from_stored_params_returns_none_on_bad_inputs():
     assert gaussian_from_stored_params(axis, center=2.0, fwhm=0.1, amplitude=float("nan")) is None
     # Empty axis.
     assert gaussian_from_stored_params(np.array([]), center=2.0, fwhm=0.1, amplitude=1.0) is None
+
+
+def _synthetic_two_peaks(
+    n: int = 256, q_max: float = 3.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Two 2D Gaussians at the same radius, 7° apart: a weak target at
+    45° and a neighbour at 52° eight times as bright. Their boxes are
+    close enough that the neighbour's intensity falls inside the
+    target's fit ROI (pygidfit's ROI is the box padded by
+    ``clustering_extend``, and its radial half-extent is
+    ``radius_width``, not ``radius_width / 2``).
+    """
+    q_xy = np.linspace(0.0, q_max, n, dtype=np.float32)
+    q_z = np.linspace(0.0, q_max, n, dtype=np.float32)
+    QXY, QZ = np.meshgrid(q_xy, q_z)
+    R = np.sqrt(QXY ** 2 + QZ ** 2)
+    A = np.rad2deg(np.arctan2(QZ, QXY))
+    img = np.zeros_like(R)
+    for centre_a, amp in ((45.0, 100.0), (52.0, 800.0)):
+        img += amp * np.exp(
+            -0.5 * (((R - 1.5) / 0.04) ** 2 + ((A - centre_a) / 3.0) ** 2)
+        )
+    return img.astype(np.float32), q_xy, q_z
+
+
+def test_a_neighbour_box_keeps_the_fit_inside_the_drawn_box():
+    """Regression for the user-reported "fitted peak lies outside the
+    marked area".
+
+    pygidfit masks / joint-fits only the boxes handed to one
+    ``fit_data`` call, and it bounds a peak centre a quarter of the
+    box outside each edge. Passing the target alone therefore let a
+    bright neighbour inside the ROI drag the centre out of the drawn
+    box and inflate the amplitude. Passing the neighbour switches
+    pygidfit's own handling back on.
+
+    Both halves are asserted: the naive single-box call must still
+    fail this way (otherwise the test would pass for the wrong
+    reason), and the neighbour-aware call must recover the target.
+    """
+    from mlgidlab.manual_fit import PeakBox
+
+    cart, q_xy, q_z = _synthetic_two_peaks()
+    fwhm_factor = 2.0 * np.sqrt(2.0 * np.log(2.0))
+    box = dict(
+        radius=1.5, radius_width=0.04 * fwhm_factor,
+        angle=45.0, angle_width=3.0 * fwhm_factor,
+    )
+    geom = dict(wavelength_angstrom=1.0, q_xy_max=3.0, q_z_max=3.0)
+    half_angle = 0.5 * box["angle_width"]
+
+    naive = fit_one_peak(cart, q_xy, q_z, **box, **geom)
+    assert abs(naive.angle - 45.0) > half_angle, (
+        "the unmasked fit no longer drifts out of the drawn box — "
+        "this test's premise has changed"
+    )
+
+    with_neighbour = fit_one_peak(
+        cart, q_xy, q_z, **box, **geom,
+        neighbours=[PeakBox(1.5, 0.04 * fwhm_factor, 52.0, 3.0 * fwhm_factor)],
+    )
+    assert abs(with_neighbour.angle - 45.0) <= half_angle
+    assert with_neighbour.angle == pytest.approx(45.0, abs=0.5)
+    assert with_neighbour.radius == pytest.approx(1.5, abs=0.01)
+    # The naive fit swallowed part of the neighbour's 800-count peak;
+    # the masked one recovers the target's own 100.
+    assert with_neighbour.amplitude == pytest.approx(100.0, rel=0.15)
+    assert naive.amplitude > 2.0 * with_neighbour.amplitude
+
+
+def test_far_neighbours_do_not_change_the_fit():
+    """``select_neighbour_boxes`` drops boxes that cannot reach the
+    target's ROI, so handing the wrapper a whole frame's worth of
+    distant peaks must produce exactly the single-box result — no
+    drift, and no extra cluster fits on every click."""
+    from mlgidlab.manual_fit import PeakBox
+
+    cart, q_xy, q_z = _synthetic_cartesian_with_gaussian(
+        centre_r=1.5, centre_a=45.0, sigma_r=0.04, sigma_a=3.0,
+        amplitude=120.0,
+    )
+    fwhm_factor = 2.0 * np.sqrt(2.0 * np.log(2.0))
+    box = dict(
+        radius=1.5, radius_width=0.04 * fwhm_factor,
+        angle=45.0, angle_width=3.0 * fwhm_factor,
+    )
+    geom = dict(wavelength_angstrom=1.0, q_xy_max=3.0, q_z_max=3.0)
+    alone = fit_one_peak(cart, q_xy, q_z, **box, **geom)
+    with_far = fit_one_peak(
+        cart, q_xy, q_z, **box, **geom,
+        neighbours=[
+            PeakBox(0.6, 0.05, 20.0, 8.0),
+            PeakBox(2.6, 0.05, 70.0, 8.0),
+        ],
+    )
+    assert with_far.radius == pytest.approx(alone.radius, abs=1e-12)
+    assert with_far.angle == pytest.approx(alone.angle, abs=1e-12)
+    assert with_far.amplitude == pytest.approx(alone.amplitude, abs=1e-12)
