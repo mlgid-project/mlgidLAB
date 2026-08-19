@@ -99,6 +99,20 @@ pre-releases.
 
 ### Fixed
 
+- **The welcome page draws at cold start.** The page the window opens
+  on was empty: an unset label where the wordmark goes, and a "Recent"
+  heading with nothing under it. Everything visible on it is filled by
+  `_refresh_welcome_view`, which was only reachable from
+  `_apply_session_mode` — and that first runs when a file is opened, so
+  the state the page exists for was the one state it never ran in.
+
+- **The workflow rail no longer reports one run behind.** Run detection
+  and the Detect chip still said "not run"; run matching and Match said
+  "not run" next to three matched phases in the Display dock. The rail
+  counts what the viewer holds, and it was refreshed before the finished
+  run's results were loaded into the viewer, so it always described the
+  previous run. It now refreshes again after the reload.
+
 - **The 1D profile fit stops refusing narrow peaks and inventing
   backgrounds.** It used to fit five parameters — peak plus a straight
   line — inside a window that was exactly the box, where a straight

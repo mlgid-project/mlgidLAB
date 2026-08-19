@@ -176,3 +176,33 @@ def test_the_skin_defines_the_rail_rules():
         assert 'QWidget[mlgid="rail"]' in qss
         assert 'QToolButton[stage="chip"]' in qss
         assert 'QToolButton[stage="run"]' in qss
+
+
+def test_the_rail_catches_up_when_a_run_s_results_land(main_window,
+                                                       synthetic_nexus,
+                                                       monkeypatch):
+    """A finished run refreshes the rail twice, and the second one is the
+    one that counts.
+
+    _on_pipeline_finished flips the status bar out of "running" first,
+    which refreshes the rail, and only then reloads the entry into the
+    viewer. The rail reads the viewer, so refreshing it before the reload
+    counts the tables from before the run: the chip for the run that just
+    finished kept saying "not run" until something else moved.
+    """
+    from mlgidlab.session import NexusSession
+
+    main_window._set_active_session(NexusSession.open(synthetic_nexus))
+    frame = int(main_window.viewer.current_frame)
+    assert main_window.workflow_rail.chips["detect"].state.text() == "not run"
+
+    def reload_with_results(entry, preserve_view=False):
+        main_window.viewer.set_peaks(
+            frame, {"detected": _table(5), "fitted": None, "manual": None})
+
+    monkeypatch.setattr(main_window, "_load_entry_into_viewer",
+                        reload_with_results)
+    main_window._pipe_command = None
+    main_window._on_pipeline_finished(None, None)
+
+    assert main_window.workflow_rail.chips["detect"].state.text() == "5 this frame"
