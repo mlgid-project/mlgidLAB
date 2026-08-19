@@ -1,7 +1,12 @@
 """Batch 2D fit of the multi-selected detected peaks.
 
 Five scenarios (all stub out ``_run_pygidfit_for_selection`` so the
-real pygidfit isn't invoked):
+real pygidfit isn't invoked). The row-count ones take
+``peak_link_off``: they count appended rows, which is the unlinked
+contract. With the fitted/detected link on (the shipped default) a
+batch fit writes each fit under its detected peak's id and replaces
+that peak's previous fit, so the count is the number of *detected*
+peaks — covered in ``test_peak_linking.py``.
 
 * One fitted row appended per selected detected peak on success.
 * Button is disabled when 'Save fitted as ring' is on (ring forces 1D).
@@ -61,7 +66,7 @@ def _select_all_three_detected(window):
 
 
 def test_batch_fit_appends_one_fitted_row_per_selected(
-    main_window, synthetic_nexus_with_peaks, monkeypatch,
+    main_window, synthetic_nexus_with_peaks, monkeypatch, peak_link_off,
 ):
     """3 detected selected, pygidfit stubbed → 3 fitted rows added."""
     from mlgidlab import file_model
@@ -131,7 +136,7 @@ def test_fit_buttons_visibility_swap(
 
 
 def test_batch_fit_cancel_mid_loop_keeps_partial(
-    main_window, synthetic_nexus_with_peaks, monkeypatch,
+    main_window, synthetic_nexus_with_peaks, monkeypatch, peak_link_off,
 ):
     """Cancel after the first write keeps row 1 but not 2/3."""
     from mlgidlab import file_model
@@ -182,7 +187,7 @@ def test_batch_fit_cancel_mid_loop_keeps_partial(
 
 
 def test_batch_fit_undo_removes_all_appended(
-    main_window, synthetic_nexus_with_peaks, monkeypatch,
+    main_window, synthetic_nexus_with_peaks, monkeypatch, peak_link_off,
 ):
     """One Ctrl+Z reverses the whole batch — all N appended rows go."""
     from mlgidlab import file_model
@@ -211,7 +216,7 @@ def test_batch_fit_undo_removes_all_appended(
 
 
 def test_batch_fit_partial_failure_continues(
-    main_window, synthetic_nexus_with_peaks, monkeypatch,
+    main_window, synthetic_nexus_with_peaks, monkeypatch, peak_link_off,
 ):
     """pygidfit fails on the 2nd peak; the 1st and 3rd still write."""
     from mlgidlab import file_model

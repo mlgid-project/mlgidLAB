@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QMessageBox, QProgressDialog
 from mlgidlab import file_model, phase_tracking
 from mlgidlab.phase_views_window import PhaseViewsWindow
+from mlgidlab.peak_link import link_enabled
 from mlgidlab.pipeline import PipelineCommand
 from mlgidlab.widgets import skin_progress
 
@@ -475,6 +476,8 @@ class TrackingMixin:
             "entry": entry,
             "plan": plan,
             "fit_params": fit_params,
+            # Same pairing as the expected-pattern injection.
+            "link_ids": link_enabled(),
         })
         match_cmds = self._build_interp_match_commands(
             plan, entry, match_kwargs

@@ -8,6 +8,15 @@ pre-releases.
 
 ### Added
 
+- **One fitted peak per detected peak.** A fit is now stored under the id
+  of the detected peak it came from, so fitting a peak again replaces its
+  fit instead of adding a second one, and the fitted peaks can no longer
+  outnumber the detected ones. Deleting a detected peak deletes its fit
+  too; deleting a fit leaves the detection alone unless you ask for that
+  as well. A hand-drawn box is added to the detected peaks first, so
+  every fit has a detection behind it. Both parts are switches in
+  Settings — the link is on by default, the reverse delete is off — and
+  with the link off everything behaves exactly as it did before.
 - **A hover preview for peak selection.** Moving over the image outlines
   the box a click would take, and when boxes are stacked the status bar
   says how many are under the cursor.

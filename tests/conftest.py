@@ -271,6 +271,28 @@ def clean_matched_colors():
 
 
 @pytest.fixture
+def peak_link_off():
+    """Turn the fitted/detected link off for one test.
+
+    The link ships **on**, so with no fixture a fitted write takes its
+    detected peak's id and replaces that peak's previous fit. Tests that
+    predate the setting assert the unlinked behaviour — two independent
+    tables, every fit appended under a fresh id — which is exactly what
+    the setting promises when it is off. They take this fixture; the
+    linked behaviour is covered in ``test_peak_linking.py``.
+    """
+    from PySide6.QtCore import QSettings
+    from mlgidlab.main_window_constants import PEAK_LINK_KEY
+
+    s = QSettings()
+    s.setValue(PEAK_LINK_KEY, False)
+    s.sync()
+    yield
+    s.remove(PEAK_LINK_KEY)
+    s.sync()
+
+
+@pytest.fixture
 def synthetic_nexus(tmp_path):
     """A minimal valid NeXus file: 1 entry, 3 frames, no peaks.
 

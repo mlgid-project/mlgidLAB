@@ -337,6 +337,11 @@ class MenusMixin:
         Cascade rule (one-way):
         - clearing ``fitted`` also clears ``matched`` (matched rows
           reference fitted ids; orphaned matched_* groups can't render).
+        - clearing ``detected`` also clears fitted (and so matched)
+          while the fitted/detected link is on — a fit belongs to its
+          detection, and clearing every detection on a scope would
+          otherwise leave every fit behind with nothing behind it. With
+          the link off, detected clears alone, as it always did.
         - clearing ``matched`` clears matched only; detected and fitted
           are left intact (re-match without re-fitting). See the
           Tools-menu wiring above.
@@ -360,12 +365,17 @@ class MenusMixin:
             return
         targets, scope_label = resolved
 
-        if not self._confirm_clear(kind, scope_label):
+        from mlgidlab.peak_link import link_enabled
+
+        linked = kind == "detected" and link_enabled()
+        if not self._confirm_clear(kind, scope_label, linked=linked):
             return
 
         kinds_to_clear = [kind]
-        if kind == "fitted":
+        if kind == "fitted" or linked:
             kinds_to_clear.append("matched")
+        if linked:
+            kinds_to_clear.insert(1, "fitted")
 
         with self._detached_silx_tree():
             try:
@@ -587,10 +597,24 @@ class MenusMixin:
             f"Exported {n} {kind} peak rows ({scope}) to {path}"
         )
 
-    def _confirm_clear(self, kind: str, scope_label: str = "") -> bool:
+    def _confirm_clear(
+        self, kind: str, scope_label: str = "", linked: bool = False,
+    ) -> bool:
+        """Confirm a clear, naming exactly what it will remove.
+
+        ``linked`` says the fitted/detected link will widen a detected
+        clear to fitted (and so matched) — the dialog has to say so
+        before anything goes, since no clear is undoable.
+        """
         descriptions = {
-            "detected": ("detected peaks",
-                         "every row of detected_peaks"),
+            "detected": (
+                ("detected + fitted + matched peaks",
+                 "every row of detected_peaks AND fitted_peaks AND every "
+                 "matched_* solution (each fit belongs to the detected "
+                 "peak it came from, and matched references fitted)")
+                if linked else
+                ("detected peaks", "every row of detected_peaks")
+            ),
             "fitted":   ("fitted + matched peaks",
                          "every row of fitted_peaks AND every matched_* "
                          "solution (matched references fitted, so it has "

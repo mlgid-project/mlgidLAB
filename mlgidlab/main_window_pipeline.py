@@ -396,6 +396,52 @@ class PipelineMixin:
             self._open_queue.append(Path(out_path))
         self._process_open_queue()
 
+    def _rekey_fitted_after_fit(self, cmd) -> None:
+        """Pair the run's fitted rows back to their detected peaks.
+
+        Scope follows the command exactly as the pre-run matched
+        invalidation does (``pipeline.execute``): an ``entry`` kwarg
+        limits it to that entry, a ``frame_num`` to that frame, and
+        neither means the run covered every entry. Frames whose ids
+        already agree cost a read and no write, so an all-entries run
+        over a long scan stays cheap.
+
+        Best-effort: a failure here is logged, not raised. The fits
+        themselves are already saved and correct; only the pairing
+        would be off, and the user can re-run.
+
+        Writes directly, without detaching silx: the only caller runs
+        while the tree is still detached for the pipeline job (it
+        reattaches when the queue drains).
+        """
+        from mlgidlab.peak_link import link_enabled
+
+        if not link_enabled():
+            return
+        entry_arg = cmd.kwargs.get("entry")
+        frame_arg = cmd.kwargs.get("frame_num")
+        frame = int(frame_arg) if isinstance(frame_arg, int) else None
+        try:
+            if isinstance(entry_arg, str) and entry_arg:
+                entries = [entry_arg]
+            else:
+                entries = file_model.list_entries(self.session.temp_path)
+            changed = 0
+            for ent in entries:
+                changed += file_model.rekey_fitted_ids_to_detected(
+                    self.session.temp_path, ent, frame=frame,
+                )
+        except Exception as exc:
+            self.pipeline_panel.append_log(
+                f"Could not link the new fits to their detected peaks: {exc}"
+            )
+            return
+        if changed:
+            self.pipeline_panel.append_log(
+                f"Linked the new fits to their detected peaks on "
+                f"{changed} frame(s)."
+            )
+
     def _on_pipeline_finished(self, result: object, error: Exception | None) -> None:
         self._pipe_thread, self._pipe_worker = stop_worker_thread(
             self._pipe_thread, self._pipe_worker
@@ -425,11 +471,28 @@ class PipelineMixin:
         if self.session is not None and error is None:
             self.session.mark_dirty()
 
+        # A fitting run numbers fitted_peaks 0..N-1 by position over the
+        # detected table (pygidfit's container carries id = box.index),
+        # which is not the detected ids once those have gaps. While the
+        # fitted/detected link is on, re-key them back onto their
+        # detected peaks so the pairing the user relies on survives the
+        # run. Done here rather than inside ``pipeline.execute``: the
+        # worker has no business reading QSettings, and the silx tree is
+        # still detached at this point (it reattaches only when the
+        # queue drains), so the write is safe.
+        cmd = getattr(self, "_pipe_command", None)
+        if (
+            error is None
+            and self.session is not None
+            and cmd is not None
+            and cmd.op_name == "run_fitting"
+        ):
+            self._rekey_fitted_after_fit(cmd)
+
         # A re-fit rewrites the entry's fitted_peaks wholesale, so any
         # phase-tracking results for that entry are stale. Invalidate
         # when the finished command was a fitting run touching the
         # tracked entry (kwargs without an entry ran on every entry).
-        cmd = getattr(self, "_pipe_command", None)
         if (
             error is None
             and self._scan_track_entry is not None

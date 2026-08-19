@@ -99,6 +99,38 @@ def test_inject_spots_appends_rows_without_track(
         assert not fit.is_ring[fi]
 
 
+def test_link_ids_pairs_each_fit_with_its_injected_box(
+    synthetic_nexus_with_peaks, monkeypatch,
+):
+    """The op writes a detected box and its fit as a pair, so with the
+    fitted/detected link on the fit takes the box's id — the GUI reads
+    the setting and passes the answer in, since a worker has no
+    business touching QSettings."""
+    path = synthetic_nexus_with_peaks
+    _patch_geometry(monkeypatch)
+    _patch_fit(monkeypatch, _echo_fit)
+    specs = [
+        {"radius": 1.0, "angle": 30.0, "radius_width": 0.2,
+         "angle_width": 6.0, "is_ring": False},
+        {"radius": 2.0, "angle": 70.0, "radius_width": 0.2,
+         "angle_width": 6.0, "is_ring": False},
+    ]
+    records = execute(path, PipelineCommand("inject_fitted_peaks", {
+        "entry": ENTRY, "plan": {0: specs}, "fit_params": {},
+        "link_ids": True,
+    }))
+    assert [r["fitted_id"] for r in records] == [
+        r["detected_id"] for r in records
+    ]
+    # The ids are the injected boxes', not a continuation of the fitted
+    # table (which held 0 and 1 before this run).
+    assert [r["detected_id"] for r in records] == [3, 4]
+    tables = file_model.load_peaks(path, ENTRY, 0)
+    assert sorted(int(v) for v in tables["fitted"].ids) == [0, 1, 3, 4]
+    # Without the flag the fitted rows follow their own table, which
+    # ``test_inject_spots_appends_rows_without_track`` covers.
+
+
 def test_inject_ring_persists_ring_convention(
     synthetic_nexus_with_peaks, monkeypatch,
 ):
