@@ -856,13 +856,15 @@ class MenusMixin:
         Settings in cross-platform apps.
         """
         settings_menu = self.menuBar().addMenu("&Settings")
+        # Attribute name kept: it is the key this action's icon is
+        # registered under in ``_MENU_ICONS``.
         self.action_playback_settings = QAction(
-            "&Playback settings…", self
+            "&Settings…", self
         )
         self.action_playback_settings.setToolTip(
-            "Configure how the Display-dock Play button drives frame "
-            "advance — either fixed time per frame or fixed total "
-            "duration regardless of frame count."
+            "Application settings: how the Display-dock Play button "
+            "drives frame advance, and whether each fitted peak is "
+            "linked to the detected peak it came from."
         )
         self.action_playback_settings.triggered.connect(
             self._action_playback_settings
@@ -870,13 +872,16 @@ class MenusMixin:
         settings_menu.addAction(self.action_playback_settings)
 
     def _action_playback_settings(self) -> None:
-        """Open the playback-settings dialog.
+        """Open the application settings dialog.
 
         On accept, persist the dialog's values via QSettings and, if
         the play timer is currently running, re-apply the new
         interval mid-flight so the change is felt immediately. The
         next press of Play also re-reads via ``_compute_play_schedule``
         so a setting change applied while paused still takes effect.
+
+        The peak-link settings need no re-apply: every consumer reads
+        them at the moment it acts (see ``mlgidlab.peak_link``).
         """
         dlg = _SettingsDialog(self)
         if dlg.exec() != QDialog.DialogCode.Accepted:

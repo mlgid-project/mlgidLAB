@@ -6,6 +6,7 @@ from __future__ import annotations
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
@@ -17,6 +18,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 from mlgidlab.main_window_constants import (
+    PEAK_LINK_KEY,
+    PEAK_LINK_REVERSE_KEY,
     PLAYBACK_FRAME_MS_KEY,
     PLAYBACK_MODE_KEY,
     PLAYBACK_TOTAL_S_KEY,
@@ -29,6 +32,7 @@ from mlgidlab.main_window_constants import (
     PLAYBACK_TOTAL_S_MAX,
     PLAYBACK_TOTAL_S_MIN,
 )
+from mlgidlab.peak_link import link_enabled, read_bool
 
 
 class _ExportPeaksDialog(QDialog):
@@ -105,9 +109,8 @@ class _ExportPeaksDialog(QDialog):
 class _SettingsDialog(QDialog):
     """Application-wide settings dialog.
 
-    Currently only carries the frame-playback section, but its
-    layout reserves room for future settings groups (rendering,
-    pipeline defaults, etc.) so adding a new section is just
+    Carries the frame-playback section and the peak-editing section;
+    the layout leaves room for more, so adding a section is just
     appending another ``QGroupBox`` to the outer layout.
 
     On accept, every changed value is written back to QSettings and
@@ -177,6 +180,43 @@ class _SettingsDialog(QDialog):
         playback_layout.addLayout(form)
         outer.addWidget(playback_box)
 
+        # --- Peak editing section ---------------------------------------------
+        peaks_box = QGroupBox("Peak editing")
+        peaks_layout = QVBoxLayout(peaks_box)
+
+        peaks_hint = QLabel(
+            "<i>How fitted peaks relate to the detected peaks they "
+            "come from.</i>"
+        )
+        peaks_hint.setWordWrap(True)
+        peaks_layout.addWidget(peaks_hint)
+
+        self._chk_peak_link = QCheckBox(
+            "One fitted peak per detected peak"
+        )
+        self._chk_peak_link.setToolTip(
+            "A fit made from a detected peak is stored under that peak's "
+            "id, so fitting it again replaces the fit instead of adding a "
+            "second one, and deleting the detected peak deletes its fit. "
+            "A hand-drawn box is added to the detected peaks first, so "
+            "every fitted peak has a detected partner.\n\n"
+            "Turn this off to keep the two tables fully independent, as "
+            "they were before this option existed."
+        )
+        self._chk_peak_link_reverse = QCheckBox(
+            "Deleting a fitted peak also deletes its detected peak"
+        )
+        self._chk_peak_link_reverse.setToolTip(
+            "Off by default: discarding a fit usually means the "
+            "prediction was wrong, not that the detection was. Needs the "
+            "option above, since without paired ids there is no partner "
+            "to delete."
+        )
+        self._chk_peak_link.toggled.connect(self._refresh_enabled)
+        peaks_layout.addWidget(self._chk_peak_link)
+        peaks_layout.addWidget(self._chk_peak_link_reverse)
+        outer.addWidget(peaks_box)
+
         # --- Buttons + outer wiring -------------------------------------------
         outer.addStretch(1)
         btns = QDialogButtonBox(
@@ -218,12 +258,27 @@ class _SettingsDialog(QDialog):
             self._rb_total.setChecked(True)
         else:
             self._rb_frame.setChecked(True)
+        # ``reverse_delete_enabled()`` folds in the link, which would
+        # show the box unticked whenever the link is off even though the
+        # user's own choice was to tick it. Read the raw key so the
+        # dialog reflects what is stored, and let the enabled-state
+        # carry the dependency.
+        self._chk_peak_link.setChecked(link_enabled())
+        self._chk_peak_link_reverse.setChecked(
+            read_bool(PEAK_LINK_REVERSE_KEY, False)
+        )
         self._refresh_enabled()
 
     def _refresh_enabled(self) -> None:
         frame_active = self._rb_frame.isChecked()
         self._spin_frame_ms.setEnabled(frame_active)
         self._spin_total_s.setEnabled(not frame_active)
+        # The reverse cascade needs paired ids to have anything to
+        # cascade to, so it greys out with the link rather than lying
+        # about what it would do.
+        self._chk_peak_link_reverse.setEnabled(
+            self._chk_peak_link.isChecked()
+        )
 
     def save_to_qsettings(self) -> None:
         """Write the dialog's current values to QSettings.
@@ -239,4 +294,9 @@ class _SettingsDialog(QDialog):
         )
         settings.setValue(
             PLAYBACK_TOTAL_S_KEY, float(self._spin_total_s.value())
+        )
+        settings.setValue(PEAK_LINK_KEY, bool(self._chk_peak_link.isChecked()))
+        settings.setValue(
+            PEAK_LINK_REVERSE_KEY,
+            bool(self._chk_peak_link_reverse.isChecked()),
         )

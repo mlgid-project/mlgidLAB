@@ -35,3 +35,11 @@ PLAYBACK_TICK_FLOOR_MS = 50
 PLAYBACK_MODE_KEY = "playbackMode"
 PLAYBACK_FRAME_MS_KEY = "playbackFrameIntervalMs"
 PLAYBACK_TOTAL_S_KEY = "playbackTotalTimeS"
+
+# QSettings keys for the fitted/detected peak link. See
+# ``mlgidlab.peak_link`` for what each one changes; the defaults are the
+# shipped behaviour (linked, and a fitted delete leaves the detection).
+PEAK_LINK_KEY = "peakLinkFittedToDetected"
+PEAK_LINK_REVERSE_KEY = "peakLinkFittedDeleteRemovesDetected"
+DEFAULT_PEAK_LINK = True
+DEFAULT_PEAK_LINK_REVERSE = False
