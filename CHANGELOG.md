@@ -8,6 +8,14 @@ pre-releases.
 
 ### Added
 
+- **Select and delete peaks from the Peaks tables.** The Detected and
+  Fitted tabs now take Ctrl+click, Shift+click and Ctrl+A for several
+  rows at once, and the image follows along (and the other way round —
+  a multi-selection made on the image now highlights every one of its
+  rows in the table). Pressing Delete with rows selected removes them,
+  through exactly the same confirmation and undo as the Delete key on
+  the image. The Matched tab is unchanged: a row there is a whole
+  structure, not a peak.
 - **One fitted peak per detected peak.** A fit is now stored under the id
   of the detected peak it came from, so fitting a peak again replaces its
   fit instead of adding a second one, and the fitted peaks can no longer

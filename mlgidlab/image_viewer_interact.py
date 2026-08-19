@@ -1306,11 +1306,26 @@ class ViewerInteractMixin:
         ]
         if not indices:
             return
-        sels = [_sel(i) for i in indices]
-        # Bypass _set_selected (which would clear extras) and write
-        # the multi-selection in one shot.
+        self.set_selected_peaks([_sel(i) for i in indices])
+
+    def set_selected_peaks(self, sels: list[SelectedPeak]) -> None:
+        """Replace the whole selection with ``sels`` in one shot.
+
+        ``sels[0]`` becomes the primary and the rest the extras, so the
+        caller decides which peak the Parameter panel and the ROI
+        follow. Bypasses ``_set_selected``, which clears extras by
+        design, and emits both selection signals once rather than once
+        per peak — which is what a caller handing over a ready-made
+        list wants (Ctrl+A on the image, a Ctrl-multi-selection in the
+        Peaks table).
+
+        An empty list clears the selection.
+        """
+        if not sels:
+            self.clear_selection()
+            return
         self._selected = sels[0]
-        self._selected_extras = sels[1:]
+        self._selected_extras = list(sels[1:])
         self._sync_roi()
         self._render_overlays(self.current_frame)
         self.selectionChanged.emit(self._selected)

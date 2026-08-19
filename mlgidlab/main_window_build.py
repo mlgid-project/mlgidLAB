@@ -1056,6 +1056,20 @@ class BuildMixin:
         self.peaks_table_panel.peakSelectedFromTable.connect(
             self._on_peak_selected_from_table
         )
+        # Ctrl / Shift multi-select in the table drives the same
+        # multi-selection Ctrl+click on the image does, and Delete in
+        # the table routes into the same handlers the image-side
+        # Delete key uses — one confirmation, one write path, one undo
+        # entry, whichever half of the window the user is looking at.
+        self.peaks_table_panel.peaksSelectedFromTable.connect(
+            self._on_peaks_selected_from_table
+        )
+        self.peaks_table_panel.deletePeaksRequested.connect(
+            self._on_delete_peaks_from_table
+        )
+        self.viewer.selectionsChanged.connect(
+            self.peaks_table_panel.set_external_selections
+        )
 
         # Commit / delete actions on the parameter panel. Add-to-detected and
         # delete reuse the existing PipelineWorker path.

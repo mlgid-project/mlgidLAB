@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import numpy as np
 from PySide6.QtCore import (
+    QItemSelectionModel,
     QModelIndex,
     QSortFilterProxyModel,
     Qt,
@@ -134,6 +135,29 @@ def _set_header(
                             Qt.ItemDataRole.ToolTipRole)
 
 
+class _PeakTableView(QTableView):
+    """Table view that reports Delete instead of swallowing it.
+
+    ``QTableView`` consumes key presses it does not handle rather than
+    letting them bubble to the dock, so a Delete pressed with the
+    table focused would do nothing at all. Re-emitting it lets the
+    panel run the same delete the image viewer runs for the same
+    selection.
+    """
+
+    deleteRequested = Signal()
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if (
+            event.key() == Qt.Key.Key_Delete
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+        ):
+            self.deleteRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class _PeakProxy(QSortFilterProxyModel):
     """Mixed numeric / text sort.
 
@@ -167,6 +191,14 @@ class PeaksTablePanel(QWidget):
     # image viewer. Suppressed while ``set_external_selection`` is
     # applying an external change so the round-trip can't bounce.
     peakSelectedFromTable = Signal(object)
+    # The full multi-selection, whenever it holds two or more rows.
+    # Single-row changes keep using the signal above so the existing
+    # round-trip is untouched.
+    peaksSelectedFromTable = Signal(list)
+    # Delete pressed with rows selected on the Detected / Fitted tab.
+    # Carries the same SelectedPeak list the host's image-side delete
+    # handlers take, so the panel does no deleting of its own.
+    deletePeaksRequested = Signal(list)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -238,6 +270,12 @@ class PeaksTablePanel(QWidget):
         self._matched_table, self._matched_proxy = self._build_table(
             self._matched_model
         )
+        # A matched row is a whole structure, not a peak: multi-select
+        # and Delete both mean something different there, so the tab
+        # keeps the single-select behaviour it has always had.
+        self._matched_table.setSelectionMode(
+            QTableView.SelectionMode.SingleSelection
+        )
         self._tabs.addTab(self._matched_table, "Matched")
 
         # Source PeakTables for the most recent ``set_frame_peaks``
@@ -256,6 +294,14 @@ class PeaksTablePanel(QWidget):
         # wiring would round-trip the same selection back through
         # the viewer.
         self._applying_external_selection = False
+        # And the other direction: while the panel is announcing its
+        # own selection, ignore the mirror coming back. The viewer
+        # emits synchronously, so without this the table would be
+        # cleared and re-selected from inside its own mouse event —
+        # which a Ctrl+click survives least of all, because Qt applies
+        # its Toggle command on release and would toggle straight back
+        # off the row we had just re-selected underneath it.
+        self._emitting_own_selection = False
 
         # Per-tab row-selection wiring. Done once; selection-model
         # is re-fetched via ``selectionModel()`` because it changes
@@ -268,6 +314,22 @@ class PeaksTablePanel(QWidget):
         ):
             table.selectionModel().currentRowChanged.connect(
                 lambda cur, _prev, k=kind: self._on_row_changed(k, cur)
+            )
+            # currentRowChanged carries only the row the keyboard focus
+            # moved to, which is the whole story for a single-select
+            # tab but not for a Ctrl+click that adds a second row
+            # without moving the current index. selectionChanged fills
+            # that gap; it fires after currentRowChanged, so the
+            # multi-selection is the last word.
+            table.selectionModel().selectionChanged.connect(
+                lambda _sel, _desel, k=kind: self._on_selection_changed(k)
+            )
+        for table, kind in (
+            (self._detected_table, "detected"),
+            (self._fitted_table, "fitted"),
+        ):
+            table.deleteRequested.connect(
+                lambda k=kind: self._on_delete_requested(k)
             )
 
         # Default sort orders. These persist across refresh because
@@ -319,6 +381,8 @@ class PeaksTablePanel(QWidget):
         - Manual selections clear every tab (manual peaks have no
           table representation).
         """
+        if self._emitting_own_selection:
+            return
         self._applying_external_selection = True
         try:
             # Always clear all three first so a fresh selection
@@ -345,6 +409,72 @@ class PeaksTablePanel(QWidget):
         finally:
             self._applying_external_selection = False
 
+    def set_external_selections(self, sels: list[SelectedPeak]) -> None:
+        """Mirror an image-driven *multi*-selection onto the tables.
+
+        Same contract as :meth:`set_external_selection`, extended to the
+        Ctrl+click multi-selection the image viewer supports for
+        detected and fitted peaks: without this the table would show
+        only the primary while the image showed five boxes, and a
+        Delete pressed in the table would then act on a different set
+        than the one the user can see highlighted.
+
+        Zero or one peak defers to the single-selection path, so the
+        two entry points cannot drift.
+        """
+        if self._emitting_own_selection:
+            return
+        if len(sels) < 2:
+            self.set_external_selection(sels[0] if sels else None)
+            return
+        kind = sels[0].kind
+        if kind not in ("detected", "fitted"):
+            self.set_external_selection(sels[0])
+            return
+        self._applying_external_selection = True
+        try:
+            for table in (
+                self._detected_table, self._fitted_table, self._matched_table,
+            ):
+                table.selectionModel().clearCurrentIndex()
+                table.selectionModel().clearSelection()
+            self._tabs.setCurrentIndex(_TAB_BY_KIND[kind])
+            table = self._table_for(kind)
+            model = (
+                self._detected_model if kind == "detected"
+                else self._fitted_model
+            )
+            proxy = (
+                self._detected_proxy if kind == "detected"
+                else self._fitted_proxy
+            )
+            selection_model = table.selectionModel()
+            flags = (
+                QItemSelectionModel.SelectionFlag.Select
+                | QItemSelectionModel.SelectionFlag.Rows
+            )
+            first_idx = None
+            for sel in sels:
+                src_row = _find_row_for_id_in_model(model, sel.peak_id)
+                if src_row is None:
+                    continue
+                proxy_idx = proxy.mapFromSource(model.index(src_row, 0))
+                selection_model.select(proxy_idx, flags)
+                if first_idx is None:
+                    first_idx = proxy_idx
+            if first_idx is not None:
+                # The primary drives the scroll and the current index,
+                # matching what the image calls the primary.
+                selection_model.setCurrentIndex(
+                    first_idx,
+                    QItemSelectionModel.SelectionFlag.NoUpdate,
+                )
+                table.scrollTo(
+                    first_idx, QTableView.ScrollHint.PositionAtCenter,
+                )
+        finally:
+            self._applying_external_selection = False
+
     def clear(self) -> None:
         """Empty all three tabs and drop source references."""
         self._detected_src = None
@@ -364,11 +494,17 @@ class PeaksTablePanel(QWidget):
         proxy = _PeakProxy(self)
         proxy.setSourceModel(source_model)
 
-        table = QTableView(self)
+        table = _PeakTableView(self)
         table.setModel(proxy)
         table.setSortingEnabled(True)
         table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-        table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
+        # Extended = Ctrl+click to add/remove one row, Shift+click for a
+        # run, Ctrl+A for all. The image viewer already multi-selects
+        # detected and fitted peaks the same way, and the bulk actions
+        # behind it (delete, batch fit) are kind-scoped — which is why
+        # the Matched tab, whose rows are structures rather than peaks,
+        # stays single-select (see ``_build_table`` callers).
+        table.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
         table.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
         _skin_item_view(table)
         table.verticalHeader().setVisible(False)
@@ -490,6 +626,15 @@ class PeaksTablePanel(QWidget):
             return
         if not current.isValid():
             return
+        # A Ctrl+click moves the current row *and* grows the selection,
+        # and the two signals do not arrive in a fixed order across
+        # input paths (mouse, Ctrl+Space, programmatic). Whenever the
+        # tab holds more than one row the multi-selection is the
+        # answer, whichever signal noticed first — otherwise the single
+        # emit would land last and collapse the selection to one peak.
+        if len(self._selected_rows(kind)) >= 2:
+            self._on_selection_changed(kind)
+            return
         # The signal carries the proxy index; the items live in the
         # source model. Map back to source, then read the row's
         # column-0 item — for Detected / Fitted it's the ID item, for
@@ -512,7 +657,92 @@ class PeaksTablePanel(QWidget):
             sel = self._build_selection(kind, int(peak_id_payload), id_item)
         if sel is None:
             return
-        self.peakSelectedFromTable.emit(sel)
+        self._emit_own(self.peakSelectedFromTable, sel)
+
+    def _emit_own(self, signal, payload) -> None:
+        """Emit one of the panel's own selection signals.
+
+        The flag tells ``set_external_selection(s)`` that whatever
+        comes back is this panel's own change echoing through the
+        viewer, and must not be re-applied to the table mid-event.
+        """
+        self._emitting_own_selection = True
+        try:
+            signal.emit(payload)
+        finally:
+            self._emitting_own_selection = False
+
+    def _table_for(self, kind: str):
+        return {
+            "detected": self._detected_table,
+            "fitted": self._fitted_table,
+            "matched": self._matched_table,
+        }.get(kind)
+
+    def _selected_rows(self, kind: str) -> list[SelectedPeak]:
+        """Every selected row of one tab, as ``SelectedPeak``s.
+
+        The row under the current index comes first, so the peak the
+        user touched last is the one that becomes the primary
+        selection — the one the Parameter panel and the resize ROI
+        follow. The rest keep the view's own top-to-bottom order,
+        which is the sort order the user is looking at.
+
+        Rows are rebuilt from the live source table, not from the cell
+        text, so display rounding never leaks into the geometry (same
+        rule as ``_on_row_changed``).
+        """
+        table = self._table_for(kind)
+        if table is None:
+            return []
+        model = table.selectionModel()
+        if model is None:
+            return []
+        rows = list(model.selectedRows())
+        current = model.currentIndex()
+        if current.isValid():
+            rows.sort(key=lambda idx: idx.row() != current.row())
+        out: list[SelectedPeak] = []
+        for proxy_idx in rows:
+            source_idx = proxy_idx.model().mapToSource(proxy_idx)
+            id_item = source_idx.model().item(source_idx.row(), 0)
+            if id_item is None:
+                continue
+            payload = id_item.data(_ROLE_PEAK_ID)
+            if payload is None:
+                continue
+            sel = self._build_selection(
+                kind, 0 if kind == "matched" else int(payload), id_item,
+            )
+            if sel is not None:
+                out.append(sel)
+        return out
+
+    def _on_selection_changed(self, kind: str) -> None:
+        """Emit the multi-selection when a tab holds more than one row.
+
+        A single row already went out through ``peakSelectedFromTable``
+        on ``currentRowChanged``; re-emitting it here would only make
+        the viewer do the same work twice.
+        """
+        if self._applying_external_selection:
+            return
+        sels = self._selected_rows(kind)
+        if len(sels) < 2:
+            return
+        self._emit_own(self.peaksSelectedFromTable, sels)
+
+    def _on_delete_requested(self, kind: str) -> None:
+        """Delete pressed on the Detected / Fitted tab.
+
+        The panel does not delete anything itself: it hands the host
+        the same ``SelectedPeak`` list the image-side Delete produces,
+        so both routes share one confirmation, one write path and one
+        undo entry.
+        """
+        sels = self._selected_rows(kind)
+        if sels:
+            self._emit_own(self.deletePeaksRequested, sels)
 
     def _build_selection(
         self,

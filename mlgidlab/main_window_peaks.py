@@ -2148,6 +2148,40 @@ class PeaksMixin:
         viewer."""
         self._refresh_peaks_table()
 
+    def _on_peaks_selected_from_table(self, sels: list) -> None:
+        """Route a table multi-selection into the image viewer.
+
+        Same stamping as the single-row path — the panel has no viewer
+        context, so it builds every row with ``frame=0``. The list
+        order is the panel's: the row the user touched last comes
+        first and becomes the primary, so the Parameter panel and the
+        resize ROI follow the same peak they would after a Ctrl+click
+        on the image.
+        """
+        if not sels:
+            return
+        for sel in sels:
+            sel.frame = self.viewer.current_frame
+        self.viewer.set_selected_peaks(list(sels))
+
+    def _on_delete_peaks_from_table(self, sels: list) -> None:
+        """Delete pressed in the Peaks dock.
+
+        Hands straight over to the image-side handlers so the two
+        routes cannot diverge: one confirmation dialog, one write
+        path, one undo entry. The bulk handler wants two or more
+        peaks of one kind and the single handler wants exactly one,
+        which is the only reason this splits at all.
+        """
+        if not sels or self._is_busy():
+            return
+        for sel in sels:
+            sel.frame = self.viewer.current_frame
+        if len(sels) == 1:
+            self._on_delete_peak_requested(sels[0])
+        else:
+            self._on_delete_peaks_requested(list(sels))
+
     def _on_peak_selected_from_table(self, sel: SelectedPeak | None) -> None:
         """Route a table-row click back into the image viewer.
 
