@@ -56,6 +56,24 @@ def _double_click_ms() -> float:
     return float(app.doubleClickInterval()) if app is not None else 400.0
 
 
+def _boxes_overlap(a: ManualPeak, b: ManualPeak) -> bool:
+    """True when two hand-drawn boxes describe the same peak.
+
+    Quick select commits the pending box when the next one is drawn
+    *somewhere else*; a box drawn on top of the pending one is the user
+    correcting an attempt they were not happy with, and must replace it
+    silently. The test is the same one the fitted/detected link uses for
+    "the same peak under another name": either centre inside the other
+    box.
+    """
+    def inside(inner: ManualPeak, outer: ManualPeak) -> bool:
+        return (
+            abs(inner.radius - outer.radius) <= abs(outer.radius_width) / 2.0
+            and abs(inner.angle - outer.angle) <= abs(outer.angle_width) / 2.0
+        )
+    return inside(a, b) or inside(b, a)
+
+
 class ViewerInteractMixin:
     # -- Manual peaks --
 
@@ -71,6 +89,65 @@ class ViewerInteractMixin:
             return
         self._undoable_remove_manual(frame, peak)
         self._push_undo(ManualRemoveAction(frame=frame, peak=peak))
+
+    def retire_manual_peak(self, frame: int, peak: ManualPeak) -> bool:
+        """Remove a manual box **without** an undo entry of its own.
+
+        For a caller that has just turned the box into a file-resident
+        peak and owns one undo entry covering both halves — quick
+        select. ``remove_manual_peak`` would push a second entry and
+        cost the user two Ctrl+Z presses to reverse one action.
+
+        Returns whether the box was there to remove.
+        """
+        if peak not in self._manual_peaks.get(frame, []):
+            return False
+        self._undoable_remove_manual(frame, peak)
+        return True
+
+    def set_quick_select(self, enabled: bool) -> None:
+        """Arm / disarm quick-select labelling.
+
+        While armed, every path that would silently drop the pending
+        manual box instead emits ``manualPeakCommitRequested`` so the
+        host can write it to the file first. Disarming commits whatever
+        is still pending, so turning the mode off never loses the last
+        box.
+        """
+        enabled = bool(enabled)
+        if enabled == self._quick_select:
+            return
+        if not enabled:
+            self.commit_pending_manual()
+        self._quick_select = enabled
+
+    @property
+    def quick_select(self) -> bool:
+        return self._quick_select
+
+    def pending_manual_peak(self, frame: int | None = None) -> ManualPeak | None:
+        """The manual box awaiting a quick-select commit, if any."""
+        if not self._quick_select:
+            return None
+        bucket = self._manual_peaks.get(
+            self.current_frame if frame is None else int(frame), []
+        )
+        return bucket[0] if bucket else None
+
+    def commit_pending_manual(self, frame: int | None = None) -> None:
+        """Ask the host to commit the pending box, if there is one.
+
+        The single funnel for every trigger — the next box, the
+        selection moving away, a frame or entry change, Enter, and the
+        mode being turned off — so they cannot drift apart. Emitting
+        with nothing pending is a no-op, which is why callers need no
+        guard of their own.
+        """
+        target_frame = self.current_frame if frame is None else int(frame)
+        peak = self.pending_manual_peak(target_frame)
+        if peak is None:
+            return
+        self.manualPeakCommitRequested.emit(int(target_frame), peak)
 
     def angular_extent(self) -> tuple[float, float] | None:
         """Return ``(angle_min_deg, angle_max_deg)`` for the active polar
@@ -362,6 +439,12 @@ class ViewerInteractMixin:
         idx = max(0, min(int(frame), n - 1))
         if idx == self._frame_index:
             return
+        # Manual boxes survive a frame switch, so a pending quick-select
+        # box would otherwise sit on a frame the user has left and be
+        # committed later against whatever frame they end on. Commit it
+        # here, against the frame it was actually drawn on.
+        if self._quick_select:
+            self.commit_pending_manual(self._frame_index)
         self._frame_index = idx
         self._prune_off_frame_selections(idx)
         self._render_frame(idx, auto_range=False)
@@ -652,6 +735,24 @@ class ViewerInteractMixin:
         frame = self.current_frame
         existing = self._manual_peaks.get(frame, [])
         old_peak = existing[0] if existing else None
+        # Quick select turns that replace into a commit: the box the
+        # user is done with goes to the file instead of the bin. Unless
+        # the new box sits on top of it — that is a correction, not the
+        # next peak, and replaces exactly as it always did.
+        if (
+            self._quick_select
+            and old_peak is not None
+            and not _boxes_overlap(old_peak, peak)
+        ):
+            self.manualPeakCommitRequested.emit(int(frame), old_peak)
+            # The host retires the committed box, so by now the frame
+            # is empty and there is nothing left to replace. Falling
+            # through with old_peak still set would make undo restore a
+            # box that is now a detected peak.
+            old_peak = (
+                self._manual_peaks.get(frame, [None])[0]
+                if self._manual_peaks.get(frame) else None
+            )
         if old_peak is not None:
             self._undoable_remove_manual(frame, old_peak)
         # _undoable_add_manual auto-selects on the current frame, so no
@@ -1133,6 +1234,11 @@ class ViewerInteractMixin:
             and prev.manual_ref is not None
             and (sel is None or sel.manual_ref is not prev.manual_ref)
         )
+        if transitioning_away_from_manual and self._quick_select:
+            # Quick select: clicking away is one of the ways to say
+            # "this box is done". Commit it rather than dropping it.
+            # The host retires it, so the removal below finds nothing.
+            self.commit_pending_manual(prev.frame)
         if transitioning_away_from_manual:
             bucket = self._manual_peaks.get(prev.frame, [])
             if prev.manual_ref in bucket:
@@ -1248,6 +1354,17 @@ class ViewerInteractMixin:
             and not self._busy
         ):
             self.remove_manual_peak(self.current_frame, self._selected.manual_ref)
+            ev.accept()
+            return
+        # Enter commits the pending quick-select box on the spot — the
+        # explicit version of clicking away, for a user whose hands are
+        # on the keyboard. Esc above still discards instead.
+        if (
+            ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and self._quick_select
+            and not self._busy
+        ):
+            self.commit_pending_manual()
             ev.accept()
             return
         # Ctrl+A: select every peak of the *current kind* on the current

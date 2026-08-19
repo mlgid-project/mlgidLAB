@@ -8,6 +8,17 @@ pre-releases.
 
 ### Added
 
+- **Quick select: label without leaving the image.** A new checkbox in
+  the Display dock, with a dropdown beside it. While it is on, drawing
+  the next box commits the previous one — as a detected peak, a fitted
+  one, or both — so labelling a frame is draw, draw, draw instead of
+  draw, cross to the panel, press a button, come back. A box drawn on
+  top of the pending one replaces it instead, which is how you correct
+  an attempt. The last box is committed when you click away, press
+  Enter, change frame or turn the mode off; Esc still discards it. One
+  Ctrl+Z turns a committed peak back into the box it was drawn as. A fit
+  that will not converge never interrupts the run with a dialog — the
+  box is kept as a detected peak and the reason goes to the log.
 - **Select and delete peaks from the Peaks tables.** The Detected and
   Fitted tabs now take Ctrl+click, Shift+click and Ctrl+A for several
   rows at once, and the image follows along (and the other way round —

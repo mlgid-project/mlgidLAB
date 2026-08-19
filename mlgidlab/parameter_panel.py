@@ -8,7 +8,7 @@ Delete shortcut.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtCore import QSettings, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from mlgidlab.fit import GaussianFit
+from mlgidlab.main_window_constants import QUICK_TARGET_KEY
 from mlgidlab.image_viewer import SelectedPeak
 from mlgidlab.pipeline import is_mlgidbase_available
 from mlgidlab import theme_tokens
@@ -60,6 +61,17 @@ class ParameterPanel(Card):
     # the new detected_peaks row. ``confidence_score()`` reads the choice.
     CONFIDENCE_LEVELS = (("High", 1.0), ("Medium", 0.5), ("Low", 0.1))
 
+    # What a quick-select commit writes. Tokens, not indices, so the
+    # stored preference survives a reordering of the dropdown.
+    QUICK_TARGET_DETECTED = "detected"
+    QUICK_TARGET_FITTED = "fitted"
+    QUICK_TARGET_BOTH = "both"
+    QUICK_TARGETS = (
+        ("Detected", QUICK_TARGET_DETECTED),
+        ("Fitted", QUICK_TARGET_FITTED),
+        ("Both", QUICK_TARGET_BOTH),
+    )
+
     addToDetectedRequested = Signal()
     addToFittedRequested = Signal()
     # Batch 2D-fit of the multi-selection. Only emitted when at least
@@ -79,6 +91,11 @@ class ParameterPanel(Card):
     # ``_update_fitted_preview`` in main_window).
     fitModeChanged = Signal(str)
     deletePeakRequested = Signal()
+    # Quick-select mode on/off, and the token of the target dropdown
+    # beside it. The host uses the first to arm the viewer and paint the
+    # status-bar cell, and reads the second at commit time.
+    quickSelectChanged = Signal(bool)
+    quickTargetChanged = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         # A Card rather than the QGroupBox this used to be: it is one
@@ -218,6 +235,53 @@ class ParameterPanel(Card):
         add_row_widget = QWidget()
         add_row_widget.setLayout(add_row)
         outer.addWidget(add_row_widget)
+
+        # Quick select: while it is on, drawing the next box commits the
+        # previous one, so a labelling run is drag-drag-drag instead of
+        # drag-reach-for-the-button-drag. The target says what each
+        # committed box becomes. Both live here rather than on the
+        # viewer toolbar because every other commit-time flag does —
+        # the score dropdown above, the fit-mode radios and the ring
+        # checkbox below — and the host reads them all from this one
+        # object. The host mirrors the mode into a status-bar cell so
+        # it stays visible when this dock is tabbed away.
+        quick_row = QHBoxLayout()
+        quick_row.setContentsMargins(0, 0, 0, 0)
+        quick_row.setSpacing(6)
+        self.chk_quick_select = QCheckBox("Quick select")
+        self.chk_quick_select.setToolTip(
+            "Label without leaving the image: draw a box, and drawing "
+            "the next one commits it as the peak kind chosen beside "
+            "this box.\n\n"
+            "A box drawn over the pending one replaces it instead — "
+            "that is how you correct an attempt. The last box is "
+            "committed when you click away, press Enter, change frame "
+            "or turn the mode off; Esc still discards it."
+        )
+        self.chk_quick_select.toggled.connect(self.quickSelectChanged)
+        self.chk_quick_select.toggled.connect(self._on_quick_select_toggled)
+        self.combo_quick_target = QComboBox()
+        for label, token in self.QUICK_TARGETS:
+            self.combo_quick_target.addItem(label, token)
+        self.combo_quick_target.setToolTip(
+            "What each auto-committed box becomes.\n\n"
+            "Detected writes the box as you drew it, at the confidence "
+            "above — quick, and it cannot fail. Fitted runs the 2D fit "
+            "on it. Both writes a detected row and fits it.\n\n"
+            "With 'One fitted peak per detected peak' on (Settings), "
+            "Fitted already writes the detected partner, so Both is "
+            "the same thing."
+        )
+        self.combo_quick_target.currentIndexChanged.connect(
+            lambda _i: self.quickTargetChanged.emit(self.quick_select_target())
+        )
+        quick_row.addWidget(self.chk_quick_select)
+        quick_row.addWidget(self.combo_quick_target, 1)
+        quick_row_widget = QWidget()
+        quick_row_widget.setLayout(quick_row)
+        outer.addWidget(quick_row_widget)
+        self._restore_quick_target()
+        self._on_quick_select_toggled(False)
 
         # Fit-mode selector for Add-to-fitted. Two radios, mutually
         # exclusive via a QButtonGroup. Default is 2D pygidfit (matches
@@ -458,6 +522,45 @@ class ParameterPanel(Card):
         else:
             self._fit_angle_label.setText(EMPTY)
             self._fit_fwhm_a_label.setText(EMPTY)
+
+    def quick_select_enabled(self) -> bool:
+        """Whether drawing the next box commits the previous one."""
+        return self.chk_quick_select.isChecked()
+
+    def quick_select_target(self) -> str:
+        """Token of the kind a quick-select commit writes."""
+        data = self.combo_quick_target.currentData()
+        return str(data) if data else self.QUICK_TARGET_DETECTED
+
+    def set_quick_select(self, enabled: bool) -> None:
+        """Turn the mode on/off from outside (the host does this when a
+        session closes, so a mode cannot outlive the file it labels)."""
+        self.chk_quick_select.setChecked(bool(enabled))
+
+    def _on_quick_select_toggled(self, enabled: bool) -> None:
+        # The target only means anything while the mode is on, and a
+        # live dropdown next to an unchecked box reads as a setting that
+        # is doing something.
+        self.combo_quick_target.setEnabled(bool(enabled))
+
+    def _restore_quick_target(self) -> None:
+        """Load the stored target.
+
+        The *target* persists across restarts — a labelling run outlives
+        one session and re-picking it every time is friction. The
+        **mode** deliberately does not: a window that came back in a
+        mode where drawing writes to the file would be a nasty
+        surprise.
+        """
+        stored = str(QSettings().value(QUICK_TARGET_KEY, "") or "")
+        idx = self.combo_quick_target.findData(stored)
+        if idx >= 0:
+            self.combo_quick_target.setCurrentIndex(idx)
+        self.combo_quick_target.currentIndexChanged.connect(
+            lambda _i: QSettings().setValue(
+                QUICK_TARGET_KEY, self.quick_select_target()
+            )
+        )
 
     def save_as_ring(self) -> bool:
         """Whether the next Add-to-fitted should commit a ring row."""

@@ -72,8 +72,29 @@ class PeaksMixin:
         entry = self.entry_combo.currentText()
         if sel is None or sel.kind != "manual" or sel.manual_ref is None or not entry:
             return
-        manual_peak = sel.manual_ref
-        frame = int(self.viewer.current_frame)
+        self._write_detected_from_manual(
+            entry, int(self.viewer.current_frame), sel.manual_ref,
+        )
+
+    def _write_detected_from_manual(
+        self, entry: str, frame: int, manual_peak, *,
+        select: bool = True, quiet: bool = False,
+    ) -> int | None:
+        """Write one manual box to ``detected_peaks``; return its id.
+
+        Split out of ``_on_add_to_detected`` so a caller that is not
+        acting on the current *selection* can use it — quick-select
+        commits the box the user drew **before** the one now selected,
+        which the button path could never name.
+
+        ``select`` and ``quiet`` let the quick-select caller keep the
+        selection where the user put it and stay off the modal path
+        (see ``_quick_commit``). The defaults reproduce the button
+        exactly.
+
+        Returns None when the write failed; the error has already been
+        surfaced.
+        """
         score = float(self.parameter_panel.confidence_score())
         geom = {
             "radius": float(manual_peak.radius),
@@ -88,18 +109,26 @@ class PeaksMixin:
                     self.session.temp_path, entry, frame,
                     score=score, **geom,
                 ))
-            except KeyError as exc:
-                QMessageBox.warning(self, "Add to detected", str(exc))
-                return
             except Exception as exc:
-                QMessageBox.critical(self, "Add to detected", str(exc))
-                return
+                if quiet:
+                    self.pipeline_panel.append_log(
+                        f"Quick select: could not add a detected peak — {exc}"
+                    )
+                    return None
+                box = (
+                    QMessageBox.warning if isinstance(exc, KeyError)
+                    else QMessageBox.critical
+                )
+                box(self, "Add to detected", str(exc))
+                return None
         self.session.mark_dirty()
         self._update_title()
         self._load_entry_into_viewer(entry, preserve_view=True)
-        self._add_detected_to_selection(entry, frame, [new_id])
+        if select:
+            self._add_detected_to_selection(entry, frame, [new_id])
         self._push_add_detected_undo(
-            entry=entry, frame=frame, peak_id=new_id, score=score, geom=geom,
+            entry=entry, frame=frame, peak_id=new_id,
+            score=score, geom=geom,
         )
         msg = (
             f"Added detected peak (score {score:.2f}) on "
@@ -107,6 +136,126 @@ class PeaksMixin:
         )
         self.statusBar().showMessage(msg, 4000)
         self.pipeline_panel.append_log(msg)
+        return new_id
+
+    # -- Quick select: drawing the next box commits the previous one --
+
+    def _on_quick_select_toggled(self, enabled: bool) -> None:
+        """Arm / disarm the viewer and repaint the status cell.
+
+        Disarming commits whatever is still pending — the viewer does
+        that inside ``set_quick_select`` — so the last box of a run is
+        never lost by simply switching the mode off.
+        """
+        self.viewer.set_quick_select(bool(enabled))
+        self._update_status_quick_select()
+
+    def _on_quick_commit_requested(self, frame: int, peak) -> None:
+        """Write one pending manual box to the file.
+
+        The viewer asks for this from every path that would otherwise
+        drop the box — the next box being drawn, the selection moving
+        away, a frame change, Enter, and the mode being switched off.
+        All of them land here so they cannot behave differently.
+
+        The write and the box's retirement are bundled into **one** undo
+        entry: the commit helpers push their own entries, which are
+        lifted off the stack and wrapped together with the removal of
+        the manual box. One Ctrl+Z therefore turns the committed peak
+        back into the box it was drawn as.
+        """
+        entry = self.entry_combo.currentText()
+        if (
+            self.session is None or not entry or peak is None
+            or self._is_busy()
+        ):
+            return
+        target = self.parameter_panel.quick_select_target()
+        stack = self.viewer._undo_stack
+        depth = len(stack)
+        written = self._quick_write(entry, int(frame), peak, target)
+        if not written:
+            # Nothing landed — leave the box alone so the user can retry
+            # or fix it rather than losing what they drew.
+            del stack[depth:]
+            return
+        actions = list(stack[depth:])
+        del stack[depth:]
+        self.viewer.retire_manual_peak(int(frame), peak)
+        self.viewer._push_undo(
+            _CallbackAction(
+                lambda: self._quick_commit_undo(int(frame), peak, actions),
+                lambda: self._quick_commit_redo(int(frame), peak, actions),
+            )
+        )
+        self._update_status_quick_select()
+
+    def _quick_write(self, entry: str, frame: int, peak, target: str) -> bool:
+        """Write the box at the chosen target. True if anything landed.
+
+        Detected is the cheap, cannot-fail path. Fitted runs the same
+        code the Add-to-fitted button runs — including, with the peak
+        link on, writing the detected partner — but **quietly**: no
+        modal is allowed to interrupt a labelling run.
+
+        A fit that will not converge therefore does not cost the user
+        the box. It is committed as detected instead, with a log line
+        naming what happened. That inverts the button's deliberate
+        strictness (physics-audit F-06, no silent fallback), and the
+        trade is different here on purpose: the button commits one peak
+        the user is watching, this commits a peak they have already
+        moved on from.
+        """
+        from mlgidlab.parameter_panel import ParameterPanel
+
+        sel = SelectedPeak.from_manual(peak, int(frame))
+        if target == ParameterPanel.QUICK_TARGET_DETECTED:
+            return self._write_detected_from_manual(
+                entry, frame, peak, select=False, quiet=True,
+            ) is not None
+
+        detected_id = None
+        if target == ParameterPanel.QUICK_TARGET_BOTH and not self._fitted_link_on():
+            # With the link on, the fitted path writes the detected
+            # partner itself, so writing one here would duplicate it.
+            detected_id = self._write_detected_from_manual(
+                entry, frame, peak, select=False, quiet=True,
+            )
+        fitted_id = self._write_fitted_from_selection(
+            sel, entry, frame, select=False, quiet=True,
+        )
+        if fitted_id is not None:
+            return True
+        if detected_id is not None:
+            self.pipeline_panel.append_log(
+                "Quick select: the fit failed — the box was kept as a "
+                "detected peak."
+            )
+            return True
+        # Fitted-only target with a failed fit: keep the box rather than
+        # discard the user's work.
+        fallback = self._write_detected_from_manual(
+            entry, frame, peak, select=False, quiet=True,
+        )
+        if fallback is None:
+            return False
+        msg = "Quick select: the fit failed — saved as a detected peak instead."
+        self.statusBar().showMessage(msg, 4000)
+        self.pipeline_panel.append_log(msg)
+        return True
+
+    def _quick_commit_undo(self, frame: int, peak, actions: list) -> None:
+        """Reverse one quick commit: unwrite the rows, restore the box."""
+        for action in reversed(actions):
+            action.undo(self.viewer)
+        self.viewer._undoable_add_manual(int(frame), peak)
+        self._update_status_quick_select()
+
+    def _quick_commit_redo(self, frame: int, peak, actions: list) -> None:
+        self.viewer.retire_manual_peak(int(frame), peak)
+        for action in actions:
+            action.redo(self.viewer)
+        self._update_status_quick_select()
 
     def _undoable_write_step(
         self, *, entry: str, frame: int | None, title: str,
@@ -355,20 +504,47 @@ class PeaksMixin:
         entry = self.entry_combo.currentText()
         if sel is None or sel.kind not in ("manual", "detected") or not entry:
             return
+        self._write_fitted_from_selection(
+            sel, entry, int(self.viewer.current_frame),
+        )
+
+    def _write_fitted_from_selection(
+        self, sel: SelectedPeak, entry: str, frame: int, *,
+        select: bool = True, quiet: bool = False,
+    ) -> int | None:
+        """The body of Add-to-fitted, for an explicitly-named box.
+
+        Split out so quick-select can commit the box the user drew
+        *before* the current selection — which is exactly the box the
+        button path cannot name. A manual box arrives here as
+        ``SelectedPeak.from_manual(...)``, which is what
+        ``_build_fitted_row_2d`` needs anyway.
+
+        ``select`` and ``quiet`` are the same two knobs
+        ``_write_detected_from_manual`` takes: keep the selection where
+        the user put it, and stay off the modal path. The defaults
+        reproduce the button exactly, including its strict
+        no-silent-fallback failure (F-06) — the quiet path is the one
+        place that trade is inverted, and ``_quick_commit`` documents
+        why. The undo entry is pushed as usual; a caller that wants the
+        commit bundled with something else wraps it (see
+        ``_quick_commit``).
+
+        Returns the new fitted id, or None when nothing was written.
+        """
         save_as_ring = self.parameter_panel.save_as_ring()
-        frame = self.viewer.current_frame
         # ``fit_mode()`` already collapses to FIT_MODE_1D when ring is
         # checked, so the rest of this function just branches on the
         # token.
         mode = self.parameter_panel.fit_mode()
 
         if mode == ParameterPanel.FIT_MODE_2D:
-            row = self._build_fitted_row_2d(sel, entry, frame)
+            row = self._build_fitted_row_2d(sel, entry, frame, quiet=quiet)
         else:
-            row = self._build_fitted_row_1d(sel, save_as_ring)
+            row = self._build_fitted_row_1d(sel, save_as_ring, quiet=quiet)
         if row is None:
             # The helper already showed a QMessageBox / log line.
-            return
+            return None
 
         add_kwargs = {
             "radius": row["radius"],
@@ -400,16 +576,21 @@ class PeaksMixin:
                 new_id, replaced = self._write_fitted_row(
                     entry, frame, add_kwargs, target_id,
                 )
-            except KeyError as exc:
-                self._undo_created_detected(entry, frame, created_detected)
-                QMessageBox.warning(self, "Add to fitted", str(exc))
-                return
             except Exception as exc:
                 # Never leave a detected row behind for a fit that did
                 # not land — same rule the injection path follows.
                 self._undo_created_detected(entry, frame, created_detected)
-                QMessageBox.critical(self, "Add to fitted", str(exc))
-                return
+                if quiet:
+                    self.pipeline_panel.append_log(
+                        f"Quick select: could not add a fitted peak — {exc}"
+                    )
+                    return None
+                box = (
+                    QMessageBox.warning if isinstance(exc, KeyError)
+                    else QMessageBox.critical
+                )
+                box(self, "Add to fitted", str(exc))
+                return None
 
         self.session.mark_dirty()
         self._update_title()
@@ -427,7 +608,7 @@ class PeaksMixin:
         # immediately visible (cyan box + profile fits both update to
         # the fitted-kind selection). 1D mode is unchanged because the
         # pink curves already previewed what was saved.
-        if mode == ParameterPanel.FIT_MODE_2D:
+        if select and mode == ParameterPanel.FIT_MODE_2D:
             fitted_sel = SelectedPeak(
                 kind="fitted",
                 frame=int(frame),
@@ -475,6 +656,7 @@ class PeaksMixin:
                 if created_detected else ""
             )
         )
+        return int(new_id)
 
     def _push_fitted_add_undo(
         self, *, entry: str, frame: int, new_id: int,
@@ -1624,15 +1806,27 @@ class PeaksMixin:
 
     def _build_fitted_row_2d(
         self, sel: SelectedPeak, entry: str, frame: int,
+        *, quiet: bool = False,
     ) -> dict | None:
         """Run pygidfit on ``sel`` and shape the result into an
         ``add_fitted_peak_row`` kwarg dict. Surfaces a QMessageBox
         on failure — strict, no silent fall-back to the 1D path.
         Delegates the actual fit to ``_run_pygidfit_for_selection``
         so the live-preview path can reuse the same code.
+
+        ``quiet`` downgrades that dialog to a log line, for the
+        quick-select commit: the user has already moved on to the next
+        box, and a modal in the middle of a labelling run stops the
+        run dead. The caller then decides what to do with the failure
+        (``_quick_write`` keeps the box as a detected peak).
         """
         fit_2d, err = self._run_pygidfit_for_selection(sel, entry, frame)
         if fit_2d is None:
+            if quiet:
+                self.pipeline_panel.append_log(
+                    f"Quick select: pygidfit could not fit this box — {err}"
+                )
+                return None
             QMessageBox.warning(
                 self, "Add to fitted (2D)",
                 f"pygidfit could not fit this box: {err}\n\n"
@@ -1651,7 +1845,7 @@ class PeaksMixin:
         }
 
     def _build_fitted_row_1d(
-        self, sel: SelectedPeak, save_as_ring: bool,
+        self, sel: SelectedPeak, save_as_ring: bool, *, quiet: bool = False,
     ) -> dict | None:
         """Build the row from the profile viewer's cached 1D scipy fits.
 
@@ -1675,23 +1869,28 @@ class PeaksMixin:
         fits = self.profile_viewer.last_fit_params()
         rfit = fits.get("radial")
         afit = fits.get("angular")
+        missing = None
         if rfit is None:
-            QMessageBox.warning(
-                self, "Add to fitted (1D)",
+            missing = (
                 "No radial Gaussian fit is available. Drag the box "
                 "until the pink fit curve appears in the radial "
-                "profile, or switch to '2D fit (pygidfit)' mode.",
+                "profile, or switch to '2D fit (pygidfit)' mode."
             )
-            return None
-        if not save_as_ring and afit is None:
-            QMessageBox.warning(
-                self, "Add to fitted (1D)",
+        elif not save_as_ring and afit is None:
+            missing = (
                 "No angular Gaussian fit is available — required for "
                 "segment peaks in 1D mode. Drag the box until the "
                 "pink fit curve appears in the angular profile, "
                 "check 'Save fitted as ring' if this is a ring, or "
-                "switch to '2D fit (pygidfit)' mode.",
+                "switch to '2D fit (pygidfit)' mode."
             )
+        if missing is not None:
+            if quiet:
+                self.pipeline_panel.append_log(
+                    f"Quick select: no 1D fit for this box — {missing}"
+                )
+            else:
+                QMessageBox.warning(self, "Add to fitted (1D)", missing)
             return None
         fwhm_to_2sigma = 1.0 / float(np.sqrt(2.0 * np.log(2.0)))
         if save_as_ring:

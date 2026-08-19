@@ -242,6 +242,10 @@ class GIWAXSImageViewer(
     # ``selectionChanged(SelectedPeak | None)``; multi-aware consumers
     # (copy handler, batch-fit button enable) subscribe here.
     selectionsChanged = Signal(list)          # list[SelectedPeak]
+    # (frame, ManualPeak) — quick select wants this box written to the
+    # file before it is dropped. Emitted only while the mode is armed,
+    # from every path that would otherwise discard a pending box.
+    manualPeakCommitRequested = Signal(int, object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -610,6 +614,12 @@ class GIWAXSImageViewer(
         # without precomputing the full polar stack.
         self._polar_cache: "tuple[_LazyPolarStack, np.ndarray, np.ndarray] | None" = None  # type: ignore[name-defined]
         self._next_manual_id = -1  # negative IDs distinguish manual from detected
+        # Quick-select labelling: while True, a pending manual box is
+        # committed to the file instead of being dropped. Armed by the
+        # host from the Parameter panel's checkbox; the viewer only ever
+        # *asks* for the commit (``manualPeakCommitRequested``) — every
+        # file write stays on the host side.
+        self._quick_select = False
         self._selected: SelectedPeak | None = None
         # Secondary selections for the multi-select (Ctrl+click / Ctrl+A)
         # workflow. Restricted to ``kind == "detected"`` in this iteration

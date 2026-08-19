@@ -113,12 +113,18 @@ CONTROL_SECTIONS: tuple[Section, ...] = (
     )),
     ("Manual peak workflow", (
         (("Ctrl+Alt-drag",), "mouse",
-         "Draw a manual peak rectangle (works in polar and Cartesian "
-         "mode)."),
+         "Draw a manual peak rectangle (polar mode only)."),
         (("Add to detected / Add to fitted",), "ui",
          "Commit the box as a detected peak, or 1D-Gaussian-fit it into "
          "fitted. Tick <b>Save fitted as ring</b> first to widen the "
          "angular extent to the full sweep (ring peaks only)."),
+        (("Quick select",), "ui",
+         "Label without leaving the image: drawing the next box commits "
+         "the previous one as the kind chosen beside the checkbox. A box "
+         "drawn on top of the pending one replaces it instead — that is "
+         "how you correct an attempt. The last box commits when you "
+         "click away, press <b>Enter</b>, change frame or turn the mode "
+         "off."),
         (("Esc",), "key",
          "Delete the selected <b>manual</b> peak (in-memory, no "
          "confirmation; Ctrl+Z restores)."),

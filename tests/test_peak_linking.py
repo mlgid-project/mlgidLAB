@@ -380,7 +380,7 @@ def _stub_fit(window, monkeypatch, row=None):
     """Skip pygidfit; the link is about which id the row lands under."""
     monkeypatch.setattr(
         window, "_build_fitted_row_2d",
-        lambda sel, entry, frame: dict(row or _FIT_ROW),
+        lambda sel, entry, frame, **_kw: dict(row or _FIT_ROW),
     )
 
 

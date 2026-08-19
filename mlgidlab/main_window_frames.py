@@ -280,6 +280,10 @@ class FramesMixin:
     def _on_entry_changed(self, entry: str) -> None:
         if not entry or self.session is None:
             return
+        # A pending quick-select box belongs to the entry it was drawn
+        # on. Commit it before the switch, while the entry combo still
+        # names that entry — the commit reads it from there.
+        self.viewer.commit_pending_manual()
         if self.session.kind == "raw":
             self._load_raw_entry_into_viewer(entry)
             self._update_status_entry()

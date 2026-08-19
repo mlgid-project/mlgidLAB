@@ -1073,6 +1073,26 @@ class BuildMixin:
 
         # Commit / delete actions on the parameter panel. Add-to-detected and
         # delete reuse the existing PipelineWorker path.
+        # Quick select: the panel owns the flag, the viewer owns the
+        # gesture, and the host owns every file write — so the mode is
+        # pushed one way and the commit request comes back the other.
+        self.parameter_panel.quickSelectChanged.connect(
+            self._on_quick_select_toggled
+        )
+        self.parameter_panel.quickTargetChanged.connect(
+            lambda _t: self._update_status_quick_select()
+        )
+        self.viewer.manualPeakCommitRequested.connect(
+            self._on_quick_commit_requested
+        )
+        # The pending marker in the status cell has to follow the box
+        # appearing and disappearing, whoever caused it.
+        self.viewer.manualPeakAdded.connect(
+            lambda *_a: self._update_status_quick_select()
+        )
+        self.viewer.manualPeakRemoved.connect(
+            lambda *_a: self._update_status_quick_select()
+        )
         self.parameter_panel.addToDetectedRequested.connect(self._on_add_to_detected)
         self.parameter_panel.addToFittedRequested.connect(self._on_add_to_fitted)
         # Batch 2D fit of the multi-selection. The button on the
@@ -1307,6 +1327,12 @@ class BuildMixin:
         self._sb_entry = QLabel("")
         self._sb_frame = QLabel("")
         self._sb_pipeline = QLabel("idle")
+        # Quick-select labelling changes what a drag does, and the
+        # Display dock that owns its checkbox is tabbed and scrollable —
+        # so the mode needs somewhere it cannot hide. Empty and hidden
+        # while the mode is off, which is most of the time.
+        self._sb_quick = QLabel("")
+        self._sb_quick.hide()
         self._sb_cursor = QLabel("")
         # A run in flight gets its own bar in the row, right after the
         # pipeline cell. Indeterminate until a frame count arrives, which
@@ -1319,7 +1345,8 @@ class BuildMixin:
         self._sb_pipe_bar.hide()
         sb.addPermanentWidget(self._sb_dirty)
         for w in (self._sb_file, self._sb_entry, self._sb_frame,
-                  self._sb_pipeline, self._sb_pipe_bar, self._sb_cursor):
+                  self._sb_pipeline, self._sb_pipe_bar, self._sb_quick,
+                  self._sb_cursor):
             # Light separation so the eye can scan the row. The divider
             # colour and padding come from the skin, which is why this
             # is a role tag rather than a stylesheet: the old hardcoded
@@ -1329,7 +1356,8 @@ class BuildMixin:
             if isinstance(w, QLabel):
                 w.setProperty(
                     "role",
-                    "sb-cell-active" if w is self._sb_file else "sb-cell")
+                    "sb-cell-active"
+                    if w in (self._sb_file, self._sb_quick) else "sb-cell")
             sb.addPermanentWidget(w)
         # The pipeline cell is the one place a run reports from, so make
         # it the way into the log of that run.
@@ -1586,6 +1614,38 @@ class BuildMixin:
             # Back to the busy marquee for the next run, whose frame
             # count is not known until its first progress tick.
             self._sb_pipe_bar.setRange(0, 0)
+
+    def _update_status_quick_select(self) -> None:
+        """Show the quick-select mode, and whether a box is pending.
+
+        The pending marker is the point: with the mode on, a box that
+        has not been committed yet is the one piece of state the image
+        alone does not make obvious (a manual box looks like a
+        selection), and it is what a frame change or a click is about
+        to write.
+        """
+        panel = getattr(self, "parameter_panel", None)
+        cell = getattr(self, "_sb_quick", None)
+        if cell is None or panel is None:
+            return
+        if not panel.quick_select_enabled():
+            cell.hide()
+            cell.setText("")
+            return
+        target = panel.quick_select_target()
+        pending = self.viewer.pending_manual_peak() is not None
+        cell.setText(f"quick: {target}" + (" • 1 pending" if pending else ""))
+        cell.setToolTip(
+            "Quick select is on: drawing the next box commits the "
+            "previous one as a "
+            f"{target} peak."
+            + (
+                "\nOne box is waiting — it commits when you draw the "
+                "next one, click away, press Enter or change frame."
+                if pending else ""
+            )
+        )
+        cell.show()
 
     def _update_status_pipeline(self, command=None, *, running: bool) -> None:
         self._set_pipeline_running(running)

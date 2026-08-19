@@ -646,6 +646,11 @@ class FilesMixin:
         was_active = session is self._active_session
         if session not in self._sessions:
             return
+        # Last chance for a pending quick-select box: after this the
+        # file it belongs to is gone. Runs before the save prompt the
+        # caller may still show, so the box counts as unsaved work.
+        if was_active:
+            self.viewer.commit_pending_manual()
         # Stop playback before pulling the file out from under the
         # viewer — the timer's next tick would otherwise read from a
         # released FrameSource.
