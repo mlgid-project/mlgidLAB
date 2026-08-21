@@ -4,6 +4,20 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## Unreleased
+
+### Fixed
+
+- **Peaks can be added before the pipeline has ever run.** Drawing a box
+  and pressing *Add to detected* / *Add to fitted* — or committing one
+  with quick select — failed on any frame that had never been through a
+  detection or fitting run, with a warning telling you to run the
+  pipeline first. That is every frame of a freshly converted file, so
+  labelling from scratch, which is the whole point of quick select, was
+  the one case that could not work. The frame's peaks table (and any
+  missing analysis group above it) is now created on demand, exactly as
+  pygid would have created it.
+
 ## 0.1.0a17 — seventeenth alpha (2026-08-19)
 
 ### Added

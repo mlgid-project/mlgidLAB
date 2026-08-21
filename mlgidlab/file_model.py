@@ -85,6 +85,43 @@ IMG_REL = "data/img_gid_q"
 QXY_REL = "data/q_xy"
 QZ_REL = "data/q_z"
 
+# NX attrs pygid stamps on the analysis / per-frame groups it creates
+# (pygid.datasaver.fill_analysis_group). Repeated here so any group this
+# module has to bring into existence looks exactly like a pygid-written
+# one to a strict NeXus validator.
+ANALYSIS_GROUP_ATTRS = {"NX_class": "NXparameters", "EX_required": "true"}
+
+# Row layout of detected_peaks / fitted_peaks / fitted_peaks_errors — a
+# literal copy of pygid.datasaver.pygid_results_dtype, used only when a
+# peak dataset has to be created from nothing (see
+# ``ensure_peak_dataset``). Existing datasets always keep their own
+# dtype, so this is a bootstrap default and never a conversion.
+#
+# Copied rather than imported on purpose: this module is backend-free by
+# contract (tests/test_hermetic_guard.py), so importing pygid here would
+# break every install without the private upstream stack.
+# tests/test_peak_dataset_bootstrap.py asserts the copy still matches
+# pygid's whenever pygid happens to be importable.
+PEAK_ROW_DTYPE = np.dtype([
+    ("amplitude", "f4"),
+    ("angle", "f4"),
+    ("angle_width", "f4"),
+    ("radius", "f4"),
+    ("radius_width", "f4"),
+    ("q_z", "f4"),
+    ("q_xy", "f4"),
+    ("theta", "f4"),
+    ("score", "f4"),
+    ("A", "f4"),
+    ("B", "f4"),
+    ("C", "f4"),
+    ("is_ring", "bool"),
+    ("is_cut_qz", "bool"),
+    ("is_cut_qxy", "bool"),
+    ("visibility", "i4"),
+    ("id", "i4"),
+])
+
 PeakKind = str  # "detected" | "fitted"
 
 
@@ -1703,6 +1740,110 @@ def merge_matched_rows(
     return restored
 
 
+def ensure_peak_dataset(
+    f: "h5py.File",
+    entry: str,
+    frame: int,
+    dataset_name: str,
+) -> "h5py.Dataset":
+    """Return a frame's peak dataset, creating it (empty) if absent.
+
+    Takes an **already-open** ``r+`` handle so the write path that needs
+    this keeps its single file open.
+
+    A peak dataset only exists once a pipeline stage has written one, so
+    before any detection / fitting run a frame has either a bare
+    ``frameNNNNN`` group (what pygid's conversion and
+    ``normalize_for_pygid`` leave behind) or no ``data/analysis`` tree at
+    all. Neither state should stop the user labelling by hand: an empty
+    peaks dataset is just a container, and creating it is exactly what
+    pygid would have done. So this brings the group chain and the
+    dataset into existence rather than refusing.
+
+    What it will **not** do is invent an entry — an unknown ``entry``
+    raises ``KeyError``, which is a real caller error and stays one.
+    The frame index is deliberately not range-checked: every caller
+    derives it from the viewer's frame count, and verifying it here
+    would mean reading the entry's signal dataset, which resolves the
+    external link for master files (the multi-second open the lazy-open
+    path exists to avoid).
+
+    A dataset created here takes its dtype from a sibling in the same
+    frame group when there is one, so a file written by a pygid whose
+    row layout differs from ours stays internally consistent; otherwise
+    it gets ``PEAK_ROW_DTYPE``. The lookup is scoped to the one frame
+    group on purpose — scanning an entry's other frames would cost real
+    time on a 6000-frame scan for a dtype that is stable in practice.
+
+    The frame group is matched on whichever key spelling the file
+    already uses (``frameNNNNN`` or the older bare ``NNNNN``) before a
+    new one is created, so appending to a legacy file does not split its
+    peaks across two groups. ``_add_peak_row`` rewrites the dataset at
+    ``ds.name`` for the same reason.
+
+    Creating ``fitted_peaks`` also creates an empty
+    ``fitted_peaks_errors`` when that is missing: pygid always writes
+    the pair (``datasaver._save_img_container_fit``) and mlgidbase's
+    ``delete_peak`` reads the errors dataset unconditionally, so a lone
+    ``fitted_peaks`` is a shape the backend does not expect. An
+    errors dataset shorter than its peaks table is already the norm
+    here (mlgidLAB appends fitted rows without fabricating errors for
+    them), so empty is the honest value.
+    """
+    if entry not in f:
+        raise KeyError(
+            f"entry {entry!r} not in {f.filename} — cannot add a "
+            f"{dataset_name} row to a frame of an entry that does not exist."
+        )
+    parts = ANALYSIS_REL.split("/")
+    analysis = f[entry]
+    for part in parts:
+        if part in analysis:
+            analysis = analysis[part]
+            continue
+        analysis = analysis.create_group(part)
+        # Only the analysis group itself carries the NXparameters attrs;
+        # an intermediate ``data`` group is NXdata and stamping it would
+        # be a lie. (In practice ``data`` always exists — an entry
+        # without it never reaches the viewer.)
+        if part == parts[-1]:
+            analysis.attrs.update(ANALYSIS_GROUP_ATTRS)
+    # Reuse whichever frame-key spelling the file already uses (current
+    # pygid writes frameNNNNN, older mlgid output NNNNN — the same
+    # candidates ``_frame_analysis_group`` reads); only fall through to
+    # creating the modern one. Creating frameNNNNN next to an existing
+    # NNNNN would split one frame's peaks across two groups.
+    group = None
+    for key in (FRAME_KEY_FMT.format(int(frame)), f"{int(frame):05d}", str(int(frame))):
+        if key in analysis:
+            group = analysis[key]
+            break
+    if group is None:
+        group = analysis.create_group(FRAME_KEY_FMT.format(int(frame)))
+        group.attrs.update(ANALYSIS_GROUP_ATTRS)
+    existing = group.get(dataset_name)
+    if isinstance(existing, h5py.Dataset):
+        return existing
+    if existing is not None:
+        raise KeyError(
+            f"{group.name}/{dataset_name} is a {type(existing).__name__}, "
+            "not a structured dataset — this file uses the older columnar "
+            "mlgid layout, which mlgidLAB reads but cannot append to."
+        )
+    dtype = PEAK_ROW_DTYPE
+    for donor in ("detected_peaks", "fitted_peaks", "fitted_peaks_errors"):
+        obj = group.get(donor)
+        if isinstance(obj, h5py.Dataset) and obj.dtype.names:
+            dtype = obj.dtype
+            break
+    ds = group.create_dataset(dataset_name, data=np.zeros(0, dtype=dtype))
+    if dataset_name == "fitted_peaks" and "fitted_peaks_errors" not in group:
+        group.create_dataset(
+            "fitted_peaks_errors", data=np.zeros(0, dtype=dtype)
+        )
+    return ds
+
+
 def _add_peak_row(
     file_path: Path,
     entry: str,
@@ -1733,6 +1874,11 @@ def _add_peak_row(
     recomputed from polar; unset fields default to zero / False; the new
     peak's id is ``max(id)+1`` (or 0 for the first row). Returns the new id.
 
+    The target dataset does **not** have to exist yet: ``ensure_peak_dataset``
+    creates it (and any missing analysis / frame group above it) so a frame
+    that has never been through detection or fitting can still be labelled
+    by hand. An unknown ``entry`` is still a ``KeyError``.
+
     ``peak_id`` overrides that assignment and writes the row under the
     id given. Two callers need it: the fitted/detected link (a fitted
     row must carry its detected peak's id) and undo (a restored row
@@ -1741,16 +1887,13 @@ def _add_peak_row(
     appends, it does not check for or replace an existing row with the
     same id; ``delete_peak_row`` first is the caller's job.
     """
-    frame_key = FRAME_KEY_FMT.format(frame)
     with h5py.File(file_path, "r+") as f:
-        ds_path = f"{entry}/{ANALYSIS_REL}/{frame_key}/{dataset_name}"
-        if ds_path not in f:
-            raise KeyError(
-                f"{dataset_name} dataset missing at {ds_path} — run the "
-                "appropriate pipeline stage at least once on this frame "
-                "before adding rows."
-            )
-        ds = f[ds_path]
+        ds = ensure_peak_dataset(f, entry, frame, dataset_name)
+        # Absolute path of the dataset we are about to rewrite. Read off
+        # the object rather than rebuilt from ``frame_key`` so a file
+        # using the older ``NNNNN`` frame-key spelling is written back
+        # where its rows already live.
+        ds_path = ds.name
         arr = ds[()]
         if peak_id is not None:
             new_id = int(peak_id)

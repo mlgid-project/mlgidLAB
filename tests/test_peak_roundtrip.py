@@ -65,21 +65,32 @@ def test_add_fitted_peak_row_assigns_next_id_and_recomputes_cartesian(
     assert bool(fitted.is_ring[row]) is True
 
 
-def test_add_fitted_peak_row_missing_dataset_raises_keyerror(
+def test_add_fitted_peak_row_bootstraps_a_frame_with_no_analysis_group(
     synthetic_nexus_with_peaks,
 ):
-    """Frame 1 has no analysis group → no fitted_peaks dataset."""
-    with pytest.raises(KeyError):
-        file_model.add_fitted_peak_row(
-            synthetic_nexus_with_peaks,
-            ENTRY,
-            1,
-            angle=10.0,
-            angle_width=4.0,
-            radius=1.0,
-            radius_width=0.2,
-            amplitude=5.0,
-        )
+    """Frame 1 has no analysis group, so no fitted_peaks dataset.
+
+    This used to raise ``KeyError: run the appropriate pipeline stage at
+    least once``. It no longer does: ``ensure_peak_dataset`` creates the
+    group and an empty table, so a frame can be labelled by hand before
+    any detection or fitting run. Full coverage of that path lives in
+    ``tests/test_peak_dataset_bootstrap.py``; this case is here to pin
+    that ``add_fitted_peak_row`` itself no longer refuses.
+    """
+    new_id = file_model.add_fitted_peak_row(
+        synthetic_nexus_with_peaks,
+        ENTRY,
+        1,
+        angle=10.0,
+        angle_width=4.0,
+        radius=1.0,
+        radius_width=0.2,
+        amplitude=5.0,
+    )
+
+    assert new_id == 0
+    fitted = file_model.load_peaks(synthetic_nexus_with_peaks, ENTRY, 1)["fitted"]
+    assert fitted is not None and len(fitted) == 1
 
 
 def test_update_peak_row_roundtrip(synthetic_nexus_with_peaks):

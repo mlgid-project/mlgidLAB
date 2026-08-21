@@ -351,9 +351,11 @@ def synthetic_nexus_with_peaks(tmp_path):
       (``ANALYSIS_REL`` / ``FRAME_KEY_FMT``, file_model.py:21,44).
     * the structured dtype is ``PYGID_PEAK_DTYPE`` (see its comment).
     * frames 1 & 2 get *no* analysis group, so ``load_peaks`` returns
-      ``{detected:None, fitted:None}`` (file_model.py:677-678) and
-      ``add_fitted_peak_row`` on them raises ``KeyError``
-      (file_model.py:829-833).
+      ``{detected:None, fitted:None}`` (``file_model.read_peaks``).
+      Adding a peak to them still works — ``ensure_peak_dataset``
+      creates the group and an empty table on demand, which is what
+      lets a frame be labelled before any pipeline stage has run
+      (see ``tests/test_peak_dataset_bootstrap.py``).
 
     Imports are local so the conftest environment lockdown is fully
     applied before h5py touches HDF5.
