@@ -30,6 +30,7 @@ from mlgidlab.conversion_config import (
     OUTPUT_SINGLE_ENTRY,
     ConversionConfig,
     RawScan,
+    parse_poni_overrides,
 )
 
 import logging
@@ -81,7 +82,9 @@ def execute(
     )
     if cfg.mask_path is not None:
         expparam_kwargs["mask_path"] = str(cfg.mask_path)
+    _complete_center_override(expparam_kwargs, cfg.poni_path)
     params = pygid.ExpParams(**expparam_kwargs)
+    _prefer_center_over_poni(params, expparam_kwargs)
 
     coordmap_kwargs: dict[str, Any] = dict(
         hor_positive=cfg.hor_positive,
@@ -634,6 +637,71 @@ def _method_kwargs_for(
         if cfg.dang is not None:
             kwargs["dang"] = cfg.dang
     return kwargs
+
+
+def _complete_center_override(kwargs: dict, poni_path: Path) -> None:
+    """Fill in the partner of a half-given beam-center override.
+
+    ``centerX`` and ``centerY`` only mean anything as a pair — pygid
+    derives poni1 *and* poni2 from them together, and a lone one would
+    hit a ``None`` mid-calculation. The panel's boxes can be unset
+    individually, so a user who dials one back to "(unset)" would send
+    half a center. Take the missing half from the PONI, which is where
+    it would have come from anyway.
+
+    Mutates ``kwargs`` in place; a no-op when neither or both are given,
+    or when the PONI cannot supply the missing half (pygid then reports
+    the inconsistency itself).
+    """
+    have = {k for k in ("centerX", "centerY") if k in kwargs}
+    if len(have) != 1:
+        return
+    missing = ({"centerX", "centerY"} - have).pop()
+    try:
+        value = parse_poni_overrides(poni_path).get(missing)
+    except OSError:
+        logger.debug("suppressed PONI re-parse for center completion", exc_info=True)
+        return
+    if value is not None:
+        kwargs[missing] = value
+
+
+def _prefer_center_over_poni(params, kwargs: dict) -> None:
+    """Make a beam-center override actually win over the PONI's poni1/poni2.
+
+    ``ExpParams.__post_init__`` reads the PONI file last, so poni1/poni2
+    are always set when a PONI is loaded. Two things follow from that,
+    and both are wrong for a user who typed a center:
+
+    1. ``CoordMaps`` reads **poni1/poni2 only** — the center override
+       never reaches the q maps, so it is silently ignored.
+    2. ``ExpParams._exp_params_update_`` applies ``fliplr`` / ``flipud`` /
+       ``transp`` to the beam center only in the branch it takes, and it
+       takes *neither* when poni and center are both set. The image gets
+       flipped by ``process_image`` and the center does not, so the
+       missing wedge lands on the wrong side.
+
+    Clearing poni1/poni2 puts pygid on the ``_calc_poni_`` branch, which
+    flips the center and derives poni from it. With no flips set this is
+    an exact round-trip (``_calc_poni_from_center`` inverts
+    ``_calc_center_``), so a conversion without flips is unchanged.
+
+    Only reached when the user edited a center field: the panel drops
+    override values still equal to what the PONI autofill wrote
+    (``ConversionPanel._unedited_autofill``), so the ordinary
+    load-a-PONI-and-tick-a-flip path keeps letting pygid derive the
+    center from poni1/poni2, which is its more accurate branch.
+
+    **Upstream note.** ``_calc_poni_`` mirrors flipud as
+    ``img_dim[0] - centerY`` where ``_calc_center_`` uses
+    ``(img_dim[0] - 1) * px - poni1``, so the two branches disagree by
+    one pixel on flipud. A hand-typed center with flipud on is therefore
+    1 px off. Reported, not worked around here.
+    """
+    if "centerX" not in kwargs or "centerY" not in kwargs:
+        return
+    params.poni1 = None
+    params.poni2 = None
 
 
 def _build_sample_metadata(pygid_mod: Any, yaml_text: str) -> Any:

@@ -397,6 +397,11 @@ class ConversionPanel(QWidget):
         # to the same image they're already looking at. Wired in
         # ``set_active_raw_frame_resolver``.
         self._get_active_raw_frame: Callable[[], object] | None = None
+        # {field: value} last written into the override spinboxes by
+        # ``_autofill_overrides_from_poni``. A field still holding its
+        # autofilled value is a readout of the PONI, not a user override,
+        # and ``_build_config`` drops it — see ``_unedited_autofill``.
+        self._poni_autofill: dict[str, float] = {}
         self._build_ui()
 
     # ---------------- Public surface ----------------
@@ -809,6 +814,26 @@ class ConversionPanel(QWidget):
             self.poni_path.setText(path)
             self._autofill_overrides_from_poni()
 
+    def _unedited_autofill(self, key: str, value: float) -> bool:
+        """Whether ``value`` is still exactly what the PONI autofill wrote.
+
+        Loading a PONI pre-fills the override boxes so they double as a
+        readout. Sending an untouched one back looks like a no-op but is
+        not: pygid only applies ``fliplr`` / ``flipud`` / ``transp`` to
+        the beam center when *one* of (poni1/poni2, centerX/centerY) is
+        given — ``ExpParams._exp_params_update_`` takes neither branch
+        when both are set. Handing back the PONI's own centre alongside
+        the PONI therefore left the centre unflipped while the image was
+        flipped, putting the missing wedge on the wrong side of the
+        converted frame.
+
+        So an untouched field is not an override. A field the user
+        actually changed still is, and ``conversion.run_conversion``
+        makes it win (see the poni1/poni2 reset there).
+        """
+        prev = self._poni_autofill.get(key)
+        return prev is not None and float(value) == float(prev)
+
     def _autofill_overrides_from_poni(self) -> None:
         """Pre-fill the override fields with the loaded PONI's values.
 
@@ -818,6 +843,7 @@ class ConversionPanel(QWidget):
         is a no-op — pygid computes the same numbers from the file.
         Best-effort: an unreadable/foreign file leaves the fields alone.
         """
+        self._poni_autofill = {}
         text = self.poni_path.text().strip()
         if not text:
             return
@@ -829,6 +855,7 @@ class ConversionPanel(QWidget):
         except Exception:
             logger.debug("suppressed PONI parse in autofill", exc_info=True)
             self.append_log(f"Could not parse {path.name} for override pre-fill.")
+            self._poni_autofill = {}
             return
         if not values:
             return
@@ -840,6 +867,14 @@ class ConversionPanel(QWidget):
         }
         for key, value in values.items():
             fields[key].setValue(value)
+        # Snapshot what the autofill put there, read back through the
+        # spinbox so the comparison in ``_build_config`` is against the
+        # rounded value the widget actually holds. A field still showing
+        # this is a readout, not an override, and must not be sent — see
+        # ``_unedited_autofill``.
+        self._poni_autofill = {
+            key: _spin_or_none(fields[key]) for key in values
+        }
         self.append_log(
             f"Override fields pre-filled from {path.name}: "
             + ", ".join(f"{k}={v:.6g}" for k, v in sorted(values.items()))
@@ -1551,7 +1586,7 @@ class ConversionPanel(QWidget):
             ("over_wavelength", "wavelength"),
         ):
             v = _spin_or_none(getattr(self, attr))
-            if v is not None:
+            if v is not None and not self._unedited_autofill(key, v):
                 overrides[key] = v
         if self.over_transp.isChecked():
             overrides["transp"] = True

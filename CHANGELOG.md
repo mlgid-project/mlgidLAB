@@ -8,6 +8,16 @@ pre-releases.
 
 ### Fixed
 
+- **Flipping the detector image now moves the beam center with it.**
+  Ticking *Flip LR* or *Flip UD* on its own flipped the image but left
+  the beam center where it was, so the converted frame came out with its
+  missing wedge mirrored relative to the data. The cause was the PONI
+  autofill: it pre-fills the Manual-override boxes as a readout, and
+  those values were being sent back as overrides, which put pygid in the
+  one state where it applies the flips to the image but not to the
+  center. An untouched override field is no longer treated as an
+  override, and a center you *do* type in now genuinely wins over the
+  PONI (it never reached the q maps before).
 - **Peaks can be added before the pipeline has ever run.** Drawing a box
   and pressing *Add to detected* / *Add to fitted* — or committing one
   with quick select — failed on any frame that had never been through a
