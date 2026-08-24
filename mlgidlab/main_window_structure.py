@@ -24,16 +24,60 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import h5py
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtCore import QItemSelectionModel, QModelIndex, Qt
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QInputDialog,
+    QMessageBox,
+)
 
-from mlgidlab import h5_edit
+from mlgidlab import h5_edit, nexus_schema
+from silx.gui.hdf5 import Hdf5TreeModel
+
 from mlgidlab.browser_widgets import _ImageFileNode
 from mlgidlab.h5_edit import MISSING, EditError, EditHandle
-from mlgidlab.h5_edit_ops import EditHistory, RenameAttrOp, SetAttrOp, WriteCellsOp
+from mlgidlab.h5_edit_ops import (
+    CreateNodeOp,
+    DeleteNodeOp,
+    EditHistory,
+    MoveNodeOp,
+    RenameAttrOp,
+    SetAttrOp,
+    WriteCellsOp,
+)
+from mlgidlab.structure_dialogs import (
+    NewDatasetDialog,
+    NewGroupDialog,
+    parse_shape,
+)
 
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_template(f, path: str, template) -> None:
+    """Create a template's fields inside a freshly made group.
+
+    Scalar datasets with the template's default value, plus the units
+    attribute where the template names one. Deliberately shallow: a
+    template pre-creates what a group nearly always has, and anything
+    optional is better added deliberately than deleted from a bloated
+    skeleton.
+    """
+    for spec in template.fields:
+        if spec.kind == "str":
+            h5_edit.create_dataset(
+                f, path, spec.name, dtype="str", data=str(spec.value),
+                attrs={"units": spec.units} if spec.units else None,
+            )
+        else:
+            dtype = "float64" if spec.kind == "float" else "int64"
+            h5_edit.create_dataset(
+                f, path, spec.name, dtype=dtype, shape=(), fill=spec.value,
+                attrs={"units": spec.units} if spec.units else None,
+            )
 
 
 class StructureMixin:
@@ -76,8 +120,16 @@ class StructureMixin:
             handle = EditHandle(path)
             self._h5_edit_handle = handle
         if not handle.is_open:
-            with self._detached_silx_tree():
+            # The detach rebuilds the browser, which would otherwise
+            # collapse the tree the user is working in — on the very
+            # first edit of a session, before anything has gone wrong.
+            state = self._capture_tree_state()
+            self._detach_silx_tree()
+            try:
                 handle.acquire()
+            finally:
+                self._reattach_tree_safely()
+            self._restore_tree_state(state)
         return handle
 
     def _release_edit_handle(self) -> None:
@@ -523,3 +575,419 @@ class StructureMixin:
         if text:
             QApplication.clipboard().setText(text)
             self.statusBar().showMessage("Changes copied to the clipboard", 3000)
+
+    # -- the file-browser context menu -------------------------------------
+
+    def _install_structure_context_menu(self) -> None:
+        """Hang the edit actions off the File browser's context menu.
+
+        silx offers ``addContextMenuCallback`` for exactly this, so the
+        dock's own context-menu policy, model and click handling are
+        untouched — the tree gains a menu and nothing else. The callback
+        is stored on ``self`` because silx keeps callbacks as safe refs.
+        """
+        self._structure_menu_callback = self._structure_context_actions
+        self.tree.addContextMenuCallback(self._structure_menu_callback)
+
+    def _structure_context_actions(self, event) -> None:
+        """Fill the context menu for the hovered node.
+
+        Everything is built against the hovered node rather than the
+        selection, which is what a right-click means: silx has already
+        resolved the node under the cursor and hands it over.
+        """
+        try:
+            node = event.hoveredObject()
+            menu = event.menu()
+        except Exception:
+            logger.debug("context menu event unusable", exc_info=True)
+            return
+        file_path = self._node_filename(node)
+        raw_path = self._node_h5_path(node)
+        if file_path is None or raw_path is None:
+            return
+        h5_path = h5_edit.normalize_path(raw_path)
+        session = self._session_for_node(node)
+        if session is None or session.kind != "nexus":
+            # Raw inputs and files with no session behind them stay
+            # read-only; adding greyed-out actions would only imply
+            # otherwise.
+            return
+
+        menu.addSeparator()
+        is_group = self._structure_node_is_group(file_path, h5_path)
+        target = (Path(file_path), h5_path)
+
+        if is_group:
+            menu.addAction(
+                "New group…",
+                lambda: self._on_structure_new_group(target),
+            )
+            menu.addAction(
+                "New field…",
+                lambda: self._on_structure_new_dataset(target),
+            )
+        menu.addAction(
+            "Rename…", lambda: self._on_structure_rename(target)
+        ).setEnabled(h5_path != "/")
+        menu.addAction(
+            "Delete", lambda: self._on_structure_delete(target)
+        ).setEnabled(h5_path != "/")
+
+    def _structure_node_is_group(self, file_path, h5_path: str) -> bool:
+        """Whether a node can hold children, without resolving a link."""
+        with self._structure_read(file_path) as f:
+            if f is None:
+                return False
+            try:
+                return h5_edit.node_info(f, h5_path).kind == "group"
+            except Exception:
+                logger.debug("node kind probe failed", exc_info=True)
+                return False
+
+    # -- structure intents -------------------------------------------------
+
+    def _structure_handle_for(self, target):
+        """``(handle, h5_path)`` for an explicit target, or None."""
+        file_path, h5_path = target
+        try:
+            return self._acquire_edit_handle(file_path), h5_path
+        except EditError as exc:
+            QMessageBox.critical(self, "Edit file", str(exc))
+            return None
+
+    def _on_structure_new_group(self, target) -> None:
+        opened = self._structure_handle_for(target)
+        if opened is None:
+            return
+        handle, parent_path = opened
+        dialog = NewGroupDialog(self, parent_path=parent_path)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, nx_class, template_key = dialog.result_values()
+        if not name:
+            return
+
+        def create(f):
+            path = h5_edit.create_group(
+                f, parent_path, name, nx_class=nx_class or None)
+            if template_key is not None:
+                _apply_template(f, path, nexus_schema.TEMPLATES[template_key])
+            return path
+
+        try:
+            new_path = create(handle.file)
+        except EditError as exc:
+            self._structure_failed("New group", exc)
+            return
+        self._commit_structure_change(
+            handle,
+            CreateNodeOp(new_path, nx_class or "group", recreate=create),
+            new_path,
+        )
+
+    def _on_structure_new_dataset(self, target) -> None:
+        opened = self._structure_handle_for(target)
+        if opened is None:
+            return
+        handle, parent_path = opened
+        dialog = NewDatasetDialog(self, parent_path=parent_path)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, dtype, shape_text, value_text, units, resizable = dialog.result_values()
+        if not name:
+            return
+
+        def create(f):
+            shape = parse_shape(shape_text)
+            attrs = {"units": units} if units else None
+            if dtype == "str":
+                return h5_edit.create_dataset(
+                    f, parent_path, name, dtype="str",
+                    data=value_text if not shape else None,
+                    shape=None if not shape else shape,
+                    attrs=attrs, resizable=resizable,
+                )
+            fill = h5_edit.parse_scalar(value_text or "0", dtype)
+            return h5_edit.create_dataset(
+                f, parent_path, name, dtype=dtype, shape=shape, fill=fill,
+                attrs=attrs, resizable=resizable,
+            )
+
+        try:
+            new_path = create(handle.file)
+        except (EditError, ValueError) as exc:
+            self._structure_failed("New field", EditError(str(exc)))
+            return
+        self._commit_structure_change(
+            handle, CreateNodeOp(new_path, dtype, recreate=create), new_path)
+
+    def _on_structure_rename(self, target) -> None:
+        opened = self._structure_handle_for(target)
+        if opened is None:
+            return
+        handle, path = opened
+        parent_path, old_name = h5_edit.split_path(path)
+        reason = h5_edit.protection_reason(path)
+        if reason and not self._confirm_protected("Rename", path, reason):
+            return
+        new_name, ok = QInputDialog.getText(
+            self, "Rename", f"New name for {old_name}:", text=old_name)
+        if not ok or not new_name.strip() or new_name.strip() == old_name:
+            return
+        try:
+            new_path = h5_edit.rename_node(
+                handle.file, path, new_name.strip())
+        except EditError as exc:
+            self._structure_failed("Rename", exc)
+            return
+        self._commit_structure_change(
+            handle, MoveNodeOp(path, new_path), new_path)
+
+    def _on_structure_delete(self, target) -> None:
+        """Delete a node, snapshotting it first when it is small enough.
+
+        The size probe walks hard links only and stops at the cap, so
+        asking "can this be undone?" never costs a walk of a 226-entry
+        master.
+        """
+        opened = self._structure_handle_for(target)
+        if opened is None:
+            return
+        handle, path = opened
+        reason = h5_edit.protection_reason(path)
+        if reason and not self._confirm_protected("Delete", path, reason):
+            return
+        try:
+            size = h5_edit.node_nbytes(
+                handle.file, path, cap=h5_edit.UNDO_SNAPSHOT_LIMIT)
+            info = h5_edit.node_info(handle.file, path)
+        except EditError as exc:
+            self._structure_failed("Delete", exc)
+            return
+
+        snapshot = None
+        if size <= h5_edit.UNDO_SNAPSHOT_LIMIT:
+            try:
+                snapshot = h5_edit.snapshot_node(handle.file, path)
+            except EditError:
+                logger.debug("snapshot before delete failed", exc_info=True)
+        if snapshot is None and not self._confirm_final_delete(path, size):
+            return
+
+        try:
+            h5_edit.delete_node(handle.file, path)
+        except EditError as exc:
+            self._structure_failed("Delete", exc)
+            return
+        self._commit_structure_change(
+            handle,
+            DeleteNodeOp(path, info.kind, snapshot=snapshot),
+            path,
+        )
+
+    def _confirm_final_delete(self, path: str, size: int) -> bool:
+        """Ask before a delete that Ctrl+Z will not be able to reverse."""
+        answer = QMessageBox.warning(
+            self,
+            "Delete permanently?",
+            f"{path} holds about {size / 1e6:.0f} MB, too much to keep in "
+            "memory for an undo.\n\n"
+            "Deleting it cannot be reversed from inside this session. The "
+            "file on disk is still untouched until you save, so closing "
+            "without saving remains a way back.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _commit_structure_change(self, handle, op, path: str) -> None:
+        """Commit an edit that changed the tree's shape.
+
+        Same as an attribute commit, plus the two things a structural
+        change makes stale: the browser tree, which is rebuilt with its
+        expansion and selection restored, and the entry dropdown, when a
+        top-level group came or went.
+        """
+        state = self._capture_tree_state()
+        self._commit_structure_edit(handle, op, path)
+        self._rebuild_tree_preserving(state, handle)
+        if h5_edit.entry_of(path) is not None or path.count("/") == 1:
+            self._repopulate_entries_after_structure_edit()
+
+    def _repopulate_entries_after_structure_edit(self) -> None:
+        """Refresh the entry dropdown, keeping the current entry if it lives."""
+        current = self.entry_combo.currentText()
+        try:
+            self._populate_entries()
+        except Exception:
+            logger.debug("entry repopulate after a structure edit failed",
+                         exc_info=True)
+            return
+        if current and self.entry_combo.findText(current) >= 0:
+            self.entry_combo.setCurrentText(current)
+
+    # -- tree state --------------------------------------------------------
+
+    def _capture_tree_state(self):
+        """Which browser rows are open, and which one is selected.
+
+        Rows are identified structurally: the file of the root row plus
+        the chain of display names below it. That deliberately avoids
+        asking each node for its h5py object — the row under the cursor
+        may be an external link, and resolving one to answer "where am
+        I?" is the cost this whole feature is built to avoid. Only
+        expanded rows are walked, so the work is bounded by what the
+        user already opened.
+        """
+        view = self.tree
+        model = view.model()
+        expanded: list[tuple[str, tuple[str, ...]]] = []
+        selected: tuple[str, tuple[str, ...]] | None = None
+        chosen = set(view.selectionModel().selectedIndexes()) if (
+            view.selectionModel() is not None) else set()
+
+        def walk(parent, file_key: str | None, parts: tuple[str, ...]) -> None:
+            nonlocal selected
+            for row in range(model.rowCount(parent)):
+                index = model.index(row, 0, parent)
+                if file_key is None:
+                    key = self._tree_root_file(index)
+                    if key is None:
+                        continue
+                    child_parts: tuple[str, ...] = ()
+                else:
+                    key = file_key
+                    name = model.data(index, Qt.ItemDataRole.DisplayRole)
+                    if not name:
+                        continue
+                    child_parts = parts + (str(name),)
+                if index in chosen:
+                    selected = (key, child_parts)
+                if not view.isExpanded(index):
+                    continue
+                expanded.append((key, child_parts))
+                walk(index, key, child_parts)
+
+        try:
+            walk(QModelIndex(), None, ())
+        except Exception:
+            logger.debug("capturing tree state failed", exc_info=True)
+            return [], None
+        return expanded, selected
+
+    def _tree_root_file(self, index) -> str | None:
+        """The filesystem path behind a root row of the browser.
+
+        A root row *is* the open file, so asking it for its h5py object
+        resolves nothing that was not already open.
+        """
+        try:
+            obj = index.model().data(index, Hdf5TreeModel.H5PY_OBJECT_ROLE)
+            return str(obj.file.filename)
+        except Exception:
+            logger.debug("tree root lookup failed", exc_info=True)
+            return None
+
+    def _find_tree_index(self, key):
+        """The proxy index for ``(file, name parts)``, or None.
+
+        Walks down one path component at a time, matching display names,
+        so only the groups on that single path are ever populated. A path
+        that no longer exists — the node was just deleted — returns None.
+        """
+        file_key, parts = key
+        view = self.tree
+        model = view.model()
+        current = None
+        for row in range(model.rowCount(QModelIndex())):
+            index = model.index(row, 0, QModelIndex())
+            if self._tree_root_file(index) == file_key:
+                current = index
+                break
+        if current is None:
+            return None
+        for part in parts:
+            nxt = None
+            for row in range(model.rowCount(current)):
+                index = model.index(row, 0, current)
+                if model.data(index, Qt.ItemDataRole.DisplayRole) == part:
+                    nxt = index
+                    break
+            if nxt is None:
+                return None
+            current = nxt
+        return current
+
+    def _reattach_tree_safely(self) -> None:
+        """Reattach the browser, surviving a file the viewer can no longer read.
+
+        ``_reattach_silx_tree`` ends by reopening the viewer's
+        FrameSource, which raises if the entry it was showing has just
+        lost its image stack or a q axis. That is a state the user can
+        now reach deliberately (delete q_z, confirm the warning), so it
+        has to degrade rather than raise out of a commit that already
+        succeeded: the tree is rebuilt, the viewer is emptied, and the
+        log says why.
+        """
+        try:
+            self._reattach_silx_tree()
+        except Exception as exc:
+            logger.debug("reattach after a structure edit failed", exc_info=True)
+            try:
+                self.viewer.clear()
+                self.pipeline_panel.append_log(
+                    f"The current entry can no longer be displayed — {exc}"
+                )
+            except Exception:
+                logger.debug("viewer cleanup after a failed reattach failed",
+                             exc_info=True)
+
+    def _restore_tree_state(self, state) -> None:
+        """Put the browser's open rows and selection back after a rebuild."""
+        expanded, selected = state
+        for key in expanded:
+            index = self._find_tree_index(key)
+            if index is not None and index.isValid():
+                self.tree.expand(index)
+        if selected is None:
+            return
+        index = self._find_tree_index(selected)
+        if index is not None and index.isValid():
+            self.tree.selectionModel().select(
+                index,
+                QItemSelectionModel.SelectionFlag.ClearAndSelect
+                | QItemSelectionModel.SelectionFlag.Rows,
+            )
+            self.tree.selectionModel().setCurrentIndex(
+                index, QItemSelectionModel.SelectionFlag.Current)
+
+    def _rebuild_tree_preserving(self, state, handle) -> None:
+        """Rebuild the browser and put its open rows and selection back.
+
+        A structural edit changes what the tree should show, and silx's
+        model has no public "refresh this subtree" — so the tree is torn
+        down and rebuilt, exactly as every other file operation in this
+        app already does it. What is new is restoring the state
+        afterwards, because here the tree is the surface the user is
+        working on and losing their place mid-edit is not acceptable.
+
+        The write handle is re-taken *inside* the detached window. The
+        detach releases it along with every other handle, and re-opening
+        it before silx reattaches is what keeps the ordering legal: r+
+        first, silx's r behind it. Without this the next edit would pay
+        for a second detach/reattach of its own.
+
+        Scoped to this call on purpose: the existing detach/reattach
+        paths are left exactly as they were.
+        """
+        self._detach_silx_tree()
+        try:
+            handle.acquire()
+        except EditError:
+            # Losing the handle here is recoverable — the next edit
+            # acquires again. Better a rebuilt tree than a raise out of a
+            # commit that already succeeded.
+            logger.debug("re-acquiring the edit handle failed", exc_info=True)
+        self._reattach_tree_safely()
+        self._restore_tree_state(state)

@@ -234,6 +234,10 @@ class BuildMixin:
         self._tree_dock.setWidget(tree_box)
         self._tree_dock.setObjectName("FileBrowserDock")
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._tree_dock)
+        # Edit actions on the browser's own context menu. silx's
+        # addContextMenuCallback is the supported hook, so the tree's
+        # policy, model and click handling stay exactly as they were.
+        self._install_structure_context_menu()
         refresh_action = QAction("Refresh file browser", self)
         refresh_action.setShortcut(QKeySequence("F5"))
         refresh_action.triggered.connect(self._refresh_file_tree)

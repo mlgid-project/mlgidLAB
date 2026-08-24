@@ -643,6 +643,7 @@ def create_dataset(
     data: Any = None,
     fill: Any = None,
     attrs: dict[str, Any] | None = None,
+    resizable: bool = False,
 ) -> str:
     """Create one dataset. Returns its path.
 
@@ -650,10 +651,19 @@ def create_dataset(
     (``()`` for a scalar) and ``dtype`` are used, with every cell set to
     ``fill``. ``dtype="str"`` creates a variable-length UTF-8 string,
     which is what NeXus text fields are.
+
+    ``resizable`` leaves the first axis unbounded, so rows can be
+    appended later without rewriting the dataset — the same shape
+    pygid's own append path relies on. Ignored for a scalar, which has
+    no axis to grow.
     """
     group = _require_group(f, parent)
     _check_free(group, name)
     kwargs: dict[str, Any] = {"track_order": True}
+    if resizable and shape:
+        kwargs["maxshape"] = (None,) + tuple(shape[1:])
+    elif resizable and data is not None and np.ndim(data) > 0:
+        kwargs["maxshape"] = (None,) + tuple(np.shape(data)[1:])
     try:
         if data is not None:
             if dtype == "str":

@@ -195,3 +195,90 @@ class EditHistory:
 
     def __len__(self) -> int:
         return len(self._undo)
+
+
+@dataclass
+class CreateNodeOp:
+    """A group, dataset or link that was created. Undone by deleting it.
+
+    ``recreate`` is a one-argument callable taking the open file, so redo
+    replays exactly what the dialog asked for without this class having
+    to know which of the three kinds it was.
+    """
+
+    path: str
+    kind: str
+    recreate: Any = None
+
+    def redo(self, f: h5py.File) -> None:
+        if self.recreate is not None:
+            self.recreate(f)
+
+    def undo(self, f: h5py.File) -> None:
+        h5_edit.delete_node(f, self.path)
+
+    def describe(self) -> str:
+        return f"+ {self.path}  ({self.kind})"
+
+
+@dataclass
+class DeleteNodeOp:
+    """A node that was deleted, with the bytes needed to bring it back.
+
+    ``snapshot`` is None when the node was too large to hold in memory
+    (see ``h5_edit.UNDO_SNAPSHOT_LIMIT``). Such a delete is not
+    reversible, and the GUI says so before it happens rather than
+    letting the user find out at Ctrl+Z.
+    """
+
+    path: str
+    kind: str
+    snapshot: Any = None
+
+    @property
+    def reversible(self) -> bool:
+        return self.snapshot is not None
+
+    def redo(self, f: h5py.File) -> None:
+        h5_edit.delete_node(f, self.path)
+
+    def undo(self, f: h5py.File) -> None:
+        if self.snapshot is None:
+            raise h5_edit.EditError(
+                f"{self.path} was too large to hold in memory, so this "
+                "delete cannot be undone."
+            )
+        parent, _ = h5_edit.split_path(self.path)
+        h5_edit.restore_snapshot(f, parent, self.snapshot)
+
+    def describe(self) -> str:
+        tail = "" if self.reversible else "  (not undoable)"
+        return f"- {self.path}  ({self.kind}){tail}"
+
+
+@dataclass
+class MoveNodeOp:
+    """A rename or a move. Both are one HDF5 operation, so both are one op."""
+
+    before: str
+    after: str
+
+    @property
+    def path(self) -> str:
+        """Where the node is now — what the viewer-refresh rule reads."""
+        return self.after
+
+    def redo(self, f: h5py.File) -> None:
+        parent, name = h5_edit.split_path(self.after)
+        h5_edit.move_node(f, self.before, parent, name)
+
+    def undo(self, f: h5py.File) -> None:
+        parent, name = h5_edit.split_path(self.before)
+        h5_edit.move_node(f, self.after, parent, name)
+
+    def describe(self) -> str:
+        before_parent, _ = h5_edit.split_path(self.before)
+        after_parent, after_name = h5_edit.split_path(self.after)
+        if before_parent == after_parent:
+            return f"{self.before} renamed to {after_name}"
+        return f"{self.before} moved to {self.after}"
