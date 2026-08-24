@@ -93,8 +93,18 @@ def attach_empty_hint(view: QWidget, text: str) -> QLabel:
     layout.addWidget(hint)
 
     def sync() -> None:
-        model = view.model()
-        hint.setVisible(model is None or model.rowCount() == 0)
+        # A view whose C++ half is already gone still has live model
+        # signals connected to this closure: a QTableWidget owns its
+        # model, and Qt emits modelReset while tearing the pair down, so
+        # the last call arrives after the view is dead. Reading anything
+        # off it then raises "Internal C++ object already deleted" and
+        # PySide6 prints the traceback from inside the signal emission.
+        # Nothing to do at that point — the hint is being destroyed too.
+        try:
+            model = view.model()
+            hint.setVisible(model is None or model.rowCount() == 0)
+        except RuntimeError:
+            return
 
     model = view.model()
     if model is not None:

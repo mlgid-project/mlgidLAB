@@ -842,6 +842,7 @@ class FramesMixin:
         if image_node is not None:
             self._activate_image_node(image_node)
             self._set_or_defer_data_node(image_node)
+            self._set_or_defer_structure_node(image_node)
             return
         nodes = self._safe_selected_h5_nodes()
         if not nodes:
@@ -870,6 +871,10 @@ class FramesMixin:
         # a single click on the Image tab never pays the external-link
         # resolve for a dataset the user can't even see.
         self._set_or_defer_data_node(node)
+        # Same deferral for the Structure tab: describing a node costs a
+        # small read, and there is no reason to pay it while the tab that
+        # would show the result is hidden.
+        self._set_or_defer_structure_node(node)
 
     def _on_tree_activated(self, *_: object) -> None:
         image_node = self._selected_image_node()
@@ -922,14 +927,21 @@ class FramesMixin:
             )
 
     def _on_main_tab_changed(self, _index: int) -> None:
-        """When the user switches to the Data tab, render any node that was
-        clicked while the tab was hidden (deferred to keep Image-tab clicks
-        from paying the external-link resolve)."""
+        """Render whatever was clicked while the newly-shown tab was hidden.
+
+        Both the Data viewer and the Structure panel defer a tree click
+        they cannot display, to keep Image-tab clicks from paying the
+        external-link resolve (Data) or a metadata read (Structure)."""
         if (
             self.tabs.currentWidget() is self.data_viewer
             and self._pending_data_node is not None
         ):
             self._set_data_node(self._pending_data_node)
+        elif (
+            self.tabs.currentWidget() is self.structure_panel
+            and self._pending_structure_node is not None
+        ):
+            self._render_structure_node(self._pending_structure_node)
 
     def _activate_entry_for_node(self, node) -> None:
         """If the clicked node is inside an ``entry_*`` group, switch the

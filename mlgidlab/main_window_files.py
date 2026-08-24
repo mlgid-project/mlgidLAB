@@ -677,6 +677,10 @@ class FilesMixin:
                 self.viewer.clear_history()
                 self.profile_viewer.clear()
                 self.peaks_table_panel.clear()
+                # The Structure panel describes a node in the file we are
+                # about to delete the working copy of; empty it before the
+                # path goes away.
+                self._clear_structure_panel()
                 self.entry_combo.blockSignals(True)
                 self.entry_combo.clear()
                 self.entry_combo.blockSignals(False)

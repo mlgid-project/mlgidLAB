@@ -59,6 +59,7 @@ from mlgidlab.pipeline import is_mlgidbase_available
 from mlgidlab.pipeline_panel import PipelinePanel
 from mlgidlab.profile_viewer import ProfileViewer
 from mlgidlab.scan_tracking_panel import ScanTrackingPanel
+from mlgidlab.structure_panel import StructurePanel
 from mlgidlab.update_ui import _UpdateBanner
 from mlgidlab.welcome_view import WelcomeView
 from mlgidlab.workflow_rail import WorkflowRail
@@ -97,6 +98,8 @@ class BuildMixin:
     def _build_central(self) -> None:
         self.viewer = GIWAXSImageViewer(self)
         self.data_viewer = DataViewerFrame(self)
+        self.structure_panel = StructurePanel(self)
+        self.structure_panel.recheckRequested.connect(self._on_structure_recheck)
 
         self.tabs = QTabWidget(self)
         # documentMode flattens the tab-pane border so the image fills
@@ -112,8 +115,13 @@ class BuildMixin:
         )
         self.tabs.addTab(self.viewer, "Image")
         self.tabs.addTab(self.data_viewer, "Data")
+        # The structure editor. Deliberately last: Image is what the app
+        # opens on, and inserting a tab before Data would move a tab the
+        # user's muscle memory already knows.
+        self.tabs.addTab(self.structure_panel, "Structure")
         # Render a deferred (clicked-while-hidden) tree node when the user
-        # switches to the Data tab — see ``_set_or_defer_data_node``.
+        # switches to the Data or Structure tab — see
+        # ``_set_or_defer_data_node`` / ``_set_or_defer_structure_node``.
         self.tabs.currentChanged.connect(self._on_main_tab_changed)
 
         # Central column: a hidden "update available" banner above the tabs

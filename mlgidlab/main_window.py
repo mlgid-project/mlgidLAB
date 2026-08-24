@@ -126,6 +126,7 @@ from mlgidlab.main_window_peaks import PeaksMixin, _CallbackAction
 from mlgidlab.main_window_frames import FramesMixin
 from mlgidlab.main_window_files import FilesMixin, _natural_key
 from mlgidlab.main_window_build import BuildMixin
+from mlgidlab.main_window_structure import StructureMixin
 from mlgidlab.main_window_update import UpdateMixin
 from mlgidlab.main_window_menus import MenusMixin
 from mlgidlab.workers import (
@@ -187,6 +188,7 @@ class MainWindow(
     PeaksMixin,
     FramesMixin,
     FilesMixin,
+    StructureMixin,
     BuildMixin,
     UpdateMixin,
     MenusMixin,
@@ -355,6 +357,10 @@ class MainWindow(
         # keeps a single Image-tab click from eagerly resolving a huge
         # external-linked dataset into a widget the user can't see.
         self._pending_data_node = None
+        # The same bargain for the Structure tab, and the file whose
+        # layout check is currently displayed (None re-runs it).
+        self._pending_structure_node = None
+        self._structure_checked_file: str | None = None
         # Tools → Export figure window. Built lazily on first open
         # (see ``_action_export_figure``); kept alive across re-opens
         # so settings persist. None until the user invokes Tools →

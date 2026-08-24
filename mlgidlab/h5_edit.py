@@ -393,6 +393,47 @@ def read_attrs(f: h5py.File, path: str) -> dict[str, Any]:
         raise EditError(f"{full} cannot be read: {exc}") from exc
 
 
+def value_preview(f: h5py.File, path: str, *, max_items: int = 12) -> str:
+    """A short rendering of what a dataset holds.
+
+    Reads at most ``max_items`` elements, never the whole array: the
+    slice walks index 0 along every axis but the last, so previewing a
+    6000 x 2000 x 2000 stack costs one row, not the file. Groups and
+    links return an empty string — there is nothing to preview.
+    """
+    full = normalize_path(path)
+    link = link_info(f, full)
+    if link is not None and link.kind == "external":
+        return ""
+    try:
+        obj = f[full]
+    except (KeyError, OSError):
+        return ""
+    if not isinstance(obj, h5py.Dataset):
+        return ""
+    try:
+        if obj.ndim == 0:
+            return format_value(obj[()])
+        index = tuple([0] * (obj.ndim - 1) + [slice(0, max_items)])
+        chunk = np.asarray(obj[index])
+    except (OSError, ValueError, TypeError) as exc:
+        logger.debug("value preview failed for %s", full, exc_info=True)
+        return f"(unreadable: {exc})"
+    total = int(np.prod(obj.shape))
+    if obj.dtype.names:
+        rows = [
+            ", ".join(f"{name}={format_value(row[name], limit=24)}"
+                      for name in obj.dtype.names)
+            for row in chunk[:2]
+        ]
+        text = " | ".join(rows)
+    else:
+        text = ", ".join(format_value(v, limit=24) for v in chunk.reshape(-1))
+    if total > chunk.size:
+        text += f", … ({total} values)"
+    return text
+
+
 def format_value(value: Any, *, limit: int = 120) -> str:
     """A one-line rendering of an attribute or scalar, elided at ``limit``."""
     if isinstance(value, bytes):
