@@ -176,6 +176,24 @@ def protection_reason(path: str) -> str | None:
     return None
 
 
+def affects_viewer(path: str) -> bool:
+    """Whether editing ``path`` changes what the image viewer displays.
+
+    Narrower than ``protection_reason`` on purpose. The entry group
+    itself is protected — deleting it takes the scan with it — but
+    putting a ``title`` on it changes nothing the viewer draws, and
+    reloading the entry for that would be a visible stutter for no
+    reason. What the viewer actually reads is the image stack, the two q
+    axes, the peak tables and the incidence angle.
+    """
+    reason = protection_reason(path)
+    if reason is None:
+        return False
+    entry = entry_of(path)
+    # The bare entry group: protected, but nothing the viewer re-reads.
+    return normalize_path(path).strip("/") != entry
+
+
 def attr_protection_reason(path: str, attr: str) -> str | None:
     """Why an attribute matters, or None.
 
@@ -485,6 +503,64 @@ def rename_attr(f: h5py.File, path: str, old_name: str, new_name: str) -> None:
         raise EditError(f"{path} already has an attribute {new_name!r}.")
     obj.attrs[new_name] = obj.attrs[old_name]
     del obj.attrs[old_name]
+
+
+def attr_type_label(value: Any) -> str:
+    """How an attribute's type reads in the UI: ``str``, ``float64``, …"""
+    if value is MISSING:
+        return "str"
+    if isinstance(value, (bytes, str)):
+        return "str"
+    if isinstance(value, np.ndarray):
+        if value.dtype.kind in "SOU":
+            return "str" if value.size == 1 else f"str[{value.size}]"
+        return (str(value.dtype) if value.size == 1
+                else f"{value.dtype}[{value.size}]")
+    if isinstance(value, (bool, np.bool_)):
+        return "bool"
+    return str(np.asarray(value).dtype)
+
+
+def is_inline_editable(value: Any) -> bool:
+    """Whether an attribute can be edited as one line of text.
+
+    Scalars, strings and flat lists can. A 2-D attribute cannot be typed
+    into a single field without inventing a syntax, so the UI shows it
+    read-only rather than pretending.
+    """
+    if isinstance(value, np.ndarray):
+        return value.ndim <= 1
+    return True
+
+
+def parse_attr_value(text: str, template: Any) -> Any:
+    """Parse ``text`` into the shape and dtype of an existing attribute.
+
+    An attribute keeps its type when edited: typing ``2.5`` into a
+    float64 attribute stores a float64, not a string. ``template`` is the
+    current value, or ``MISSING`` for one being created (which becomes
+    text). A flat array attribute is written comma-separated and may
+    change length — HDF5 attributes are rewritten wholesale anyway.
+    """
+    if template is MISSING or template is None:
+        return text
+    if isinstance(template, (bytes, str)):
+        return text
+    if isinstance(template, np.ndarray) and template.dtype.kind in "SOU":
+        parts = [p.strip() for p in text.split(",")]
+        return parts[0] if template.size == 1 and len(parts) == 1 else parts
+    if isinstance(template, np.ndarray) and template.size != 1:
+        parts = [p.strip() for p in text.split(",") if p.strip()]
+        if not parts:
+            raise EditError("Expected one or more comma-separated values.")
+        return np.array(
+            [parse_scalar(p, str(template.dtype)) for p in parts],
+            dtype=template.dtype,
+        )
+    dtype = str(np.asarray(template).dtype)
+    if np.asarray(template).dtype.kind == "b":
+        dtype = "bool"
+    return parse_scalar(text, dtype)
 
 
 def parse_scalar(text: str, dtype: str) -> Any:

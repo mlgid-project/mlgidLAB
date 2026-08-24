@@ -100,6 +100,18 @@ class BuildMixin:
         self.data_viewer = DataViewerFrame(self)
         self.structure_panel = StructurePanel(self)
         self.structure_panel.recheckRequested.connect(self._on_structure_recheck)
+        self.structure_panel.attributeEdited.connect(
+            self._on_structure_attribute_edited)
+        self.structure_panel.attributeRenamed.connect(
+            self._on_structure_attribute_renamed)
+        self.structure_panel.attributeAdded.connect(
+            self._on_structure_attribute_added)
+        self.structure_panel.attributeRemoved.connect(
+            self._on_structure_attribute_removed)
+        self.structure_panel.scalarValueEdited.connect(
+            self._on_structure_value_edited)
+        self.structure_panel.copyChangesRequested.connect(
+            self._on_structure_copy_changes)
 
         self.tabs = QTabWidget(self)
         # documentMode flattens the tab-pane border so the image fills

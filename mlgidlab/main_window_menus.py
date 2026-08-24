@@ -923,13 +923,20 @@ class MenusMixin:
                 )
 
     def _action_undo(self) -> None:
-        # Covers manual add/remove, manual geom edits, and detected/fitted
-        # geom edits. File-level deletes (delete_peak) are not undoable —
+        # Two histories, one shortcut. The Structure tab owns Ctrl+Z only
+        # while it is the tab in front and has an edit to reverse;
+        # everywhere else this is unchanged and reaches the viewer, which
+        # covers manual add/remove, manual geom edits, and detected /
+        # fitted geom edits. File-level peak deletes stay non-undoable —
         # see the confirmation dialog in _on_delete_peak_requested.
+        if self._structure_owns_undo() and self._structure_undo():
+            return
         if hasattr(self, "viewer"):
             self.viewer.undo_last_action()
 
     def _action_redo(self) -> None:
+        if self._structure_owns_undo() and self._structure_redo():
+            return
         if hasattr(self, "viewer"):
             self.viewer.redo_last_action()
 

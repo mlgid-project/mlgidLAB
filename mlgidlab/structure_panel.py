@@ -1,15 +1,18 @@
-"""The Structure tab: what the file browser's selection actually is.
+"""The Structure tab: what the file browser's selection is, and editing it.
 
 The third central tab, beside Image and Data. The File-browser dock
 stays the one place a file is navigated; this panel answers the
 questions the tree cannot show in a row — the full path, the type and
 shape, every attribute, what a link points at, whether the pipeline
-depends on this node, and what is wrong with the file as a whole.
+depends on this node, and what is wrong with the file as a whole — and
+is where those things are changed.
 
-Display only. Everything it shows is handed to it by
-``MainWindow``'s ``StructureMixin``, which owns the file handles; the
-panel opens nothing and reads nothing. Later stages add the editing
-affordances on top of exactly these sections.
+The panel performs no I/O. It renders what ``MainWindow``'s
+``StructureMixin`` hands it and emits an intent when the user asks for a
+change; the mixin owns the file handle, does the write, and re-renders.
+The panel therefore holds no authoritative state, and a failed edit
+needs no rollback logic here — the re-render reconciles the display with
+whatever the file actually says.
 """
 from __future__ import annotations
 
@@ -18,9 +21,15 @@ from typing import Any
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
+    QListWidget,
+    QPushButton,
     QScrollArea,
     QTableWidget,
     QTableWidgetItem,
@@ -29,13 +38,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from mlgidlab import icons
-from mlgidlab.h5_edit import Issue, NodeInfo
+from mlgidlab import icons, nexus_schema
+from mlgidlab.h5_edit import Issue, NodeInfo, is_inline_editable
 from mlgidlab.widgets import (
     GAP,
     PAD,
+    PRIMARY,
     Card,
     attach_empty_hint,
+    make_form,
+    set_variant,
     skin_item_view,
 )
 
@@ -51,6 +63,20 @@ _ISSUE_STATUS = {"error": "error", "warning": "warn", "info": "info"}
 _EMPTY_HINT = (
     "Select a group or a dataset in the File browser to see what it is."
 )
+
+#: Types offered when creating an attribute. NeXus metadata is almost
+#: entirely text and numbers, and an attribute created with the wrong
+#: type is one delete away from being created again — a longer list
+#: would cost more in hesitation than it buys.
+ATTR_TYPES: tuple[str, ...] = ("str", "float64", "int64", "bool")
+
+#: Attribute names that get a suggestion list rather than a bare field.
+_CLASS_ATTR = "NX_class"
+_UNITS_ATTR = "units"
+
+#: Stored on each attribute cell so an edit knows which attribute it
+#: belongs to even after the name cell itself has been retyped.
+_ATTR_NAME_ROLE = Qt.ItemDataRole.UserRole
 
 
 def _human_bytes(count: int) -> str:
@@ -98,20 +124,117 @@ def describe_node(info: NodeInfo) -> str:
     return " · ".join(parts)
 
 
+def suggestions_for(name: str) -> tuple[tuple[str, ...], str]:
+    """``(completions, type)`` worth offering for an attribute called ``name``.
+
+    This is the NeXus-aware half of the form: ``NX_class`` offers the
+    base classes instead of a blank box, and anything whose name implies
+    a physical quantity offers the units that quantity is written in.
+    Both stay editable — the lists are a leg-up, not a constraint.
+    """
+    if name == _CLASS_ATTR:
+        return nexus_schema.NX_CLASSES, "str"
+    if name == _UNITS_ATTR:
+        return nexus_schema.GENERIC_UNITS, "str"
+    return (), ""
+
+
+class NewAttributeDialog(QDialog):
+    """Name, type and value for an attribute being created."""
+
+    def __init__(self, parent: QWidget | None = None, *, node_name: str = "") -> None:
+        super().__init__(parent)
+        self.setWindowTitle("New attribute")
+        self._node_name = node_name
+
+        form = make_form(self)
+        self.name_edit = QLineEdit(self)
+        self.name_edit.setPlaceholderText("units, NX_class, long_name, …")
+        self.name_edit.textChanged.connect(self._on_name_changed)
+        form.addRow("Name:", self.name_edit)
+
+        self.type_combo = QComboBox(self)
+        self.type_combo.addItems(ATTR_TYPES)
+        form.addRow("Type:", self.type_combo)
+
+        # Editable combo rather than a line edit: for the names NeXus has
+        # an opinion about it fills with real values, and for everything
+        # else it behaves exactly like a text field.
+        self.value_combo = QComboBox(self)
+        self.value_combo.setEditable(True)
+        form.addRow("Value:", self.value_combo)
+
+        self.hint = QLabel("", self)
+        self.hint.setProperty("status", "muted")
+        self.hint.setWordWrap(True)
+        form.addRow("", self.hint)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self._on_name_changed("")
+
+    def _on_name_changed(self, name: str) -> None:
+        completions, forced_type = suggestions_for(name.strip())
+        if not completions and name.strip():
+            completions = nexus_schema.suggest_units(name.strip())
+            # Only offer units when the name actually implies a quantity;
+            # the generic fallback would put "counts" under "comment".
+            if completions is nexus_schema.GENERIC_UNITS:
+                completions = ()
+        current = self.value_combo.currentText()
+        self.value_combo.clear()
+        if completions:
+            self.value_combo.addItems([c for c in completions if c])
+        self.value_combo.setCurrentText(current)
+        if forced_type:
+            self.type_combo.setCurrentText(forced_type)
+        self.hint.setText(nexus_schema.class_help(self.value_combo.currentText())
+                          if name.strip() == _CLASS_ATTR else "")
+
+    def result_values(self) -> tuple[str, str, str]:
+        """``(name, type, value_text)`` as typed."""
+        return (
+            self.name_edit.text().strip(),
+            self.type_combo.currentText(),
+            self.value_combo.currentText(),
+        )
+
+
 class StructurePanel(QWidget):
-    """Read-out of one HDF5 node, plus the file's health."""
+    """Read-out and editor for one HDF5 node, plus the file's health."""
 
     #: The user asked for the file to be re-checked.
     recheckRequested = Signal()
+    #: ``(attribute_name, typed_text)`` — set this attribute's value.
+    attributeEdited = Signal(str, str)
+    #: ``(old_name, new_name)``
+    attributeRenamed = Signal(str, str)
+    #: ``(name, type, typed_text)`` — create this attribute.
+    attributeAdded = Signal(str, str, str)
+    #: ``(name,)`` — remove this attribute.
+    attributeRemoved = Signal(str)
+    #: The typed text for a scalar dataset's value.
+    scalarValueEdited = Signal(str)
+    #: Put the changes list on the clipboard.
+    copyChangesRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._info: NodeInfo | None = None
+        self._editable = False
+        # Guards the itemChanged signal while the table is being filled,
+        # so populating a row never reads as a user edit.
+        self._populating = False
 
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        # The path line elides and the tables scroll internally, so the
+        # The path line wraps and the tables scroll internally, so the
         # page never needs a horizontal bar of its own.
         scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -128,6 +251,7 @@ class StructurePanel(QWidget):
         self._link_card = self._build_link_card(page)
         column.addWidget(self._link_card)
         column.addWidget(self._build_check_card(page))
+        column.addWidget(self._build_changes_card(page))
         column.addStretch(1)
 
         scroll.setWidget(page)
@@ -182,14 +306,37 @@ class StructurePanel(QWidget):
         self._attr_table.verticalHeader().setVisible(False)
         self._attr_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
+        # Double-click to edit, not single: a single click is how the
+        # user selects a row to remove, and an accidental one-click edit
+        # on a file's metadata is a bad surprise.
         self._attr_table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers)
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
         header = self._attr_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._attr_table.setMinimumHeight(120)
+        self._attr_table.itemChanged.connect(self._on_attr_item_changed)
         attach_empty_hint(self._attr_table, "No attributes on this node.")
         card.body_layout.addWidget(self._attr_table)
+
+        row = QHBoxLayout()
+        row.setSpacing(GAP)
+        self._add_attr_btn = QPushButton("+ Attribute", card)
+        self._add_attr_btn.setToolTip(
+            "Add an attribute to this node. NX_class and units come with "
+            "suggestions."
+        )
+        self._add_attr_btn.clicked.connect(self._on_add_attribute)
+        row.addWidget(self._add_attr_btn)
+        self._remove_attr_btn = QPushButton("Remove", card)
+        self._remove_attr_btn.setToolTip(
+            "Remove the selected attribute (Delete).")
+        self._remove_attr_btn.clicked.connect(self._on_remove_attribute)
+        row.addWidget(self._remove_attr_btn)
+        row.addStretch(1)
+        card.body_layout.addLayout(row)
         return card
 
     def _build_value_card(self, parent: QWidget) -> Card:
@@ -199,6 +346,20 @@ class StructurePanel(QWidget):
         self._value_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
         card.body_layout.addWidget(self._value_label)
+
+        self._value_row = QWidget(card)
+        row = QHBoxLayout(self._value_row)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(GAP)
+        self._value_edit = QLineEdit(self._value_row)
+        self._value_edit.setPlaceholderText("value")
+        self._value_edit.returnPressed.connect(self._on_set_value)
+        row.addWidget(self._value_edit, 1)
+        self._value_set_btn = set_variant(
+            QPushButton("Set", self._value_row), PRIMARY)
+        self._value_set_btn.clicked.connect(self._on_set_value)
+        row.addWidget(self._value_set_btn)
+        card.body_layout.addWidget(self._value_row)
         return card
 
     def _build_link_card(self, parent: QWidget) -> Card:
@@ -251,6 +412,38 @@ class StructurePanel(QWidget):
         card.body_layout.addWidget(self._issue_table)
         return card
 
+    def _build_changes_card(self, parent: QWidget) -> Card:
+        card = Card("Changes this session", parent=parent)
+        self._changes_card = card
+        self._changes_list = QListWidget(card)
+        skin_item_view(self._changes_list)
+        self._changes_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.NoSelection)
+        self._changes_list.setMinimumHeight(90)
+        attach_empty_hint(
+            self._changes_list,
+            "Nothing changed yet. Every edit lands in the working copy; "
+            "the file on disk is untouched until you save.",
+        )
+        card.body_layout.addWidget(self._changes_list)
+
+        row = QHBoxLayout()
+        row.setSpacing(GAP)
+        self._copy_changes_btn = QToolButton(card)
+        self._copy_changes_btn.setText("Copy as text")
+        self._copy_changes_btn.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._copy_changes_btn.setAutoRaise(True)
+        self._copy_changes_btn.setToolTip(
+            "Put this list on the clipboard — a record of what was done "
+            "to the file before saving it."
+        )
+        self._copy_changes_btn.clicked.connect(self.copyChangesRequested)
+        row.addWidget(self._copy_changes_btn)
+        row.addStretch(1)
+        card.body_layout.addLayout(row)
+        return card
+
     # -- population --------------------------------------------------------
 
     def clear(self, message: str = "") -> None:
@@ -260,10 +453,37 @@ class StructurePanel(QWidget):
         self._type_label.setText("")
         self._badge.hide()
         self._note_label.hide()
-        self._attr_table.setRowCount(0)
+        self._populating = True
+        try:
+            self._attr_table.setRowCount(0)
+        finally:
+            self._populating = False
         self._attr_card.set_status("")
         self._value_card.hide()
         self._link_card.hide()
+        self._apply_editable()
+
+    def set_editable(self, editable: bool) -> None:
+        """Turn every edit control on or off.
+
+        Off for raw sessions, for a file with no session behind it, and
+        whenever there is no node selected.
+        """
+        self._editable = bool(editable)
+        self._apply_editable()
+
+    def _apply_editable(self) -> None:
+        has_node = self._info is not None
+        can_edit = self._editable and has_node and self._info.kind != "missing"
+        self._add_attr_btn.setEnabled(can_edit)
+        self._remove_attr_btn.setEnabled(can_edit)
+        self._attr_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+            if can_edit else QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self._value_edit.setEnabled(can_edit)
+        self._value_set_btn.setEnabled(can_edit)
 
     def set_note(self, text: str, level: str = "muted") -> None:
         """A line under the type summary — why editing is off, mostly."""
@@ -302,6 +522,13 @@ class StructurePanel(QWidget):
 
         if info.kind == "dataset":
             self._value_label.setText(preview or "(empty)")
+            # One cell is one field to type into. Anything larger is the
+            # grid's job (and a 6000 x 2000 image is nobody's job in a
+            # single line of text).
+            scalar = info.n_cells == 1 and not info.is_compound
+            self._value_row.setVisible(scalar)
+            if scalar:
+                self._value_edit.setText(preview)
             self._value_card.show()
         else:
             self._value_card.hide()
@@ -311,18 +538,36 @@ class StructurePanel(QWidget):
             self._link_card.show()
         else:
             self._link_card.hide()
+        self._apply_editable()
 
     def _fill_attributes(self, attrs: dict[str, Any]) -> None:
-        from mlgidlab.h5_edit import format_value
+        from mlgidlab.h5_edit import attr_type_label, format_value
 
-        self._attr_table.setRowCount(0)
-        for name, value in attrs.items():
-            row = self._attr_table.rowCount()
-            self._attr_table.insertRow(row)
-            self._attr_table.setItem(row, 0, QTableWidgetItem(str(name)))
-            item = QTableWidgetItem(format_value(value))
-            item.setToolTip(format_value(value, limit=2000))
-            self._attr_table.setItem(row, 1, item)
+        self._populating = True
+        try:
+            self._attr_table.setRowCount(0)
+            for name, value in attrs.items():
+                row = self._attr_table.rowCount()
+                self._attr_table.insertRow(row)
+                name_item = QTableWidgetItem(str(name))
+                name_item.setData(_ATTR_NAME_ROLE, str(name))
+                name_item.setToolTip(f"type: {attr_type_label(value)}")
+                self._attr_table.setItem(row, 0, name_item)
+
+                text = format_value(value)
+                value_item = QTableWidgetItem(text)
+                value_item.setData(_ATTR_NAME_ROLE, str(name))
+                value_item.setToolTip(format_value(value, limit=2000))
+                if not is_inline_editable(value):
+                    # A 2-D attribute has no one-line spelling. Showing it
+                    # read-only is honest; inventing a syntax is not.
+                    value_item.setFlags(
+                        value_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    value_item.setToolTip(
+                        "Multi-dimensional attribute — shown read-only.")
+                self._attr_table.setItem(row, 1, value_item)
+        finally:
+            self._populating = False
         count = self._attr_table.rowCount()
         self._attr_card.set_status(f"{count}" if count else "")
 
@@ -333,8 +578,7 @@ class StructurePanel(QWidget):
         for issue in issues:
             row = self._issue_table.rowCount()
             self._issue_table.insertRow(row)
-            where = QTableWidgetItem(issue.path)
-            self._issue_table.setItem(row, 0, where)
+            self._issue_table.setItem(row, 0, QTableWidgetItem(issue.path))
             text = issue.message
             if issue.fix:
                 text = f"{text}  →  {issue.fix}"
@@ -347,13 +591,13 @@ class StructurePanel(QWidget):
                 worst = "warning"
             elif not worst:
                 worst = "info"
+        if not issues:
+            self._check_card.set_status("clean", "ok")
+            return
         counts = {
             level: sum(1 for i in issues if i.level == level)
             for level in ("error", "warning", "info")
         }
-        if not issues:
-            self._check_card.set_status("clean", "ok")
-            return
         summary = ", ".join(
             f"{n} {name}" for name, n in (
                 ("error", counts["error"]),
@@ -363,11 +607,89 @@ class StructurePanel(QWidget):
         )
         self._check_card.set_status(summary, _ISSUE_STATUS.get(worst, "muted"))
 
+    def set_changes(self, entries: list[str]) -> None:
+        """Fill the changes list, newest at the bottom."""
+        self._changes_list.clear()
+        self._changes_list.addItems(entries)
+        self._changes_card.set_status(
+            f"{len(entries)}" if entries else "", "muted")
+        self._copy_changes_btn.setEnabled(bool(entries))
+        if entries:
+            self._changes_list.scrollToBottom()
+
+    # -- user intent -------------------------------------------------------
+
+    def _on_attr_item_changed(self, item: QTableWidgetItem) -> None:
+        """A cell was typed into: rename on the name column, set on the value.
+
+        The attribute's original name travels on the item itself, so a
+        rename knows what it is renaming even though the cell now reads
+        as the new name.
+        """
+        if self._populating or not self._editable:
+            return
+        original = item.data(_ATTR_NAME_ROLE)
+        if not original:
+            return
+        text = item.text().strip()
+        if item.column() == 0:
+            if text and text != original:
+                self.attributeRenamed.emit(str(original), text)
+        else:
+            self.attributeEdited.emit(str(original), item.text())
+
+    def _on_add_attribute(self) -> None:
+        node = self._info.path if self._info is not None else ""
+        dialog = NewAttributeDialog(self, node_name=node)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, type_name, value = dialog.result_values()
+        if name:
+            self.attributeAdded.emit(name, type_name, value)
+
+    def _on_remove_attribute(self) -> None:
+        name = self.selected_attribute()
+        if name:
+            self.attributeRemoved.emit(name)
+
+    def _on_set_value(self) -> None:
+        if self._editable:
+            self.scalarValueEdited.emit(self._value_edit.text())
+
+    def selected_attribute(self) -> str | None:
+        """The attribute name of the selected row, if any."""
+        items = self._attr_table.selectedItems()
+        if not items:
+            return None
+        value = items[0].data(_ATTR_NAME_ROLE)
+        return str(value) if value else None
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        """Delete removes the selected attribute while the table has focus.
+
+        Scoped to the table's focus so it never collides with the image
+        viewer's Delete = "remove the selected peak".
+        """
+        if (
+            event.key() == Qt.Key.Key_Delete
+            and self._editable
+            and self._attr_table.hasFocus()
+            and self.selected_attribute()
+        ):
+            self._on_remove_attribute()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     # -- read-back, for the tests and for later stages ---------------------
 
     @property
     def current(self) -> NodeInfo | None:
         return self._info
+
+    @property
+    def editable(self) -> bool:
+        return self._editable
 
     def attribute_rows(self) -> list[tuple[str, str]]:
         return [
@@ -380,4 +702,10 @@ class StructurePanel(QWidget):
             (self._issue_table.item(r, 0).text(),
              self._issue_table.item(r, 1).text())
             for r in range(self._issue_table.rowCount())
+        ]
+
+    def change_rows(self) -> list[str]:
+        return [
+            self._changes_list.item(r).text()
+            for r in range(self._changes_list.count())
         ]

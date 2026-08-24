@@ -1109,6 +1109,12 @@ class FilesMixin:
         # closed silx item.
         self._pending_data_node = None
         self.viewer.release_frame_source()
+        # The Structure editor's r+ handle is the third long-lived handle
+        # on the working copy. It is released here for the same reason as
+        # the other two: whatever runs next opens the file itself, and
+        # HDF5 refuses r+ behind any open handle. The editor re-acquires
+        # on the user's next edit.
+        self._release_edit_handle()
         # Tell the background prefetch worker to drop its own h5py
         # handle too. mlgidbase opens the same file r+ in the worker
         # we're about to spawn; an outstanding read handle from the

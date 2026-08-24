@@ -361,6 +361,14 @@ class MainWindow(
         # layout check is currently displayed (None re-runs it).
         self._pending_structure_node = None
         self._structure_checked_file: str | None = None
+        # (file, h5 path) the Structure tab is showing and may write to;
+        # None whenever it is showing something read-only.
+        self._structure_target: tuple | None = None
+        # The editor's r+ handle on the active working copy, and one undo
+        # history per file. The handle is acquired lazily on the first
+        # edit and released by ``_detach_silx_tree``.
+        self._h5_edit_handle = None
+        self._structure_histories: dict = {}
         # Tools → Export figure window. Built lazily on first open
         # (see ``_action_export_figure``); kept alive across re-opens
         # so settings persist. None until the user invokes Tools →

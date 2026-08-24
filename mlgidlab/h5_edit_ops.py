@@ -1,0 +1,197 @@
+"""Undoable edits, and the history that holds them.
+
+Every edit the Structure tab performs is also an object that knows how
+to reverse itself. The shape mirrors the image viewer's ``_Action``
+protocol (``viewer_items.py``): ``undo`` and ``redo`` are exact mirrors,
+so the stacks can be walked in both directions without special cases.
+
+Kept separate from the viewer's history on purpose. The two describe
+different things — peaks versus file structure — and merging them would
+mean a Ctrl+Z on the Image tab could reverse an edit the user made on
+the Structure tab three minutes earlier, in a file view they are not
+even looking at. ``MainWindow`` routes Ctrl+Z to whichever of the two
+the front tab owns.
+
+No Qt: an op takes an open ``h5py.File`` and works on it, which is what
+makes the whole history testable without a window.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Protocol
+
+import h5py
+
+from mlgidlab import h5_edit
+from mlgidlab.h5_edit import MISSING, format_value
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+#: How many edits the history keeps. Old entries fall off the bottom;
+#: 200 is far past any single sitting and bounds the memory a run of
+#: snapshotted deletes can pin.
+HISTORY_LIMIT = 200
+
+
+class EditOp(Protocol):
+    """One reversible edit."""
+
+    def undo(self, f: h5py.File) -> None: ...
+    def redo(self, f: h5py.File) -> None: ...
+    def describe(self) -> str: ...
+
+
+def _apply_attr(f: h5py.File, path: str, name: str, value: Any) -> None:
+    """Set ``name`` to ``value``, or remove it when ``value`` is MISSING."""
+    if value is MISSING:
+        try:
+            h5_edit.delete_attr(f, path, name)
+        except h5_edit.EditError:
+            # Already gone. Reaching the intended state is the contract;
+            # how it got there is not.
+            logger.debug("attribute %s already absent on %s", name, path)
+        return
+    h5_edit.set_attr(f, path, name, value)
+
+
+@dataclass
+class SetAttrOp:
+    """Create, change or delete one attribute.
+
+    One class for all three because they are the same edit with
+    ``MISSING`` on one side or the other: creating has no ``before``,
+    deleting has no ``after``. That keeps undo symmetric — undoing a
+    delete is just applying the ``before`` again.
+    """
+
+    path: str
+    name: str
+    before: Any
+    after: Any
+
+    def redo(self, f: h5py.File) -> None:
+        _apply_attr(f, self.path, self.name, self.after)
+
+    def undo(self, f: h5py.File) -> None:
+        _apply_attr(f, self.path, self.name, self.before)
+
+    def describe(self) -> str:
+        where = f"{self.path}@{self.name}"
+        if self.before is MISSING:
+            return f"+ {where} = {format_value(self.after, limit=40)}"
+        if self.after is MISSING:
+            return f"- {where}  (was {format_value(self.before, limit=40)})"
+        return (
+            f"{where}: {format_value(self.before, limit=30)} → "
+            f"{format_value(self.after, limit=30)}"
+        )
+
+
+@dataclass
+class RenameAttrOp:
+    path: str
+    before: str
+    after: str
+
+    def redo(self, f: h5py.File) -> None:
+        h5_edit.rename_attr(f, self.path, self.before, self.after)
+
+    def undo(self, f: h5py.File) -> None:
+        h5_edit.rename_attr(f, self.path, self.after, self.before)
+
+    def describe(self) -> str:
+        return f"{self.path}@{self.before} renamed to {self.after}"
+
+
+@dataclass
+class WriteCellsOp:
+    """A set of cell writes into one dataset, reversed by writing back."""
+
+    path: str
+    before: dict[Any, Any]
+    after: dict[Any, Any]
+
+    def redo(self, f: h5py.File) -> None:
+        h5_edit.write_cells(f, self.path, self.after)
+
+    def undo(self, f: h5py.File) -> None:
+        h5_edit.write_cells(f, self.path, self.before)
+
+    def describe(self) -> str:
+        if len(self.after) == 1:
+            (index, value), = self.after.items()
+            old = self.before.get(index)
+            where = self.path if index == () else f"{self.path}{_index_text(index)}"
+            return (
+                f"{where}: {format_value(old, limit=30)} → "
+                f"{format_value(value, limit=30)}"
+            )
+        return f"{self.path}: {len(self.after)} cells changed"
+
+
+def _index_text(index: Any) -> str:
+    if isinstance(index, tuple):
+        return "[" + ", ".join(str(part) for part in index) + "]"
+    return f"[{index}]"
+
+
+class EditHistory:
+    """The undo/redo stacks, and the session's list of changes.
+
+    The changes list is not a separate log: it *is* the undo stack, read
+    oldest-first. Undoing an edit therefore takes its line back off the
+    list, which is the only reading of "what I have changed" that stays
+    honest.
+    """
+
+    def __init__(self, limit: int = HISTORY_LIMIT) -> None:
+        self._limit = limit
+        self._undo: list[EditOp] = []
+        self._redo: list[EditOp] = []
+
+    def push(self, op: EditOp) -> None:
+        """Record an edit that has *already* been applied."""
+        self._undo.append(op)
+        del self._undo[: max(0, len(self._undo) - self._limit)]
+        self._redo.clear()
+
+    def undo(self, f: h5py.File) -> EditOp | None:
+        if not self._undo:
+            return None
+        op = self._undo.pop()
+        op.undo(f)
+        self._redo.append(op)
+        return op
+
+    def redo(self, f: h5py.File) -> EditOp | None:
+        if not self._redo:
+            return None
+        op = self._redo.pop()
+        op.redo(f)
+        self._undo.append(op)
+        return op
+
+    @property
+    def can_undo(self) -> bool:
+        return bool(self._undo)
+
+    @property
+    def can_redo(self) -> bool:
+        return bool(self._redo)
+
+    def entries(self) -> list[str]:
+        """One line per edit still standing, oldest first."""
+        return [op.describe() for op in self._undo]
+
+    def as_text(self) -> str:
+        """The changes list as plain text, for the clipboard."""
+        return "\n".join(self.entries())
+
+    def clear(self) -> None:
+        self._undo.clear()
+        self._redo.clear()
+
+    def __len__(self) -> int:
+        return len(self._undo)
