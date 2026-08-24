@@ -32,3 +32,20 @@ def test_pure_path_has_no_heavy_backend():
         f"pure-logic path runs on environments without the private "
         f"upstream stack installed."
     )
+
+
+def test_structure_editor_primitives_have_no_heavy_backend():
+    """The Structure tab's primitives must run on a GUI-only install too.
+
+    ``h5_edit`` imports ``file_model`` for the NeXus layout constants and
+    nothing else; ``nexus_schema`` is pure data. Neither may reach the
+    private analysis stack, or editing a file would stop working on
+    exactly the installs that most need a plain HDF5 editor.
+    """
+    before = set(sys.modules)
+    import mlgidlab.h5_edit  # noqa: F401
+    import mlgidlab.nexus_schema  # noqa: F401
+    heavy_added = _HEAVY_BACKENDS & (set(sys.modules) - before)
+    assert not heavy_added, (
+        f"Importing h5_edit + nexus_schema pulled in {heavy_added!r}."
+    )
