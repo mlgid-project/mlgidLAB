@@ -300,13 +300,19 @@ def test_copy_as_text_reaches_the_clipboard(editing, monkeypatch):
 # -- the handle, and everything that must not change ----------------------
 
 
-def test_the_handle_is_acquired_on_the_first_edit_only(editing, monkeypatch):
-    assert editing._h5_edit_handle is None
-    _show(editing, "/entry_0000", monkeypatch)
-    assert editing._h5_edit_handle is None, "showing a node must not open r+"
-    editing.structure_panel.attributeAdded.emit("title", "str", "x")
+def test_the_handle_is_taken_once_and_reused(editing, monkeypatch):
+    """Opening the tab takes it; editing never pays for it again.
+
+    Acquiring detaches and rebuilds the file browser, so it is done on
+    the tab switch — where a moment's work is expected — rather than in
+    the middle of the user's first edit.
+    """
     handle = editing._h5_edit_handle
-    assert handle is not None and handle.is_open
+    assert handle is not None and handle.is_open, (
+        "the fixture switches to the Structure tab, which takes the handle")
+    _show(editing, "/entry_0000", monkeypatch)
+    editing.structure_panel.attributeAdded.emit("title", "str", "x")
+    assert editing._h5_edit_handle is handle, "no re-acquire on the first edit"
     editing.structure_panel.attributeEdited.emit("title", "y")
     assert editing._h5_edit_handle is handle, "no re-acquire between edits"
 

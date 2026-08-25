@@ -20,7 +20,6 @@ from __future__ import annotations
 
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtWidgets import (
-    QFrame,
     QHBoxLayout,
     QLabel,
     QToolButton,
@@ -184,10 +183,6 @@ class WorkflowRail(QWidget):
         outer.addWidget(self._folded_label)
         self._apply_expanded()
 
-        line = QFrame(self)
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Plain)
-        line.setFixedHeight(1)
 
     # -- collapsing ----------------------------------------------------
 

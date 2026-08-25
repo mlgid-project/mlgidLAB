@@ -33,7 +33,11 @@ def opened(main_window, synthetic_nexus):
     main_window._set_active_session(session)
     main_window._confirm_discard_changes = lambda session=None: True
     main_window.show()
-    return main_window
+    yield main_window
+    # Entering the Structure tab now takes the write handle, and the
+    # temp dir is removed by the session-cleanup fixture.
+    if main_window._h5_edit_handle is not None:
+        main_window._h5_edit_handle.release()
 
 
 def _visible(window):
@@ -170,3 +174,108 @@ def test_the_choice_is_remembered(main_window):
             settings.remove(RAIL_EXPANDED_KEY)
         else:
             settings.setValue(RAIL_EXPANDED_KEY, previous)
+
+
+# -- what folding the docks must not leave behind -------------------------
+#
+# Reported from a manual pass: controls above the image were frequently
+# unclickable. Hiding and re-showing docks that share a tab group is a
+# re-tabify as far as Qt is concerned, and this window carries two fixes
+# for what that leaves behind — a stale QTabBar painted into a corner,
+# and fresh tabs with no glyph. The fold has to run both.
+
+
+def test_folding_runs_the_dock_chrome_cleanup(opened, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        opened, "_hide_stale_dock_tab_bars", lambda: calls.append("bars"))
+    monkeypatch.setattr(
+        opened, "_apply_dock_tab_icons", lambda: calls.append("icons"))
+    opened.tabs.setCurrentWidget(opened.structure_panel)
+    assert calls == ["bars", "icons"]
+    calls.clear()
+    opened.tabs.setCurrentWidget(opened.viewer)
+    assert calls == ["bars", "icons"]
+
+
+def test_the_cleanup_is_skipped_when_nothing_was_folded(opened, monkeypatch):
+    """No dock changed, so there is nothing for Qt to have mangled."""
+    opened.tabs.setCurrentWidget(opened.structure_panel)
+    calls = []
+    monkeypatch.setattr(
+        opened, "_hide_stale_dock_tab_bars", lambda: calls.append("bars"))
+    opened.tabs.setCurrentWidget(opened.structure_panel)
+    assert calls == []
+
+
+def test_a_failing_cleanup_does_not_break_the_switch(opened, monkeypatch):
+    def _boom():
+        raise RuntimeError("Qt said no")
+
+    monkeypatch.setattr(opened, "_hide_stale_dock_tab_bars", _boom)
+    opened.tabs.setCurrentWidget(opened.structure_panel)
+    assert _visible(opened) == set()
+
+
+def test_no_dock_tab_bar_is_left_showing_an_empty_tab_set(opened):
+    """A visible bar with no tabs is a ghost with nothing to click."""
+    from PySide6.QtWidgets import QTabBar
+
+    opened.tabs.setCurrentWidget(opened.structure_panel)
+    opened.tabs.setCurrentWidget(opened.viewer)
+    ghosts = [
+        tb for tb in opened.findChildren(QTabBar)
+        if tb.parent() is opened and tb.isVisible() and tb.count() == 0
+    ]
+    assert ghosts == []
+
+
+def test_the_rail_has_no_widget_outside_its_layout(qtbot):
+    """An unmanaged child sits at (0, 0) on top of whatever is there."""
+    from PySide6.QtWidgets import QWidget
+
+    rail = WorkflowRail()
+    qtbot.addWidget(rail)
+    rail.show()
+    managed = set()
+    layout = rail.layout()
+    for i in range(layout.count()):
+        widget = layout.itemAt(i).widget()
+        if widget is not None:
+            managed.add(id(widget))
+    stray = [c for c in rail.children()
+             if isinstance(c, QWidget) and id(c) not in managed]
+    assert stray == []
+
+
+# -- taking the write handle up front -------------------------------------
+
+
+def test_opening_the_tab_takes_the_write_handle(opened):
+    """So the first edit is as immediate as every edit after it."""
+    assert opened._h5_edit_handle is None
+    opened.tabs.setCurrentWidget(opened.structure_panel)
+    assert opened._h5_edit_handle is not None
+    assert opened._h5_edit_handle.is_open
+
+
+def test_a_raw_session_is_not_opened_for_writing(main_window, synthetic_raw):
+    from mlgidlab.session import RawSession
+
+    session = RawSession.open([synthetic_raw])
+    main_window._sessions.append(session)
+    main_window._set_active_session(session)
+    main_window.tabs.setCurrentWidget(main_window.structure_panel)
+    assert main_window._h5_edit_handle is None
+
+
+def test_a_failure_to_take_the_handle_is_silent(opened, monkeypatch):
+    """The user has asked for nothing yet; the next edit reports it."""
+    from mlgidlab.h5_edit import EditError
+
+    def _boom(_path):
+        raise EditError("nope")
+
+    monkeypatch.setattr(opened, "_acquire_edit_handle", _boom)
+    opened.tabs.setCurrentWidget(opened.structure_panel)
+    assert opened.structure_panel is opened.tabs.currentWidget()

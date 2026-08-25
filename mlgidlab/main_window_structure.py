@@ -65,6 +65,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+#: Past this many changed cells a grid edit is written as one array
+#: replace rather than a per-cell diff. Hand editing never reaches it;
+#: a find-and-replace over a whole frame would, and doing that cell by
+#: cell would freeze the window.
+MAX_SPARSE_CELLS = 4096
+
 
 def _apply_template(f, path: str, template) -> None:
     """Create a template's fields inside a freshly made group.
@@ -1126,11 +1132,16 @@ class StructureMixin:
             return
         on_structure = self.tabs.currentWidget() is self.structure_panel
         if on_structure:
+            changed = False
             for name in self._STRUCTURE_FOLDED_DOCKS:
                 dock = getattr(self, name, None)
                 if dock is not None and dock.isVisible():
                     self._structure_folded_docks.add(name)
                     dock.hide()
+                    changed = True
+            if changed:
+                self._settle_dock_chrome()
+            self._prepare_structure_editing()
             return
         if not self._structure_folded_docks:
             return
@@ -1139,6 +1150,53 @@ class StructureMixin:
             if dock is not None:
                 dock.show()
         self._structure_folded_docks.clear()
+        self._settle_dock_chrome()
+
+    def _settle_dock_chrome(self) -> None:
+        """Clean up after showing or hiding a tabified dock.
+
+        Hiding and re-showing docks that share a tab group is a
+        re-tabify as far as Qt is concerned, and this window already
+        carries two fixes for what that leaves behind: a stale QTabBar
+        painted into a corner of the window, and fresh tabs that come up
+        without their glyphs. Both have to run here for the same reason
+        they run after every other re-tabify.
+        """
+        for cleanup in ("_hide_stale_dock_tab_bars", "_apply_dock_tab_icons"):
+            handler = getattr(self, cleanup, None)
+            if handler is None:
+                continue
+            try:
+                handler()
+            except Exception:
+                logger.debug("dock chrome cleanup %s failed", cleanup,
+                             exc_info=True)
+
+    def _prepare_structure_editing(self) -> None:
+        """Take the write handle when the tab opens, not on the first edit.
+
+        Acquiring it detaches and rebuilds the file browser, which on a
+        large file or a slow mount is a visible pause. Paying that on the
+        tab switch — where a moment's work is expected, and where the
+        docks are folding anyway — keeps the first actual edit as
+        immediate as every edit after it.
+
+        Failure is not reported: the user has not asked for anything yet.
+        The next edit acquires again and surfaces the error then.
+        """
+        session = getattr(self, "_active_session", None)
+        if session is None or session.kind != "nexus":
+            return
+        handle = getattr(self, "_h5_edit_handle", None)
+        if handle is not None and handle.is_open and handle.path == Path(
+            session.temp_path
+        ):
+            return
+        try:
+            self._acquire_edit_handle(session.temp_path)
+        except EditError:
+            logger.debug("could not take the write handle on tab entry",
+                         exc_info=True)
 
     # -- link intents ------------------------------------------------------
 
@@ -1503,6 +1561,13 @@ class StructureMixin:
         """
         replace = before.shape != after.shape or before.dtype != after.dtype
         changed = {} if replace else self._diff_cells(before, after)
+        if not replace and len(changed) > MAX_SPARSE_CELLS:
+            # A sparse diff is the right shape for a few hand-typed
+            # cells. Past this many it is neither: building the dict,
+            # writing cell by cell and holding it for undo all become
+            # per-cell Python work on the GUI thread. One array write
+            # says the same thing in one operation.
+            replace, changed = True, {}
         if not replace and not changed:
             # OK on a grid nobody typed into. Nothing happened, so
             # nothing is asked and nothing is recorded.
