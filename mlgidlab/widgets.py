@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from mlgidlab.skin import DANGER, PRIMARY  # noqa: F401  (re-exported)
+from mlgidlab.skin import DANGER, PRIMARY, REGION_NAME  # noqa: F401  (re-exported)
 
 from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
@@ -174,6 +174,33 @@ def section_label(text: str, parent: QWidget | None = None) -> QLabel:
     label = QLabel(text, parent)
     label.setProperty("role", "section")
     return label
+
+
+def boxed(widget: QWidget, parent: QWidget | None = None) -> QFrame:
+    """Put ``widget`` in a bordered pane, and return the pane.
+
+    A ``Card``'s only chrome is a hairline under its title. Stacked in a
+    dock that is right — six nested rectangles read as clutter, which is
+    why the card has no box. Given a pane of its own in a split
+    workspace it is wrong: the hairline runs out into open space and
+    nothing says where the section ends.
+
+    Tagged rather than framed by hand so the border follows the theme
+    like everything else (``skin.REGION_SELECTOR``). A ``QFrame`` and not
+    a plain ``QWidget`` because Qt only honours a stylesheet background
+    or border on a widget that paints one — a bare ``QWidget`` subclass
+    would silently ignore the rule. And an objectName rather than this
+    module's usual dynamic property, because qdarkstyle already claims
+    ``.QFrame[frameShape="0"]`` with a transparent border and that
+    selector outranks a property one; see ``skin.REGION_NAME``.
+    """
+    frame = QFrame(parent)
+    frame.setObjectName(REGION_NAME)
+    layout = QVBoxLayout(frame)
+    layout.setContentsMargins(PAD, GAP, PAD, PAD)
+    layout.setSpacing(0)
+    layout.addWidget(widget)
+    return frame
 
 
 class Card(QWidget):

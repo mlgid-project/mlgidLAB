@@ -50,7 +50,9 @@ pre-releases.
   on the left, the selected node on the right, the file's health and
   this session's changes below. **Nothing scrolls at the tab level** —
   each section scrolls inside itself — and every division is a splitter
-  you can drag, remembered between launches.
+  you can drag, remembered between launches. Each region is drawn as a
+  bordered pane, so a section has an edge rather than a rule that stops
+  in mid-air.
 
 - The Structure tab folds every dock away while it is in front — the
   File browser included, since the tab navigates from its own tree — and

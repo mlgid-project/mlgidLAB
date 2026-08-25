@@ -52,6 +52,19 @@ TABLE_SELECTOR = 'QTableView[mlgid="table"]'
 #: Progress bars this application owns (``widgets.skin_progress``).
 PROGRESS_SELECTOR = 'QProgressBar[mlgid="progress"]'
 
+#: objectName for a bordered box around one region of a split workspace
+#: (``widgets.boxed``). A ``Card``'s only chrome is a hairline under its
+#: title, which reads correctly stacked inside a dock and reads as a
+#: line stopping in mid-air when the section is a pane of its own.
+#:
+#: An objectName rather than the usual dynamic property, because
+#: qdarkstyle ships ``.QFrame[frameShape="0"] { border: 1px transparent }``
+#: — a class selector plus an attribute, which outranks a type selector
+#: plus an attribute, so ``QFrame[mlgid="region"]`` loses and the border
+#: silently paints transparent. An id selector outranks both.
+REGION_NAME = "MlgidRegion"
+REGION_SELECTOR = f'QFrame#{REGION_NAME}'
+
 
 def marker(theme: str) -> str:
     """The comment stamped at the top of the sheet, so a test (or a bug
@@ -248,6 +261,18 @@ QLabel[status="error"] {{ color: {t['status_error']}; font-style: italic; }}
 QLabel[status="info"] {{ color: {t['status_info']}; font-style: italic; }}
 QLabel[role="section"] {{ color: {t['text']}; font-weight: bold; }}
 QLabel[role="hint"] {{ color: {t['text_muted']}; font-style: italic; }}
+
+/* --- a region of a split workspace ----------------------------------
+   The Structure tab divides into five panes, and a pane needs an edge:
+   without one the cards' title hairlines run out into open space and
+   the splitter handles are the only thing suggesting where one section
+   ends. Ground stays `surface` so the tab's overall tone is unchanged —
+   this adds an edge, not a second background. */
+{REGION_SELECTOR} {{
+    background: {t['surface']};
+    border: 1px solid {t['border']};
+    border-radius: 6px;
+}}
 
 /* --- item views this application owns -------------------------------
    qdarkstyle ships no QTableView rules at all, so alternating rows fall

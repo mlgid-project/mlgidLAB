@@ -631,3 +631,27 @@ def test_a_click_from_another_tab_still_switches_at_once(opened, monkeypatch):
         str(opened.session.temp_path), "/entry_0000/data/q_xy")
 
     assert len(loaded) == 1
+
+
+# -- the region boxes ------------------------------------------------------
+
+
+def test_every_region_sits_in_a_box(workspace):
+    """A card's only chrome is a hairline under its title.
+
+    Stacked in a dock that is right. Given a pane of its own it is not:
+    the hairline runs out into open space and nothing says where the
+    section ends, which is exactly how the first cut of this layout
+    looked.
+    """
+    from PySide6.QtWidgets import QFrame
+
+    from mlgidlab.skin import REGION_NAME
+
+    boxes = [
+        f for f in workspace.findChildren(QFrame)
+        if f.objectName() == REGION_NAME
+    ]
+    assert len(boxes) == 5
+    for card in _regions(workspace).values():
+        assert any(box.isAncestorOf(card) for box in boxes), card.title()

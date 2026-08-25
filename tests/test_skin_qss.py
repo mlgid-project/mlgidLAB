@@ -92,9 +92,55 @@ def test_the_tagged_widget_roles_are_all_present(theme):
         'QLabel[status="error"]',
         'QLabel[role="sb-cell"]',
         skin.TABLE_SELECTOR,
+        skin.REGION_SELECTOR,
         "#UpdateBanner",
     ):
         assert selector in qss
+
+
+def test_the_region_box_outranks_qdarkstyles_frame_rule():
+    """It has to be an id selector, and this is why.
+
+    qdarkstyle ships ``.QFrame[frameShape="0"] { border: 1px transparent }``
+    — a class selector plus an attribute. A property-scoped rule
+    (``QFrame[mlgid="region"]``, the convention everywhere else in this
+    sheet) is a type selector plus an attribute, which loses, and the
+    border then paints *transparent*: the rule is live, the box is
+    invisible, and nothing anywhere reports a problem.
+    """
+    assert skin.REGION_SELECTOR.startswith("QFrame#")
+
+
+@pytest.mark.gui
+@pytest.mark.parametrize("theme", THEMES)
+def test_a_boxed_region_actually_paints_its_border(qtbot, theme):
+    """The rule is live *and* wins — asserted on pixels, not on the sheet.
+
+    A stylesheet rule that loses a specificity contest is still in the
+    sheet, so only what reaches the screen can tell the two apart.
+    """
+    from PySide6.QtWidgets import QApplication, QLabel
+
+    from mlgidlab.theme import apply_dark_theme, apply_light_theme
+    from mlgidlab.widgets import boxed
+
+    app = QApplication.instance()
+    (apply_dark_theme if theme == "dark" else apply_light_theme)(app)
+
+    frame = boxed(QLabel("x"))
+    qtbot.addWidget(frame)
+    frame.resize(120, 60)
+    frame.show()
+    qtbot.waitExposed(frame)
+
+    image = frame.grab().toImage()
+    border = theme_tokens.color("border", theme).lstrip("#").lower()
+    # Along the top edge, away from the rounded corners.
+    row = {
+        image.pixelColor(x, 0).name().lstrip("#").lower()
+        for x in range(20, 100)
+    }
+    assert border in row, f"no {border} border on a boxed region: {row}"
 
 
 def test_applying_a_theme_installs_that_theme_s_skin(main_window):

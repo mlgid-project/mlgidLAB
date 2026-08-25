@@ -50,6 +50,7 @@ from mlgidlab.widgets import (
     PRIMARY,
     Card,
     attach_empty_hint,
+    boxed,
     make_form,
     set_variant,
     skin_item_view,
@@ -290,12 +291,20 @@ class StructurePanel(QWidget):
         # Left is where you are (find, tree), right is the node you
         # picked, and the band below is about the file as a whole rather
         # than any one node.
+        # Each region goes in a box of its own (``boxed``). Nested boxes
+        # would be clutter in a dock, but a pane with no edge leaves its
+        # card's title hairline ending in mid-air.
         self._split_left = self._splitter(Qt.Orientation.Vertical, "left")
-        self._split_left.addWidget(self._build_search_card(self._split_left))
-        self._split_left.addWidget(self._build_tree_card(self._split_left))
+        self._split_left.addWidget(
+            boxed(self._build_search_card(self._split_left)))
+        self._split_left.addWidget(
+            boxed(self._build_tree_card(self._split_left)))
         self._split_left.setStretchFactor(0, 0)
         self._split_left.setStretchFactor(1, 1)
 
+        # One box for the whole node column: the path, its attributes,
+        # its value and its link are four readings of one thing, and
+        # four boxes would say they were four things.
         node_column = QWidget(self)
         column = QVBoxLayout(node_column)
         column.setContentsMargins(0, 0, 0, 0)
@@ -311,14 +320,15 @@ class StructurePanel(QWidget):
 
         self._split_top = self._splitter(Qt.Orientation.Horizontal, "top")
         self._split_top.addWidget(self._split_left)
-        self._split_top.addWidget(node_column)
+        self._split_top.addWidget(boxed(node_column))
         self._split_top.setStretchFactor(0, 1)
         self._split_top.setStretchFactor(1, 3)
 
         self._split_bottom = self._splitter(Qt.Orientation.Horizontal, "bottom")
-        self._split_bottom.addWidget(self._build_check_card(self._split_bottom))
         self._split_bottom.addWidget(
-            self._build_changes_card(self._split_bottom))
+            boxed(self._build_check_card(self._split_bottom)))
+        self._split_bottom.addWidget(
+            boxed(self._build_changes_card(self._split_bottom)))
 
         self._split_main = self._splitter(Qt.Orientation.Vertical, "main")
         self._split_main.addWidget(self._split_top)
