@@ -6,7 +6,52 @@ pre-releases.
 
 ## Unreleased
 
+### Added
+
+- **Interactive NeXus/HDF5 editing.** A new **Structure** tab, beside
+  Image and Data, makes every field, attribute, group and link in the
+  open file editable in place. Edits land in the session's working copy
+  the moment they are committed; the file on disk is untouched until you
+  save, so closing without saving is a complete revert.
+
+  - Attributes: add, rename, retype, edit, remove. An edited attribute
+    keeps its own type, and `NX_class` and `units` come with real
+    suggestions instead of a blank box.
+  - Structure: create groups and fields from the File browser's context
+    menu, with NeXus templates that pre-create what a group nearly
+    always has. Rename, move, delete.
+  - Links: create hard, soft and external links, see what one points at,
+    retarget it, or unlink it — all without following it. **Follow** is
+    the only thing that opens an external link, and only on request.
+  - Copy and paste, within a file and *between* two open files, plus
+    **Paste from file…** for a file that is not open at all. The
+    clipboard holds a reference, so copying a large stack costs nothing
+    until it is pasted, and copying a link keeps it a link.
+  - A value grid for datasets: axis selectors for N-d arrays, one column
+    per field for compound tables, and row insert and delete.
+  - Undo and redo for all of it, with a running list of what has changed
+    that can be copied out as text.
+  - **Find** by name, attribute name or attribute value.
+  - A **Check** section that reports what would stop the viewer or the
+    pipeline from reading the file, and names the fix.
+  - Raw detector files are read-only throughout: they have no working
+    copy, and the editor never opens one for writing.
+
+- The **workflow strip** above the image can be folded away with the
+  chevron at its left, and remembers the choice.
+
+- The Structure tab folds the side and bottom docks while it is in
+  front, and puts back exactly the ones that were open.
+
 ### Fixed
+
+- **The view controls above the image could be dead on a single-frame
+  file.** With one frame the whole frame transport is hidden, and the
+  layout skips a cluster with nothing visible in it — but a skipped
+  widget keeps its default size, so the emptied cluster sat on top of
+  the Cartesian / Polar buttons and the colormap picker and swallowed
+  every click. Loading a second, multi-frame file appeared to fix it,
+  because that gave the cluster real content.
 
 - **Flipping the detector image now moves the beam center with it.**
   Ticking *Flip LR* or *Flip UD* on its own flipped the image but left

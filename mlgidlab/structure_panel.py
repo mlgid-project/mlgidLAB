@@ -228,6 +228,10 @@ class StructurePanel(QWidget):
     followLinkRequested = Signal()
     #: Open the value grid for this dataset.
     editValuesRequested = Signal()
+    #: Find nodes whose name or attributes match this text.
+    searchRequested = Signal(str)
+    #: Go to this in-file path.
+    searchResultActivated = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -250,6 +254,7 @@ class StructurePanel(QWidget):
         column.setContentsMargins(PAD * 2, PAD * 2, PAD * 2, PAD * 2)
         column.setSpacing(PAD * 2)
 
+        column.addWidget(self._build_search_card(page))
         column.addLayout(self._build_header(page))
         column.addWidget(self._build_attributes_card(page))
         self._value_card = self._build_value_card(page)
@@ -268,6 +273,78 @@ class StructurePanel(QWidget):
         self.clear()
 
     # -- construction ------------------------------------------------------
+
+    def _build_search_card(self, parent: QWidget) -> Card:
+        """Find a node by name, attribute name or attribute value.
+
+        Deliberately a jump list rather than a filter on the browser
+        tree: filtering silx's model would ask it to resolve rows to
+        answer the query, and on a master of external links that is the
+        one thing this tab never does.
+        """
+        card = Card("Find", parent=parent)
+        self._search_card = card
+        row = QHBoxLayout()
+        row.setSpacing(GAP)
+        self._search_edit = QLineEdit(card)
+        self._search_edit.setPlaceholderText(
+            "name, attribute or value — e.g. wavelength, NX_class, 1/Angstrom")
+        self._search_edit.setClearButtonEnabled(True)
+        self._search_edit.returnPressed.connect(self._on_search)
+        row.addWidget(self._search_edit, 1)
+        self._search_btn = QPushButton("Find", card)
+        self._search_btn.clicked.connect(self._on_search)
+        row.addWidget(self._search_btn)
+        card.body_layout.addLayout(row)
+
+        self._search_list = QListWidget(card)
+        skin_item_view(self._search_list)
+        self._search_list.setMinimumHeight(90)
+        self._search_list.itemActivated.connect(self._on_search_activated)
+        self._search_list.itemClicked.connect(self._on_search_activated)
+        attach_empty_hint(
+            self._search_list,
+            "Nothing searched yet. Links are never followed, so a master "
+            "of external scans answers as fast as any other file.",
+        )
+        card.body_layout.addWidget(self._search_list)
+        return card
+
+    def _on_search(self) -> None:
+        text = self._search_edit.text().strip()
+        if text:
+            self.searchRequested.emit(text)
+
+    def _on_search_activated(self, item) -> None:
+        path = item.data(_ATTR_NAME_ROLE)
+        if path:
+            self.searchResultActivated.emit(str(path))
+
+    def set_search_results(self, hits, truncated: bool = False) -> None:
+        """Fill the results list. ``hits`` are ``h5_edit.SearchHit``."""
+        self._search_list.clear()
+        from PySide6.QtWidgets import QListWidgetItem
+
+        for hit in hits:
+            label = (hit.path if hit.where == "name"
+                     else f"{hit.path}  —  {hit.detail}")
+            item = QListWidgetItem(label)
+            item.setData(_ATTR_NAME_ROLE, hit.path)
+            item.setToolTip(f"{hit.path}\nmatched on {hit.where}")
+            self._search_list.addItem(item)
+        if truncated:
+            self._search_card.set_status(
+                f"{len(hits)}, stopped early", "warn")
+        else:
+            self._search_card.set_status(
+                f"{len(hits)}" if hits else "no match",
+                "muted" if hits else "warn")
+
+    def search_rows(self) -> list[str]:
+        return [
+            self._search_list.item(r).text()
+            for r in range(self._search_list.count())
+        ]
 
     def _build_header(self, parent: QWidget) -> QVBoxLayout:
         box = QVBoxLayout()

@@ -72,6 +72,19 @@ logger = logging.getLogger(__name__)
 MAX_SPARSE_CELLS = 4096
 
 
+class _PathNode:
+    """A stand-in for a browser node, for a path with no row in the tree.
+
+    ``_render_structure_node`` reads exactly two things off a node — the
+    file and the in-file path — so a search hit inside a subtree the
+    user has never expanded can still be shown.
+    """
+
+    def __init__(self, file_path, h5_path: str) -> None:
+        self.local_filename = str(file_path)
+        self.local_name = h5_path
+
+
 def _apply_template(f, path: str, template) -> None:
     """Create a template's fields inside a freshly made group.
 
@@ -1653,3 +1666,68 @@ class StructureMixin:
         for index in zip(*np.nonzero(before != after)):
             changed[tuple(int(i) for i in index)] = after[index]
         return changed
+
+    # -- search ------------------------------------------------------------
+
+    def _on_structure_search(self, text: str) -> None:
+        """Search the file on show for ``text`` and list what matched.
+
+        Bounded and link-blind: the walk descends only into hard links,
+        so a master whose entries are external links to multi-GB scans
+        answers as fast as any other file, and says so when it stopped
+        early rather than implying the list is complete.
+        """
+        target = getattr(self, "_structure_target", None)
+        file_path = (
+            target[0] if target is not None
+            else (self.session.temp_path if self.session is not None else None)
+        )
+        if file_path is None:
+            return
+        with self._structure_read(file_path) as f:
+            if f is None:
+                self.structure_panel.set_search_results([], False)
+                return
+            try:
+                hits, truncated = h5_edit.walk_search(f, text)
+            except Exception:
+                logger.debug("structure search failed", exc_info=True)
+                hits, truncated = [], False
+        self.structure_panel.set_search_results(hits, truncated)
+        if truncated:
+            self.pipeline_panel.append_log(
+                f"Find '{text}': stopped early — this file has more nodes "
+                "than one search walks. The list is a partial answer; "
+                "narrow the term."
+            )
+
+    def _on_structure_search_result(self, path: str) -> None:
+        """Select a search hit in the File browser.
+
+        Going through the browser rather than rendering the node
+        directly keeps one idea of "what is selected" — the panel then
+        fills from the ordinary selection path, like any other click.
+        """
+        target = getattr(self, "_structure_target", None)
+        file_path = (
+            target[0] if target is not None
+            else (self.session.temp_path if self.session is not None else None)
+        )
+        if file_path is None:
+            return
+        parts = tuple(p for p in h5_edit.normalize_path(path).split("/") if p)
+        index = self._find_tree_index((str(file_path), parts))
+        if index is None or not index.isValid():
+            # The row is not in the tree — a collapsed parent has not been
+            # populated, or the node went away. Render it directly so the
+            # hit is still useful.
+            self._render_structure_node(
+                _PathNode(file_path, h5_edit.normalize_path(path)))
+            return
+        self.tree.setCurrentIndex(index)
+        self.tree.selectionModel().select(
+            index,
+            QItemSelectionModel.SelectionFlag.ClearAndSelect
+            | QItemSelectionModel.SelectionFlag.Rows,
+        )
+        self.tree.scrollTo(index)
