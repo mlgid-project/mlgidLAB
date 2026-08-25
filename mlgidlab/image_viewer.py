@@ -378,6 +378,10 @@ class GIWAXSImageViewer(
         # Keep a handle on the layout so the host can splice the
         # frame-navigation widgets in.
         self._toolbar_layout = bar
+        # Kept so ``refresh_toolbar_layout`` can nudge the strip when a
+        # whole cluster appears or disappears.
+        self._toolbar_widget = bar_widget
+        self._view_group = view_group
         outer.addWidget(bar_widget)
 
         self._plot = pg.PlotItem()
@@ -808,6 +812,7 @@ class GIWAXSImageViewer(
             if label.text() == "View:":
                 label.setVisible(visible)
                 break
+        self.refresh_toolbar_layout()
 
     def show_raw_stack(self, arr_3d) -> None:
         """Render a raw detector stack in pixel coordinates.
@@ -1170,6 +1175,41 @@ class GIWAXSImageViewer(
             # The slider gets the stretch so it, not the buttons either
             # side of it, absorbs the row's spare width.
             self._frames_group.add(w, 100 if isinstance(w, QSlider) else 0)
+
+    def refresh_toolbar_layout(self) -> None:
+        """Re-run the control strip's layout after a cluster's visibility
+        changed.
+
+        ``ToolGroup`` reports a zero size hint when all its members are
+        hidden, and ``FlowLayout``'s own height depends on which clusters
+        are in play — but Qt only re-runs a parent layout when a size
+        *hint* changes, and this layout's hint is always one row tall.
+        Hiding the six transport widgets for a single-frame stack
+        therefore left the strip laid out for the widgets it no longer
+        had: the controls were painted in their new places while the
+        window still hit-tested the old ones, so clicking Cartesian or
+        Polar did nothing. Opening a second file appeared to "fix" it
+        only because that triggered a relayout.
+
+        Cheap and idempotent, so every visibility toggle calls it rather
+        than reasoning about which ones can get away without it.
+        """
+        for group in (getattr(self, "_frames_group", None),
+                      getattr(self, "_view_group", None)):
+            if group is None:
+                continue
+            # A cluster with nothing left in it should not be on screen
+            # at all; leaving it visible is what let an empty one cover
+            # its neighbours.
+            group.setVisible(group.has_visible_members())
+            group.updateGeometry()
+        layout = getattr(self, "_toolbar_layout", None)
+        if layout is not None:
+            layout.invalidate()
+            layout.activate()
+        holder = getattr(self, "_toolbar_widget", None)
+        if holder is not None:
+            holder.updateGeometry()
 
     def set_overlay_visible(self, kind: str, visible: bool) -> None:
         if kind not in OVERLAY_KINDS:

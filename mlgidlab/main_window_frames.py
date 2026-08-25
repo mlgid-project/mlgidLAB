@@ -637,6 +637,11 @@ class FramesMixin:
 
         With the controls living in the image-viewer toolbar (no
         form / no row container), each widget is toggled directly.
+
+        The strip's layout is then re-run: hiding all six empties their
+        whole cluster, and a wrapping layout has to be told, or it keeps
+        placing the controls that are left where they used to be. See
+        ``GIWAXSImageViewer.refresh_toolbar_layout``.
         """
         for w in (
             self.prev_frame_button,
@@ -647,6 +652,7 @@ class FramesMixin:
             self.frame_label,
         ):
             w.setVisible(visible)
+        self.viewer.refresh_toolbar_layout()
 
     def _refresh_frame_nav_enabled(self) -> None:
         """Disable prev/next at the boundaries so the user can see

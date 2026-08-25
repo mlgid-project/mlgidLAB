@@ -1561,11 +1561,10 @@ class StructureMixin:
         """
         replace = before.shape != after.shape or before.dtype != after.dtype
         changed = {} if replace else self._diff_cells(before, after)
-        if not replace and len(changed) > MAX_SPARSE_CELLS:
-            # A sparse diff is the right shape for a few hand-typed
-            # cells. Past this many it is neither: building the dict,
-            # writing cell by cell and holding it for undo all become
-            # per-cell Python work on the GUI thread. One array write
+        if changed is None:
+            # Too many cells to describe one by one. Building the dict,
+            # writing cell by cell and holding it for undo would all be
+            # per-cell Python work on the GUI thread; one array write
             # says the same thing in one operation.
             replace, changed = True, {}
         if not replace and not changed:
@@ -1588,20 +1587,67 @@ class StructureMixin:
         self._commit_structure_edit(handle, op, path)
 
     @staticmethod
-    def _diff_cells(before, after) -> dict:
-        """``{index: new value}`` for every cell that differs.
+    def _changed_mask(before, after):
+        """Where two arrays genuinely differ, treating NaN as equal to NaN.
+
+        ``NaN != NaN`` is True by IEEE rule, and a GIWAXS image is full
+        of NaN — the detector's missing wedge is nothing else. Comparing
+        naively therefore reports every masked pixel as changed: opening
+        a 1750 x 1750 frame and pressing OK without touching anything
+        "changed" 389,743 cells, each of which was then written back
+        through h5py one at a time. Two NaN in the same place are the
+        same value as far as an edit is concerned.
+        """
+        unequal = before != after
+        if before.dtype.kind == "f" and after.dtype.kind == "f":
+            unequal &= ~(np.isnan(before) & np.isnan(after))
+        return unequal
+
+    @classmethod
+    def _diff_cells(cls, before, after, limit: int = MAX_SPARSE_CELLS):
+        """``{index: new value}`` for every changed cell, or None if too many.
+
+        None means "do not describe this cell by cell" and the caller
+        replaces the array wholesale. The count is taken with numpy
+        BEFORE any dict is built, so a large change costs one pass over
+        the array rather than a million tuple allocations.
 
         Compound arrays are compared field by field so the index is
-        ``(row, field)`` — the same shape ``write_cells`` takes, and the
-        same one an undo writes back.
+        ``(row, field)`` — the shape ``write_cells`` takes, and the one
+        an undo writes back.
         """
         changed: dict = {}
         if before.dtype.names:
+            total = sum(
+                int(np.count_nonzero(
+                    cls._changed_mask(before[f], after[f])))
+                for f in before.dtype.names
+            )
+            if total > limit:
+                return None
             for field in before.dtype.names:
-                rows = np.nonzero(before[field] != after[field])[0]
+                rows = np.nonzero(cls._changed_mask(before[field], after[field]))[0]
                 for row in rows:
                     changed[(int(row), field)] = after[field][row]
             return changed
+        if before.ndim == 0:
+            return dict(cls._diff_scalar(before, after))
+        mask = cls._changed_mask(before, after)
+        if int(np.count_nonzero(mask)) > limit:
+            return None
+        for index in zip(*np.nonzero(mask)):
+            changed[tuple(int(i) for i in index)] = after[index]
+        return changed
+
+    @staticmethod
+    def _diff_scalar(before, after):
+        """The one-entry diff of a 0-d array, NaN-aware."""
+        a, b = before[()], after[()]
+        if a != b and not (
+            before.dtype.kind == "f" and np.isnan(a) and np.isnan(b)
+        ):
+            return {(): b}
+        return {}
         if before.ndim == 0:
             return {(): after[()]} if before[()] != after[()] else {}
         for index in zip(*np.nonzero(before != after)):

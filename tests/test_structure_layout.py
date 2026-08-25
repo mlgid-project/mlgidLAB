@@ -279,3 +279,81 @@ def test_a_failure_to_take_the_handle_is_silent(opened, monkeypatch):
     monkeypatch.setattr(opened, "_acquire_edit_handle", _boom)
     opened.tabs.setCurrentWidget(opened.structure_panel)
     assert opened.structure_panel is opened.tabs.currentWidget()
+
+
+# -- the control strip above the image ------------------------------------
+#
+# Reported twice: the view buttons were dead on the first file loaded and
+# came alive after loading a second one. On a single-frame stack every
+# transport widget is hidden, so their cluster reports a zero size hint
+# and the flow layout SKIPS it — and a skipped widget keeps its default
+# 640x480 geometry at the parent's origin, floating over the strip and
+# eating the clicks. A second, multi-frame file gave the cluster real
+# content, which is why it looked like a fix.
+
+
+def _single_frame_nexus(tmp_path):
+    import h5py
+    import numpy as np
+
+    path = tmp_path / "one_frame.h5"
+    with h5py.File(path, "w", track_order=True) as f:
+        data = f.create_group("entry_0000/data", track_order=True)
+        data.attrs["signal"] = "img_gid_q"
+        data.create_dataset(
+            "img_gid_q",
+            data=np.linspace(0.1, 1.0, 64, dtype="f4").reshape(1, 8, 8))
+        data.create_dataset("q_xy", data=np.linspace(-1, 1, 8, dtype="f4"))
+        data.create_dataset("q_z", data=np.linspace(0, 2, 8, dtype="f4"))
+    return path
+
+
+@pytest.fixture
+def single_frame(main_window, tmp_path):
+    session = NexusSession.open(_single_frame_nexus(tmp_path))
+    main_window._sessions.append(session)
+    main_window._set_active_session(session)
+    main_window._confirm_discard_changes = lambda session=None: True
+    main_window.show()
+    return main_window
+
+
+def test_a_single_frame_file_hides_the_transport(single_frame):
+    assert single_frame.viewer.n_frames == 1
+    assert not single_frame.frame_slider.isVisible()
+
+
+def test_the_view_buttons_are_hit_testable_on_the_first_file(single_frame):
+    """The reported bug, as a hit test: the click must reach the button."""
+    button = single_frame.viewer._radio_cart
+    point = button.mapTo(single_frame, button.rect().center())
+    assert single_frame.childAt(point) is button
+
+
+def test_an_emptied_cluster_covers_nothing(single_frame):
+    group = single_frame.viewer._frames_group
+    assert not group.has_visible_members()
+    assert group.isHidden() or group.size().isEmpty(), (
+        "an empty cluster must not keep a default 640x480 rectangle")
+
+
+def test_the_cluster_comes_back_when_the_transport_does(single_frame):
+    """Collapsing is geometry only, so a refilled cluster lays out again."""
+    viewer = single_frame.viewer
+    single_frame._set_frame_slider_visible(True)
+    assert viewer._frames_group.has_visible_members()
+    assert not viewer._frames_group.isHidden()
+    button = viewer._radio_cart
+    point = button.mapTo(single_frame, button.rect().center())
+    assert single_frame.childAt(point) is button
+
+
+def test_hiding_the_view_cluster_also_settles_the_strip(single_frame):
+    """The same path a raw session takes."""
+    viewer = single_frame.viewer
+    viewer.set_mode_radios_visible(False)
+    assert viewer._view_group.isHidden() or viewer._view_group.size().isEmpty()
+    viewer.set_mode_radios_visible(True)
+    button = viewer._radio_cart
+    point = button.mapTo(single_frame, button.rect().center())
+    assert single_frame.childAt(point) is button
