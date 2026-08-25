@@ -516,13 +516,21 @@ class StructureMixin:
     def _structure_owns_undo(self) -> bool:
         """Whether Ctrl+Z belongs to the editor right now.
 
-        Only while the Structure tab is the one in front, and only when
-        it has something to reverse. The image viewer's own history is
-        untouched by this and keeps Ctrl+Z everywhere else.
+        Two ways in, because there are two ways to edit. The Structure
+        tab being in front is the obvious one. The File browser having
+        focus is the other: every structural edit starts from that dock's
+        context menu, and after one the focus is back on the tree — so
+        without this, creating a group and pressing Ctrl+Z would hand the
+        key to the image viewer, which had nothing to do with it.
+
+        The viewer's own history is untouched and keeps Ctrl+Z
+        everywhere else.
         """
         if not hasattr(self, "structure_panel"):
             return False
-        if self.tabs.currentWidget() is not self.structure_panel:
+        in_editor = self.tabs.currentWidget() is self.structure_panel
+        in_browser = hasattr(self, "tree") and self.tree.hasFocus()
+        if not (in_editor or in_browser):
             return False
         handle = getattr(self, "_h5_edit_handle", None)
         if handle is None:
@@ -540,10 +548,24 @@ class StructureMixin:
         return self._structure_step(redo=True)
 
     def _structure_step(self, *, redo: bool) -> bool:
-        target = self._structure_edit_target()
-        if target is None:
+        """Walk the editor's history one step.
+
+        Keyed on the file being edited, NOT on the node the panel happens
+        to be showing. Those came apart the moment structural edits
+        landed: renaming or deleting the selected node leaves the panel
+        pointing at a path that no longer exists, which made the panel
+        non-editable, which silently took Ctrl+Z away — exactly when the
+        user most wants it.
+        """
+        handle = getattr(self, "_h5_edit_handle", None)
+        if handle is None:
             return False
-        handle, _ = target
+        if not handle.is_open:
+            try:
+                handle = self._acquire_edit_handle(handle.path)
+            except EditError as exc:
+                QMessageBox.warning(self, "Undo", str(exc))
+                return False
         history = self._structure_history_for(handle.path)
         if redo and not history.can_redo:
             return False
@@ -562,6 +584,12 @@ class StructureMixin:
             self._update_title()
         self._structure_checked_file = None
         self._refresh_viewer_after_structure_edit(getattr(op, "path", ""))
+        # Reversing a structural edit changes the tree's shape as much as
+        # making it did, so the browser has to be rebuilt here too. An
+        # attribute or value step leaves the shape alone and skips it.
+        if isinstance(op, (CreateNodeOp, DeleteNodeOp, MoveNodeOp)):
+            self._rebuild_tree_preserving(self._capture_tree_state(), handle)
+            self._repopulate_entries_after_structure_edit()
         self._rerender_structure()
         return True
 

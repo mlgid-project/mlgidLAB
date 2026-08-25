@@ -465,3 +465,118 @@ def test_a_raw_file_gets_no_edit_menu(main_window, synthetic_raw, monkeypatch):
     node = _FakeNode(synthetic_raw, "/")
     main_window._structure_context_actions(_MenuEvent(node, menu))
     assert [a.text() for a in menu.actions() if a.text()] == []
+
+
+# -- undo after a structural edit ------------------------------------------
+#
+# Reported from a manual pass: Ctrl+Z did nothing after a rename or a
+# delete, while it worked after a create. Both cases leave the panel
+# showing a path that no longer exists, and the undo route used to hang
+# off "what is on show" rather than "which file is being edited".
+
+
+def test_undo_works_after_a_rename(editing, monkeypatch):
+    _show(editing, "/entry_0000", monkeypatch)
+    _stub_group_dialog(monkeypatch, "notes", "NXnote")
+    editing._on_structure_new_group(_target(editing, "/entry_0000"))
+    # Select the group being renamed, which is what a user does before
+    # right-clicking it. The panel then shows a path that stops existing
+    # the moment the rename lands.
+    _show(editing, "/entry_0000/notes", monkeypatch)
+    monkeypatch.setattr(
+        QInputDialog, "getText", staticmethod(lambda *a, **k: ("remarks", True)))
+    editing._on_structure_rename(_target(editing, "/entry_0000/notes"))
+
+    assert editing._structure_owns_undo(), "the editor must still own Ctrl+Z"
+    assert editing._structure_undo() is True
+    f = _read(editing)
+    assert "notes" in f["entry_0000"] and "remarks" not in f["entry_0000"]
+
+
+def test_undo_works_after_a_delete(editing, monkeypatch):
+    _show(editing, "/entry_0000", monkeypatch)
+    _stub_group_dialog(monkeypatch, "notes", "NXnote")
+    editing._on_structure_new_group(_target(editing, "/entry_0000"))
+    _show(editing, "/entry_0000/notes", monkeypatch)
+    editing._on_structure_delete(_target(editing, "/entry_0000/notes"))
+    assert "notes" not in _read(editing)["entry_0000"]
+
+    assert editing._structure_owns_undo()
+    assert editing._structure_undo() is True
+    assert "notes" in _read(editing)["entry_0000"]
+
+
+def test_undoing_a_rename_puts_the_old_name_back_in_the_tree(editing, monkeypatch):
+    """The browser is the surface being edited; undo has to reach it."""
+    view = editing.tree
+    view.expand(view.model().index(0, 0, view.rootIndex()))
+    _show(editing, "/entry_0000", monkeypatch)
+    _stub_group_dialog(monkeypatch, "notes", "NXnote")
+    editing._on_structure_new_group(_target(editing, "/entry_0000"))
+    monkeypatch.setattr(
+        QInputDialog, "getText", staticmethod(lambda *a, **k: ("remarks", True)))
+    editing._on_structure_rename(_target(editing, "/entry_0000/notes"))
+    editing._structure_undo()
+
+    key = (str(editing.session.temp_path), ("entry_0000", "notes"))
+    index = editing._find_tree_index(key)
+    assert index is not None and index.isValid()
+    gone = (str(editing.session.temp_path), ("entry_0000", "remarks"))
+    assert editing._find_tree_index(gone) is None
+
+
+def test_undoing_a_create_takes_the_row_out_of_the_tree(editing, monkeypatch):
+    view = editing.tree
+    view.expand(view.model().index(0, 0, view.rootIndex()))
+    _show(editing, "/entry_0000", monkeypatch)
+    _stub_group_dialog(monkeypatch, "notes", "NXnote")
+    editing._on_structure_new_group(_target(editing, "/entry_0000"))
+    key = (str(editing.session.temp_path), ("entry_0000", "notes"))
+    assert editing._find_tree_index(key) is not None
+
+    editing._structure_undo()
+    assert editing._find_tree_index(key) is None
+
+
+def test_undoing_a_delete_puts_the_row_back_in_the_tree(editing, monkeypatch):
+    view = editing.tree
+    view.expand(view.model().index(0, 0, view.rootIndex()))
+    _show(editing, "/entry_0000", monkeypatch)
+    _stub_group_dialog(monkeypatch, "notes", "NXnote")
+    editing._on_structure_new_group(_target(editing, "/entry_0000"))
+    editing._on_structure_delete(_target(editing, "/entry_0000/notes"))
+    editing._structure_undo()
+
+    key = (str(editing.session.temp_path), ("entry_0000", "notes"))
+    assert editing._find_tree_index(key) is not None
+
+
+def test_the_editor_owns_undo_while_the_browser_has_focus(editing, monkeypatch):
+    """Edits start from the dock's context menu, so the dock has to count.
+
+    Otherwise creating a group from the browser and pressing Ctrl+Z hands
+    the key to the image viewer, which has nothing to do with it.
+    """
+    _show(editing, "/entry_0000", monkeypatch)
+    _stub_group_dialog(monkeypatch, "notes", "NXnote")
+    editing._on_structure_new_group(_target(editing, "/entry_0000"))
+
+    editing.tabs.setCurrentWidget(editing.viewer)
+    monkeypatch.setattr(type(editing.tree), "hasFocus", lambda self: True)
+    assert editing._structure_owns_undo()
+    editing._action_undo()
+    assert "notes" not in _read(editing)["entry_0000"]
+
+
+def test_the_viewer_still_owns_undo_elsewhere(editing, monkeypatch):
+    _show(editing, "/entry_0000", monkeypatch)
+    _stub_group_dialog(monkeypatch, "notes", "NXnote")
+    editing._on_structure_new_group(_target(editing, "/entry_0000"))
+
+    editing.tabs.setCurrentWidget(editing.viewer)
+    monkeypatch.setattr(type(editing.tree), "hasFocus", lambda self: False)
+    calls = []
+    monkeypatch.setattr(editing.viewer, "undo_last_action", lambda: calls.append(1))
+    editing._action_undo()
+    assert calls == [1]
+    assert "notes" in _read(editing)["entry_0000"]
