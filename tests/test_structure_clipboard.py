@@ -476,3 +476,62 @@ def test_paste_from_file_cancelled_at_the_picker_does_nothing(
     _show(editing, "/", monkeypatch)
     editing._on_structure_paste_from_file(_target(editing, "/"))
     assert "beamline" not in _read(editing)
+
+
+# -- across files, entirely from the tab -----------------------------------
+#
+# The workflow the tab's own tree exists for: the File browser is folded
+# away while the Structure tab is up, so the second file has to be
+# reachable, selectable and copyable from inside the tab itself.
+
+
+def test_a_second_open_file_is_a_second_root(editing, tmp_path):
+    from mlgidlab.session import NexusSession
+
+    other = NexusSession.open(_second_nexus(tmp_path))
+    editing._sessions.append(other)
+    editing._refresh_structure_tree_roots()
+
+    assert editing.structure_panel.node_tree.root_labels() == [
+        "synthetic.h5", "second.h5"]
+
+
+def test_copy_from_one_root_and_paste_into_another(editing, tmp_path,
+                                                    monkeypatch):
+    from mlgidlab.session import NexusSession
+
+    first = editing.session
+    other = NexusSession.open(_second_nexus(tmp_path))
+    editing._sessions.append(other)
+    editing._refresh_structure_tree_roots()
+    tree = editing.structure_panel.node_tree
+
+    # Click into the second file and copy a group from it.
+    assert tree.select_path(str(other.temp_path), "/beamline")
+    editing._on_structure_action("copy")
+    assert editing._structure_clip is not None
+
+    # Back into the first — held from before the click, because clicking
+    # into the second file made *it* the active session, which is the
+    # point of that promotion — and paste at its root.
+    assert tree.select_path(str(first.temp_path), "/")
+    assert editing.session is first
+    editing._on_structure_action("paste")
+
+    with h5py.File(first.temp_path, "r") as f:
+        assert f["beamline"].attrs["operator"] == "Nico"
+        assert float(f["beamline/wavelength"][()]) == pytest.approx(1.54)
+
+
+def test_selecting_the_second_file_promotes_its_session(editing, tmp_path):
+    """An edit marks the *active* session dirty, so it has to follow."""
+    from mlgidlab.session import NexusSession
+
+    other = NexusSession.open(_second_nexus(tmp_path))
+    editing._sessions.append(other)
+    editing._refresh_structure_tree_roots()
+
+    editing.structure_panel.node_tree.select_path(
+        str(other.temp_path), "/beamline")
+
+    assert editing.session is other

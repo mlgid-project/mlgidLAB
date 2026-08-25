@@ -17,9 +17,9 @@ pre-releases.
   - Attributes: add, rename, retype, edit, remove. An edited attribute
     keeps its own type, and `NX_class` and `units` come with real
     suggestions instead of a blank box.
-  - Structure: create groups and fields from the File browser's context
-    menu, with NeXus templates that pre-create what a group nearly
-    always has. Rename, move, delete.
+  - Structure: create groups and fields from the tree's action row or
+    its context menu, with NeXus templates that pre-create what a group
+    nearly always has. Rename, move, delete.
   - Links: create hard, soft and external links, see what one points at,
     retarget it, or unlink it — all without following it. **Follow** is
     the only thing that opens an external link, and only on request.
@@ -37,11 +37,30 @@ pre-releases.
   - Raw detector files are read-only throughout: they have no working
     copy, and the editor never opens one for writing.
 
+  - **Its own tree**, of every file you have open — so a group can be
+    copied out of one and pasted into another without leaving the tab.
+    It lists lazily and never follows a link, so a master of external
+    scans opens as fast as any other file, and it holds no file handle
+    of its own.
+
 - The **workflow strip** above the image can be folded away with the
   chevron at its left, and remembers the choice.
 
-- The Structure tab folds the side and bottom docks while it is in
-  front, and puts back exactly the ones that were open.
+- The Structure tab is a workspace rather than a page: find and the tree
+  on the left, the selected node on the right, the file's health and
+  this session's changes below. **Nothing scrolls at the tab level** —
+  each section scrolls inside itself — and every division is a splitter
+  you can drag, remembered between launches.
+
+- The Structure tab folds every dock away while it is in front — the
+  File browser included, since the tab navigates from its own tree — and
+  puts back exactly the ones that were open.
+
+  Two things it used to do per click are now done once, when you leave
+  the tab: rebuilding the File browser after a structural edit, and
+  switching the image to the entry you last clicked. Both update
+  something the tab hides, and doing them per edit made a large file
+  feel slow for no visible benefit.
 
 ### Fixed
 

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSettings, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -29,8 +29,10 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QMenu,
     QPushButton,
-    QScrollArea,
+    QSizePolicy,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -39,7 +41,9 @@ from PySide6.QtWidgets import (
 )
 
 from mlgidlab import icons, nexus_schema
+from mlgidlab.flow_layout import FlowLayout
 from mlgidlab.h5_edit import Issue, NodeInfo, is_inline_editable
+from mlgidlab.structure_tree import StructureTree
 from mlgidlab.widgets import (
     GAP,
     PAD,
@@ -77,6 +81,36 @@ _UNITS_ATTR = "units"
 #: Stored on each attribute cell so an edit knows which attribute it
 #: belongs to even after the name cell itself has been retyped.
 _ATTR_NAME_ROLE = Qt.ItemDataRole.UserRole
+
+#: Where each splitter remembers how the user sized it. A workspace the
+#: user has arranged must come back arranged, like the workflow rail's
+#: fold and the playback settings.
+_SPLIT_KEYS = {
+    "main": "structure/split_main",
+    "top": "structure/split_top",
+    "left": "structure/split_left",
+    "bottom": "structure/split_bottom",
+}
+
+#: How the workspace divides itself the first time, as relative weights.
+#: Without these the splitters divide by size hint, which hands Find as
+#: much room as the tree — and the tree is the one you work in.
+_SPLIT_DEFAULTS = {
+    "main": (3, 1),
+    "top": (2, 5),
+    "left": (1, 3),
+    "bottom": (1, 1),
+}
+
+#: The action row's buttons, as ``(verb, label, tooltip)``. The verbs
+#: are what ``nodeActionRequested`` carries; ``MainWindow`` maps them to
+#: the same handlers the context menu calls, so the row and the menu can
+#: never offer different things.
+NODE_ACTIONS = (
+    ("new_group", "Group…", "Add a group inside the selected group."),
+    ("new_field", "Field…", "Add a dataset inside the selected group."),
+    ("new_link", "Link…", "Add a soft or external link."),
+)
 
 
 def _human_bytes(count: int) -> str:
@@ -232,6 +266,9 @@ class StructurePanel(QWidget):
     searchRequested = Signal(str)
     #: Go to this in-file path.
     searchResultActivated = Signal(str)
+    #: One of ``NODE_ACTIONS``' verbs, or copy/cut/paste/rename/delete —
+    #: the action row asking for what the context menu also offers.
+    nodeActionRequested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -240,39 +277,224 @@ class StructurePanel(QWidget):
         # Guards the itemChanged signal while the table is being filled,
         # so populating a row never reads as a user edit.
         self._populating = False
+        self._splits: dict[str, QSplitter] = {}
+        self._splits_applied = False
 
-        scroll = QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        # The path line wraps and the tables scroll internally, so the
-        # page never needs a horizontal bar of its own.
-        scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Five regions, no page-level scrolling. The tab used to be one
+        # tall scrolling column, which meant that reading the file's
+        # health while editing an attribute took a scroll, and that
+        # nothing was where it had been left. Splitters instead: each
+        # region scrolls inside itself, which is what a table is for,
+        # and the divisions are the user's to set and are remembered.
+        #
+        # Left is where you are (find, tree), right is the node you
+        # picked, and the band below is about the file as a whole rather
+        # than any one node.
+        self._split_left = self._splitter(Qt.Orientation.Vertical, "left")
+        self._split_left.addWidget(self._build_search_card(self._split_left))
+        self._split_left.addWidget(self._build_tree_card(self._split_left))
+        self._split_left.setStretchFactor(0, 0)
+        self._split_left.setStretchFactor(1, 1)
 
-        page = QWidget(scroll)
-        column = QVBoxLayout(page)
-        column.setContentsMargins(PAD * 2, PAD * 2, PAD * 2, PAD * 2)
+        node_column = QWidget(self)
+        column = QVBoxLayout(node_column)
+        column.setContentsMargins(0, 0, 0, 0)
         column.setSpacing(PAD * 2)
-
-        column.addWidget(self._build_search_card(page))
-        column.addLayout(self._build_header(page))
-        column.addWidget(self._build_attributes_card(page))
-        self._value_card = self._build_value_card(page)
+        column.addLayout(self._build_header(node_column))
+        # The attributes table is the one thing here that grows: a node
+        # has a handful of them or a hundred.
+        column.addWidget(self._build_attributes_card(node_column), 1)
+        self._value_card = self._build_value_card(node_column)
         column.addWidget(self._value_card)
-        self._link_card = self._build_link_card(page)
+        self._link_card = self._build_link_card(node_column)
         column.addWidget(self._link_card)
-        column.addWidget(self._build_check_card(page))
-        column.addWidget(self._build_changes_card(page))
-        column.addStretch(1)
 
-        scroll.setWidget(page)
+        self._split_top = self._splitter(Qt.Orientation.Horizontal, "top")
+        self._split_top.addWidget(self._split_left)
+        self._split_top.addWidget(node_column)
+        self._split_top.setStretchFactor(0, 1)
+        self._split_top.setStretchFactor(1, 3)
+
+        self._split_bottom = self._splitter(Qt.Orientation.Horizontal, "bottom")
+        self._split_bottom.addWidget(self._build_check_card(self._split_bottom))
+        self._split_bottom.addWidget(
+            self._build_changes_card(self._split_bottom))
+
+        self._split_main = self._splitter(Qt.Orientation.Vertical, "main")
+        self._split_main.addWidget(self._split_top)
+        self._split_main.addWidget(self._split_bottom)
+        self._split_main.setStretchFactor(0, 3)
+        self._split_main.setStretchFactor(1, 1)
+
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(scroll)
+        outer.setContentsMargins(PAD * 2, PAD * 2, PAD * 2, PAD * 2)
+        outer.addWidget(self._split_main)
 
+        self._restore_splits()
         self.clear()
 
+    # -- the workspace -----------------------------------------------------
+
+    def _splitter(self, orientation, key: str) -> QSplitter:
+        """A splitter that remembers where the user put it.
+
+        Children cannot be collapsed to nothing: the whole point of this
+        layout is that every region is on screen, and a handle dragged
+        one pixel too far must not make a section disappear with no
+        obvious way back.
+        """
+        split = QSplitter(orientation, self)
+        split.setObjectName(f"Structure_{key}")
+        split.setChildrenCollapsible(False)
+        split.splitterMoved.connect(
+            lambda *_: self._save_split(key, split))
+        self._splits[key] = split
+        return split
+
+    def _save_split(self, key: str, split: QSplitter) -> None:
+        try:
+            QSettings().setValue(
+                _SPLIT_KEYS[key], ",".join(str(n) for n in split.sizes()))
+        except Exception:  # pragma: no cover - a settings backend failure
+            logger.debug("saving the %s splitter failed", key, exc_info=True)
+
+    def _restore_splits(self) -> None:
+        """Put the saved divisions back, ignoring anything malformed.
+
+        A stored size list from a different window size is still useful
+        — Qt scales it — but a corrupt or stale-arity one is not, and it
+        must not stop the tab from building.
+        """
+        for key, split in self._splits.items():
+            sizes = self._stored_sizes(key, split.count())
+            if sizes is None:
+                sizes = self._default_sizes(key, split)
+            split.setSizes(sizes)
+
+    @staticmethod
+    def _default_sizes(key: str, split: QSplitter) -> list[int]:
+        """The first-run division, as a share of the space there is.
+
+        In real pixels rather than bare weights because a splitter obeys
+        its children's size *hints* until it is told otherwise, and the
+        Find card's hint is as tall as the tree's — which would hand
+        half the left column to a search box nobody has typed in yet.
+        """
+        weights = _SPLIT_DEFAULTS[key]
+        extent = (split.height() if split.orientation() == Qt.Orientation.Vertical
+                  else split.width())
+        # Before the first show there is no geometry to divide; the
+        # ratio is still right, and showEvent re-applies it once there
+        # is something real to divide.
+        extent = max(int(extent), 400)
+        total = sum(weights)
+        return [max(1, extent * w // total) for w in weights]
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        """Size the workspace once, when there is a real window to size it in.
+
+        ``__init__`` runs before the tab has any geometry, so a division
+        applied there is a division of nothing.
+        """
+        super().showEvent(event)
+        if not self._splits_applied:
+            self._splits_applied = True
+            self._restore_splits()
+
+    @staticmethod
+    def _stored_sizes(key: str, count: int) -> list[int] | None:
+        """The saved division for one splitter, or None if unusable.
+
+        A stored list from a different window size is still worth having
+        — Qt scales it — but one with the wrong number of entries came
+        from a different layout and would silently misplace a section.
+        """
+        raw = str(QSettings().value(_SPLIT_KEYS[key], "") or "")
+        if not raw:
+            return None
+        try:
+            sizes = [int(n) for n in raw.split(",") if n]
+        except ValueError:
+            logger.debug("ignoring a malformed %s splitter state", key)
+            return None
+        if len(sizes) != count or any(n < 0 for n in sizes) or not any(sizes):
+            return None
+        return sizes
+
     # -- construction ------------------------------------------------------
+
+    def _build_tree_card(self, parent: QWidget) -> Card:
+        """The tab's own tree of every open file.
+
+        It fills itself through a lister that ``MainWindow`` installs,
+        so this panel keeps its no-I/O rule: the tree asks, the window
+        reads. See ``structure_tree`` for why it is not a silx tree.
+        """
+        card = Card("Tree", parent=parent)
+        self._tree_card = card
+
+        # The same actions the right-click menu carries. Both exist
+        # because the menu is faster once you know it is there and the
+        # row is the only way to find out that it is.
+        #
+        # A flow layout, not a QHBoxLayout: a row of five buttons in a
+        # box layout sets a hard floor under how narrow the tree column
+        # can be dragged, and this column is meant to be narrow. It
+        # wraps onto a second line instead — the same reason the image
+        # viewer's control strip uses one.
+        row = FlowLayout(hspacing=GAP, vspacing=4)
+        self._new_btn = QToolButton(card)
+        self._new_btn.setText("New")
+        self._new_btn.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._new_btn.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._new_btn.setToolTip(
+            "Add a group, a field or a link inside the selected group.")
+        new_menu = QMenu(self._new_btn)
+        for verb, label, tip in NODE_ACTIONS:
+            action = new_menu.addAction(label)
+            action.setToolTip(tip)
+            action.triggered.connect(
+                lambda _checked=False, v=verb: self.nodeActionRequested.emit(v))
+        self._new_btn.setMenu(new_menu)
+        row.addWidget(self._new_btn)
+
+
+        self._node_buttons: dict[str, QToolButton] = {}
+        for verb, label, tip in (
+            ("copy", "Copy", "Copy this node (Ctrl+C). Paste it anywhere, "
+                             "including into another open file."),
+            ("paste", "Paste", "Paste into the selected group (Ctrl+V)."),
+            ("rename", "Rename", "Rename this node."),
+            ("delete", "Delete", "Delete this node. Ctrl+Z brings it back."),
+        ):
+            button = QToolButton(card)
+            button.setText(label)
+            button.setToolButtonStyle(
+                Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            button.setAutoRaise(True)
+            button.setToolTip(tip)
+            button.clicked.connect(
+                lambda _checked=False, v=verb: self.nodeActionRequested.emit(v))
+            self._node_buttons[verb] = button
+            row.addWidget(button)
+        card.body_layout.addLayout(row)
+
+        self.node_tree = StructureTree(card)
+        self.node_tree.setMinimumWidth(180)
+        self.node_tree.setMinimumHeight(80)
+        self.node_tree.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        skin_item_view(self.node_tree)
+        attach_empty_hint(self.node_tree, "No file open.")
+        self.node_tree.setToolTip(
+            "Every file you have open. A group can be copied from one and "
+            "pasted into another; an external link is only resolved if you "
+            "expand it yourself."
+        )
+        card.body_layout.addWidget(self.node_tree)
+        return card
 
     def _build_search_card(self, parent: QWidget) -> Card:
         """Find a node by name, attribute name or attribute value.
@@ -299,13 +521,19 @@ class StructurePanel(QWidget):
 
         self._search_list = QListWidget(card)
         skin_item_view(self._search_list)
-        self._search_list.setMinimumHeight(90)
+        self._search_list.setMinimumHeight(56)
+        self._search_list.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._search_list.itemActivated.connect(self._on_search_activated)
         self._search_list.itemClicked.connect(self._on_search_activated)
-        attach_empty_hint(
-            self._search_list,
-            "Nothing searched yet. Links are never followed, so a master "
-            "of external scans answers as fast as any other file.",
+        # Short on purpose: this box is the smallest region of the tab,
+        # and a hint that does not fit is worse than no hint. The long
+        # version of why links are never followed lives in the tooltip.
+        attach_empty_hint(self._search_list, "Nothing searched yet.")
+        self._search_list.setToolTip(
+            "Searches names, attribute names and attribute values. Links "
+            "are never followed, so a master of external scans answers as "
+            "fast as any other file."
         )
         card.body_layout.addWidget(self._search_list)
         return card
@@ -399,7 +627,9 @@ class StructurePanel(QWidget):
         header = self._attr_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self._attr_table.setMinimumHeight(120)
+        self._attr_table.setMinimumHeight(56)
+        self._attr_table.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._attr_table.itemChanged.connect(self._on_attr_item_changed)
         attach_empty_hint(self._attr_table, "No attributes on this node.")
         card.body_layout.addWidget(self._attr_table)
@@ -455,6 +685,10 @@ class StructurePanel(QWidget):
         grid_row.addWidget(self._edit_values_btn)
         grid_row.addStretch(1)
         card.body_layout.addLayout(grid_row)
+        # No scrolling view inside, so it takes its natural height and
+        # leaves the rest of the column to the attributes table.
+        card.setSizePolicy(QSizePolicy.Policy.Preferred,
+                           QSizePolicy.Policy.Maximum)
         return card
 
     def _build_link_card(self, parent: QWidget) -> Card:
@@ -481,6 +715,8 @@ class StructurePanel(QWidget):
         row.addWidget(self._retarget_btn)
         row.addStretch(1)
         card.body_layout.addLayout(row)
+        card.setSizePolicy(QSizePolicy.Policy.Preferred,
+                           QSizePolicy.Policy.Maximum)
         return card
 
     def _build_check_card(self, parent: QWidget) -> Card:
@@ -515,7 +751,9 @@ class StructurePanel(QWidget):
         issue_header.setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents)
         issue_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self._issue_table.setMinimumHeight(90)
+        self._issue_table.setMinimumHeight(56)
+        self._issue_table.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         attach_empty_hint(
             self._issue_table,
             "Nothing to report — the viewer and the pipeline can read "
@@ -531,11 +769,13 @@ class StructurePanel(QWidget):
         skin_item_view(self._changes_list)
         self._changes_list.setSelectionMode(
             QAbstractItemView.SelectionMode.NoSelection)
-        self._changes_list.setMinimumHeight(90)
+        self._changes_list.setMinimumHeight(56)
+        self._changes_list.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         attach_empty_hint(
             self._changes_list,
-            "Nothing changed yet. Every edit lands in the working copy; "
-            "the file on disk is untouched until you save.",
+            "Nothing changed yet. Edits land in the working copy; the "
+            "file on disk is untouched until you save.",
         )
         card.body_layout.addWidget(self._changes_list)
 
@@ -601,6 +841,19 @@ class StructurePanel(QWidget):
         self._retarget_btn.setEnabled(
             can_edit and has_node and self._info.link.kind in ("soft", "external")
         )
+        # The action row answers to the same rules the context menu
+        # applies: you can only add inside a group, and the file root is
+        # not a node you can rename or delete.
+        is_group = has_node and self._info.kind == "group"
+        is_root = has_node and self._info.path == "/"
+        self._new_btn.setEnabled(can_edit and is_group)
+        for verb, button in self._node_buttons.items():
+            if verb in ("rename", "delete"):
+                button.setEnabled(can_edit and not is_root)
+            elif verb == "paste":
+                button.setEnabled(can_edit and is_group)
+            else:
+                button.setEnabled(can_edit and not is_root)
 
     def set_note(self, text: str, level: str = "muted") -> None:
         """A line under the type summary — why editing is off, mostly."""

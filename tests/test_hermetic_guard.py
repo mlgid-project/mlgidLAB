@@ -49,3 +49,23 @@ def test_structure_editor_primitives_have_no_heavy_backend():
     assert not heavy_added, (
         f"Importing h5_edit + nexus_schema pulled in {heavy_added!r}."
     )
+
+
+def test_the_structure_tree_has_no_heavy_backend_and_no_h5py():
+    """The tab's tree is a view over strings, and must stay one.
+
+    No analysis stack, for the same reason as the primitives above — and
+    no h5py either, which is the design rather than an accident: a tree
+    that could open a file would sooner or later hold one open, and an
+    open read handle is exactly what stops the editor taking its ``r+``.
+    """
+    before = set(sys.modules)
+    import mlgidlab.structure_tree  # noqa: F401
+    newly_loaded = set(sys.modules) - before
+    assert not (_HEAVY_BACKENDS & newly_loaded), (
+        f"structure_tree pulled in {_HEAVY_BACKENDS & newly_loaded!r}."
+    )
+    assert "h5py" not in newly_loaded, (
+        "structure_tree imported h5py — it reads through the lister "
+        "MainWindow installs, and must not be able to open a file itself."
+    )

@@ -126,6 +126,16 @@ class BuildMixin:
             self._on_structure_search)
         self.structure_panel.searchResultActivated.connect(
             self._on_structure_search_result)
+        # The tab's own tree. It reads nothing itself — the lister goes
+        # through MainWindow's handle-aware accessor — so the panel keeps
+        # its no-I/O rule and the tree never holds a file open.
+        self.structure_panel.node_tree.set_lister(self._structure_list_children)
+        self.structure_panel.node_tree.nodeSelected.connect(
+            self._on_structure_tree_selected)
+        self.structure_panel.node_tree.contextRequested.connect(
+            self._on_structure_tree_context)
+        self.structure_panel.nodeActionRequested.connect(
+            self._on_structure_action)
 
         self.tabs = QTabWidget(self)
         # documentMode flattens the tab-pane border so the image fills
@@ -258,6 +268,11 @@ class BuildMixin:
         self._tree_dock.setWidget(tree_box)
         self._tree_dock.setObjectName("FileBrowserDock")
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._tree_dock)
+        # Edits made while the browser is folded away defer its rebuild
+        # (see ``_ensure_browser_current``). Re-opening it by hand is the
+        # one route back that does not pass through a tab switch.
+        self._tree_dock.visibilityChanged.connect(
+            self._on_browser_visibility_changed)
         # Edit actions on the browser's own context menu. silx's
         # addContextMenuCallback is the supported hook, so the tree's
         # policy, model and click handling stay exactly as they were.

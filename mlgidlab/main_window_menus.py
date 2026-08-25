@@ -809,6 +809,12 @@ class MenusMixin:
             # QTabBars and only reads a dock's windowIcon when it builds
             # the tab, so they have to be re-pushed by hand.
             self._apply_dock_tab_icons()
+            # Nor are the Structure tree's rows: a QTreeWidgetItem is not
+            # a QObject, takes a column with its icon, and is thrown away
+            # every time its parent is re-listed. Same fix, same reason.
+            panel = getattr(self, "structure_panel", None)
+            if panel is not None:
+                panel.node_tree.retheme(theme)
         except Exception:
             logger.debug("suppressed exception rethemeing icons", exc_info=True)
         # Recolour the live pyqtgraph plots (config options only affect

@@ -31,10 +31,11 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QInputDialog,
+    QMenu,
     QMessageBox,
 )
 
-from mlgidlab import h5_edit, nexus_schema
+from mlgidlab import file_model, h5_edit, nexus_schema
 from silx.gui.hdf5 import Hdf5TreeModel
 
 from mlgidlab.browser_widgets import _ImageFileNode
@@ -53,6 +54,7 @@ from mlgidlab.h5_edit_ops import (
     WriteCellsOp,
 )
 from mlgidlab.structure_clipboard import StructureClip, free_name
+from mlgidlab.structure_tree import RootSpec
 from mlgidlab.structure_dialogs import (
     NewDatasetDialog,
     NewGroupDialog,
@@ -193,6 +195,172 @@ class StructureMixin:
             logger.debug("structure read failed for %s", path, exc_info=True)
             yield None
 
+    # -- the tab's own tree ------------------------------------------------
+
+    def _structure_list_children(self, file_path: str, h5_path: str):
+        """What is inside one group — the tree's lister.
+
+        Goes through ``_structure_read``, so it reuses the open write
+        handle when there is one and otherwise opens ``r`` for the
+        length of the call. The tree itself keeps nothing open, which is
+        what lets the editor take its ``r+`` handle at any moment.
+        """
+        with self._structure_read(file_path) as f:
+            if f is None:
+                return []
+            try:
+                return h5_edit.list_children(f, h5_path)
+            except Exception:
+                logger.debug("listing %s::%s failed", file_path, h5_path,
+                             exc_info=True)
+                return []
+
+    #: How many of a raw batch's files get a root row. A batch can hold
+    #: several thousand, and a tree of 6000 read-only roots is not a
+    #: navigator. The Conversion panel is where a batch that size is
+    #: actually worked with.
+    _MAX_RAW_ROOTS = 50
+
+    def _structure_root_specs(self) -> list[RootSpec]:
+        """One root row per open file, in the order they were opened.
+
+        A NeXus session shows its working copy under the original file's
+        name — the name is what the user recognises, the working copy is
+        what the edits actually land in. A raw batch shows its HDF5
+        inputs, read-only and capped; its image files have no structure
+        to show at all, which is what the panel says when one is
+        selected.
+        """
+        specs: list[RootSpec] = []
+        for session in getattr(self, "_sessions", []):
+            if session.kind == "raw":
+                specs.extend(self._raw_root_specs(session))
+                continue
+            specs.append(RootSpec(
+                str(session.temp_path),
+                Path(session.display_path).name,
+                detail=f"{session.display_path}\nedits land in the working copy",
+            ))
+        return specs
+
+    def _raw_root_specs(self, session) -> list[RootSpec]:
+        """The HDF5 files of a raw batch, read-only, capped.
+
+        The extension test comes first and the content test second, on
+        purpose: ``h5py.is_hdf5`` *opens* the file, and a batch of 6000
+        TIFFs would mean 6000 opens every time this list is rebuilt.
+        """
+        specs: list[RootSpec] = []
+        for path in getattr(session, "raw_paths", []):
+            if len(specs) >= self._MAX_RAW_ROOTS:
+                logger.debug("raw batch truncated to %d root rows",
+                             self._MAX_RAW_ROOTS)
+                break
+            if file_model.is_fabio_image(path):
+                continue
+            try:
+                if not h5py.is_hdf5(path):
+                    continue
+            except OSError:
+                continue
+            specs.append(RootSpec(
+                str(path), path.name, editable=False,
+                detail=f"{path}\nraw input — read-only",
+            ))
+        return specs
+
+    def _refresh_structure_tree_roots(self) -> None:
+        """Re-list the open files. Cheap: roots come up collapsed."""
+        panel = getattr(self, "structure_panel", None)
+        if panel is None:
+            return
+        try:
+            panel.node_tree.set_roots(self._structure_root_specs())
+        except Exception:
+            logger.debug("refreshing the structure tree roots failed",
+                         exc_info=True)
+
+    def _on_structure_tree_selected(self, file_path: str, h5_path: str) -> None:
+        """A row in the tab's own tree was clicked.
+
+        Routed through the same helpers a File-browser click uses, via
+        the ``_PathNode`` stand-in: the session must follow the click
+        (an edit marks the *active* session dirty), and the panel fills
+        from the ordinary render path.
+        """
+        node = _PathNode(file_path, h5_edit.normalize_path(h5_path))
+        # The session has to follow the click: an edit marks the *active*
+        # session dirty, and writing into one file while another is
+        # marked would be a lie in the title bar.
+        self._activate_session_for_node(node)
+        if self.tabs.currentWidget() is self.structure_panel:
+            # The entry does not. Loading a frame for an image tab the
+            # user cannot see is the one cost this tab can avoid paying
+            # per click, and on a 1750 x 1750 scan it is seconds.
+            self._structure_pending_activation = node
+        else:
+            self._activate_entry_for_node(node)
+        self._render_structure_node(node)
+
+    def _on_structure_tree_context(self, file_path: str, h5_path: str,
+                                   position) -> None:
+        """Build the edit menu for a row of the tab's own tree.
+
+        Same actions as the File browser's, from the same definition —
+        two menus that could drift apart would be two sets of rules for
+        one file.
+        """
+        session = self._session_for_path(str(Path(file_path).resolve()))
+        menu = QMenu(self)
+        self._structure_menu_actions(
+            menu, Path(file_path), h5_edit.normalize_path(h5_path), session)
+        if not menu.isEmpty():
+            menu.exec(position)
+
+    #: The action row's verbs, and the handler each one calls. The same
+    #: handlers the context menu uses, so the two surfaces can never
+    #: drift into offering different things on one node.
+    _STRUCTURE_ACTIONS = {
+        "new_group": "_on_structure_new_group",
+        "new_field": "_on_structure_new_dataset",
+        "new_link": "_on_structure_new_link",
+        "rename": "_on_structure_rename",
+        "delete": "_on_structure_delete",
+        "paste": "_on_structure_paste",
+        "paste_from_file": "_on_structure_paste_from_file",
+    }
+
+    def _on_structure_action(self, verb: str) -> None:
+        """Run one of the action row's buttons against the selection."""
+        target = self._structure_selected_target()
+        if target is None:
+            return
+        if verb == "copy":
+            self._on_structure_copy(target)
+            return
+        if verb == "cut":
+            self._on_structure_copy(target, cut=True)
+            return
+        handler = getattr(self, self._STRUCTURE_ACTIONS.get(verb, ""), None)
+        if handler is not None:
+            handler(target)
+
+    def _sync_structure_tree_selection(self, file_path, h5_path: str) -> None:
+        """Point the tab's tree at what the panel is showing.
+
+        Keeps one idea of "where am I" when the selection came from
+        somewhere else — the File browser, a search hit, or a re-render
+        after an edit. Quiet, because the panel is already filled.
+        """
+        panel = getattr(self, "structure_panel", None)
+        if panel is None:
+            return
+        try:
+            panel.node_tree.select_path(str(file_path), h5_path, quiet=True)
+        except Exception:
+            logger.debug("syncing the structure tree selection failed",
+                         exc_info=True)
+
     # -- selection ---------------------------------------------------------
 
     def _set_or_defer_structure_node(self, node) -> None:
@@ -219,6 +387,12 @@ class StructureMixin:
         explanation rather than propagate out of a tree click.
         """
         self._pending_structure_node = None
+        # What the panel is showing, whoever asked for it. Needed
+        # because a re-render after an edit used to fall back to the
+        # File browser's selection — which, now that the browser is
+        # folded away while this tab is up, can be a different node
+        # entirely from the one the user is editing.
+        self._structure_node = node
         panel = self.structure_panel
         if isinstance(node, _ImageFileNode):
             panel.clear(
@@ -291,6 +465,7 @@ class StructureMixin:
             "NeXus to edit it." if is_raw else ""
         )
         panel.set_changes(self._structure_history_for(file_path).entries())
+        self._sync_structure_tree_selection(file_path, h5_path)
 
     def _refresh_structure_issues(self, file_path, f) -> None:
         """Re-run the layout check when the file changed, or on demand.
@@ -316,10 +491,7 @@ class StructureMixin:
     def _on_structure_recheck(self) -> None:
         """Re-check button: drop the cache and re-render the selection."""
         self._structure_checked_file = None
-        node = self._pending_structure_node
-        if node is None:
-            nodes = self._safe_selected_h5_nodes()
-            node = nodes[0] if nodes else None
+        node = self._structure_current_node()
         if node is not None:
             self._render_structure_node(node)
 
@@ -331,6 +503,7 @@ class StructureMixin:
         edit history for a file that no longer exists.
         """
         self._pending_structure_node = None
+        self._structure_node = None
         self._structure_checked_file = None
         self._structure_target = None
         handle = getattr(self, "_h5_edit_handle", None)
@@ -341,6 +514,7 @@ class StructureMixin:
             self.structure_panel.clear()
             self.structure_panel.set_note("")
             self.structure_panel.set_issues([])
+            self._refresh_structure_tree_roots()
 
     # -- editing -----------------------------------------------------------
 
@@ -428,12 +602,25 @@ class StructureMixin:
         authoritative state, so reconciling it with the file is both the
         refresh after a write and the rollback after a rejected one.
         """
+        node = self._structure_current_node()
+        if node is not None:
+            self._render_structure_node(node)
+
+    def _structure_current_node(self):
+        """The node the panel is on, in order of authority.
+
+        A deferred click first (the tab was hidden when it happened),
+        then whatever was last rendered, then the File browser's
+        selection. The browser comes last because it may be folded away
+        and pointing at something the user has not looked at in a while.
+        """
         node = self._pending_structure_node
+        if node is None:
+            node = getattr(self, "_structure_node", None)
         if node is None:
             nodes = self._safe_selected_h5_nodes()
             node = nodes[0] if nodes else None
-        if node is not None:
-            self._render_structure_node(node)
+        return node
 
     def _structure_failed(self, title: str, exc: Exception) -> None:
         QMessageBox.warning(self, title, str(exc))
@@ -620,7 +807,15 @@ class StructureMixin:
         # making it did, so the browser has to be rebuilt here too. An
         # attribute or value step leaves the shape alone and skips it.
         if isinstance(op, (CreateNodeOp, DeleteNodeOp, MoveNodeOp)):
-            self._rebuild_tree_preserving(self._capture_tree_state(), handle)
+            # A move touches two parents; ``before`` is only on a move,
+            # and the two collapse to one refresh for a plain rename.
+            for changed in {getattr(op, "path", ""),
+                            getattr(op, "before", "")} - {""}:
+                self._refresh_structure_tree_at(handle.path, changed)
+            if self._browser_is_hidden():
+                self._browser_needs_rebuild = True
+            else:
+                self._rebuild_tree_preserving(self._capture_tree_state(), handle)
             self._repopulate_entries_after_structure_edit()
         self._rerender_structure()
         return True
@@ -666,15 +861,29 @@ class StructureMixin:
         raw_path = self._node_h5_path(node)
         if file_path is None or raw_path is None:
             return
-        h5_path = h5_edit.normalize_path(raw_path)
-        session = self._session_for_node(node)
+        self._structure_menu_actions(
+            menu, file_path, h5_edit.normalize_path(raw_path),
+            self._session_for_node(node),
+        )
+
+    def _structure_menu_actions(self, menu, file_path, h5_path: str,
+                                session) -> None:
+        """Add the edit actions for one node to ``menu``.
+
+        One definition, two menus: the File browser's (through silx's
+        ``addContextMenuCallback``) and the Structure tab's own tree.
+        They must offer the same thing on the same node — a user who
+        learns one has learned the other.
+        """
         if session is None or session.kind != "nexus":
             # Raw inputs and files with no session behind them stay
             # read-only; adding greyed-out actions would only imply
-            # otherwise.
+            # otherwise. No separator either: a raw file's menu must look
+            # untouched, not like an edit menu that failed to fill.
             return
 
-        menu.addSeparator()
+        if not menu.isEmpty():
+            menu.addSeparator()
         is_group = self._structure_node_is_group(file_path, h5_path)
         target = (Path(file_path), h5_path)
 
@@ -923,16 +1132,41 @@ class StructureMixin:
     def _commit_structure_change(self, handle, op, path: str) -> None:
         """Commit an edit that changed the tree's shape.
 
-        Same as an attribute commit, plus the two things a structural
-        change makes stale: the browser tree, which is rebuilt with its
-        expansion and selection restored, and the entry dropdown, when a
-        top-level group came or went.
+        Same as an attribute commit, plus the three things a structural
+        change makes stale: the tab's own tree, whose one affected group
+        is re-listed in place; the browser tree, which has no such
+        surgery available and is rebuilt with its expansion and
+        selection restored; and the entry dropdown, when a top-level
+        group came or went.
         """
         state = self._capture_tree_state()
         self._commit_structure_edit(handle, op, path)
-        self._rebuild_tree_preserving(state, handle)
+        self._refresh_structure_tree_at(handle.path, path)
+        if self._browser_is_hidden():
+            # Nobody can see it. Tearing the whole browser down and
+            # rebuilding it per edit was the largest cost in an editing
+            # session, and all of it was invisible.
+            self._browser_needs_rebuild = True
+        else:
+            self._rebuild_tree_preserving(state, handle)
         if h5_edit.entry_of(path) is not None or path.count("/") == 1:
             self._repopulate_entries_after_structure_edit()
+
+    def _refresh_structure_tree_at(self, file_path, path: str) -> None:
+        """Re-list the group a changed path lives in.
+
+        The parent, not the path itself: a create, a delete and a rename
+        all change what the *parent* holds, and after a delete the path
+        itself has no row left to refresh.
+        """
+        panel = getattr(self, "structure_panel", None)
+        if panel is None:
+            return
+        parent, _ = h5_edit.split_path(h5_edit.normalize_path(path))
+        try:
+            panel.node_tree.refresh_path(str(file_path), parent)
+        except Exception:
+            logger.debug("refreshing the structure tree failed", exc_info=True)
 
     def _repopulate_entries_after_structure_edit(self) -> None:
         """Refresh the entry dropdown, keeping the current entry if it lives."""
@@ -1081,7 +1315,7 @@ class StructureMixin:
             self.tree.selectionModel().setCurrentIndex(
                 index, QItemSelectionModel.SelectionFlag.Current)
 
-    def _rebuild_tree_preserving(self, state, handle) -> None:
+    def _rebuild_tree_preserving(self, state, handle=None) -> None:
         """Rebuild the browser and put its open rows and selection back.
 
         A structural edit changes what the tree should show, and silx's
@@ -1091,7 +1325,8 @@ class StructureMixin:
         afterwards, because here the tree is the surface the user is
         working on and losing their place mid-edit is not acceptable.
 
-        The write handle is re-taken *inside* the detached window. The
+        The write handle, when there is one, is re-taken *inside* the
+        detached window. The
         detach releases it along with every other handle, and re-opening
         it before silx reattaches is what keeps the ordering legal: r+
         first, silx's r behind it. Without this the next edit would pay
@@ -1101,22 +1336,29 @@ class StructureMixin:
         paths are left exactly as they were.
         """
         self._detach_silx_tree()
-        try:
-            handle.acquire()
-        except EditError:
-            # Losing the handle here is recoverable — the next edit
-            # acquires again. Better a rebuilt tree than a raise out of a
-            # commit that already succeeded.
-            logger.debug("re-acquiring the edit handle failed", exc_info=True)
+        if handle is not None:
+            try:
+                handle.acquire()
+            except EditError:
+                # Losing the handle here is recoverable — the next edit
+                # acquires again. Better a rebuilt tree than a raise out
+                # of a commit that already succeeded.
+                logger.debug("re-acquiring the edit handle failed",
+                             exc_info=True)
         self._reattach_tree_safely()
         self._restore_tree_state(state)
+        # Whatever was deferred has now been paid.
+        self._browser_needs_rebuild = False
 
     # -- dock visibility ---------------------------------------------------
 
-    #: The docks the Structure tab folds away. The File browser is not
-    #: among them on purpose: it is this tab's navigator, so hiding it
-    #: would leave the panel with nothing to describe.
+    #: The docks the Structure tab folds away — the File browser among
+    #: them. It used to be excluded because it was this tab's navigator;
+    #: the tab now has a tree of its own, so leaving the browser open
+    #: would show the same file twice and give the user two places to
+    #: click for one answer.
     _STRUCTURE_FOLDED_DOCKS = (
+        "_tree_dock",
         "_display_dock",
         "_pipeline_dock",
         "_sim_dock",
@@ -1128,18 +1370,25 @@ class StructureMixin:
     )
 
     def _sync_structure_docks(self) -> None:
-        """Fold the side and bottom docks away while the Structure tab is up.
+        """Fold every dock away while the Structure tab is up.
 
         Nothing in Display, Pipeline, Profiles, Peaks or Scan tracking
-        applies to editing a file's structure, and on a laptop they leave
-        the panel a narrow column. They come back exactly as they were:
-        only docks that were actually open when the tab was entered are
-        remembered, so one the user had already closed — or one the
-        session mode hides, like Conversion on a converted file — stays
-        closed on the way out.
+        applies to editing a file's structure, and the File browser is
+        now redundant — the tab has its own tree. Between them they left
+        the editor a narrow column on a laptop. They come back exactly as
+        they were: only docks that were actually open when the tab was
+        entered are remembered, so one the user had already closed — or
+        one the session mode hides, like Conversion on a converted file —
+        stays closed on the way out.
 
         The set is added to rather than replaced, because a session-mode
         change can re-show a dock while the tab is still in front.
+
+        Leaving the tab is also where the two things deferred while it
+        was in front are paid: the browser's rebuild and the entry
+        switch. Both are deliberately late — neither is visible from
+        inside this tab, and doing them per click made editing a large
+        file feel slow for no benefit anyone could see.
         """
         if not hasattr(self, "structure_panel") or not hasattr(self, "tabs"):
             return
@@ -1155,7 +1404,12 @@ class StructureMixin:
             if changed:
                 self._settle_dock_chrome()
             self._prepare_structure_editing()
+            self._refresh_structure_tree_roots()
             return
+        # Before the docks come back, so the browser is already correct
+        # by the time it is on screen again.
+        self._ensure_browser_current()
+        self._apply_structure_pending_entry()
         if not self._structure_folded_docks:
             return
         for name in self._structure_folded_docks:
@@ -1164,6 +1418,64 @@ class StructureMixin:
                 dock.show()
         self._structure_folded_docks.clear()
         self._settle_dock_chrome()
+
+    def _browser_is_hidden(self) -> bool:
+        """Whether the File browser has actually been closed.
+
+        ``isHidden``, not ``not isVisible``: the second is also true for
+        every dock of a window that has not been shown yet, or that is
+        minimised, and deferring a rebuild on those would make the
+        deferral depend on the state of the *window* rather than on
+        whether this dock is up.
+        """
+        dock = getattr(self, "_tree_dock", None)
+        return dock is not None and dock.isHidden()
+
+    def _ensure_browser_current(self) -> None:
+        """Rebuild the File browser if edits landed while it was folded.
+
+        The browser holds live h5py objects, so a delete made behind its
+        back leaves it pointing at nodes that no longer exist. Deferring
+        the rebuild is only safe because every route back to it comes
+        through here or through ``_detach_silx_tree``, which rebuilds
+        from scratch anyway.
+        """
+        if not getattr(self, "_browser_needs_rebuild", False):
+            return
+        if getattr(self, "_rebuilding_browser", False):
+            return
+        self._rebuilding_browser = True
+        try:
+            self._rebuild_tree_preserving(
+                self._capture_tree_state(),
+                getattr(self, "_h5_edit_handle", None),
+            )
+        except Exception:
+            logger.debug("the deferred browser rebuild failed", exc_info=True)
+            self._browser_needs_rebuild = False
+        finally:
+            self._rebuilding_browser = False
+
+    def _on_browser_visibility_changed(self, visible: bool) -> None:
+        """Catch the browser being re-opened by hand while edits are pending."""
+        if visible:
+            self._ensure_browser_current()
+
+    def _apply_structure_pending_entry(self) -> None:
+        """Switch to the entry of the last node touched in the tab's tree.
+
+        One frame load on the way out instead of one per click. The
+        viewer therefore lands on what was being edited, which is where
+        the user was looking anyway.
+        """
+        node = getattr(self, "_structure_pending_activation", None)
+        if node is None:
+            return
+        self._structure_pending_activation = None
+        try:
+            self._activate_entry_for_node(node)
+        except Exception:
+            logger.debug("the deferred entry switch failed", exc_info=True)
 
     def _settle_dock_chrome(self) -> None:
         """Clean up after showing or hiding a tabified dock.
@@ -1661,11 +1973,6 @@ class StructureMixin:
         ):
             return {(): b}
         return {}
-        if before.ndim == 0:
-            return {(): after[()]} if before[()] != after[()] else {}
-        for index in zip(*np.nonzero(before != after)):
-            changed[tuple(int(i) for i in index)] = after[index]
-        return changed
 
     # -- search ------------------------------------------------------------
 
@@ -1715,6 +2022,10 @@ class StructureMixin:
         )
         if file_path is None:
             return
+        # The tab's own tree first: it is the one on screen, and it can
+        # reveal a hit inside a subtree nobody has expanded.
+        self._sync_structure_tree_selection(
+            file_path, h5_edit.normalize_path(path))
         parts = tuple(p for p in h5_edit.normalize_path(path).split("/") if p)
         index = self._find_tree_index((str(file_path), parts))
         if index is None or not index.isValid():

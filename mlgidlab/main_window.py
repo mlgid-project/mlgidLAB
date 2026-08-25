@@ -360,6 +360,9 @@ class MainWindow(
         # The same bargain for the Structure tab, and the file whose
         # layout check is currently displayed (None re-runs it).
         self._pending_structure_node = None
+        # The node the Structure panel is currently showing, whoever
+        # selected it — its own tree, the browser, or a search hit.
+        self._structure_node = None
         self._structure_checked_file: str | None = None
         # (file, h5 path) the Structure tab is showing and may write to;
         # None whenever it is showing something read-only.
@@ -372,6 +375,14 @@ class MainWindow(
         # Docks folded away because the Structure tab is in front, to be
         # restored on the way back to Image or Data.
         self._structure_folded_docks: set[str] = set()
+        # Set when a structural edit landed while the File browser was
+        # folded away: rebuilding a tree nobody can see is a teardown for
+        # nothing, so it is paid once, on the way out.
+        self._browser_needs_rebuild = False
+        # The last node clicked in the Structure tab's own tree. Its
+        # entry is applied when the tab is left, so browsing a file to
+        # edit it never reloads the image behind the tab.
+        self._structure_pending_activation = None
         # What the Structure tab holds between a Copy and a Paste. Kept
         # apart from the peak clipboard: Ctrl+C means a different thing
         # on each tab.

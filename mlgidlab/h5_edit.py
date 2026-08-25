@@ -397,6 +397,100 @@ def node_info(f: h5py.File, path: str, *, follow: bool = False) -> NodeInfo:
     )
 
 
+@dataclass(frozen=True)
+class ChildInfo:
+    """One row of a group's contents, classified without resolving it.
+
+    ``kind`` is what to draw: a hard link is ``group`` or ``dataset``, a
+    soft link that resolves in-file is reported as ``soft`` (with the
+    resolved kind in ``target_kind``, which costs nothing - it never
+    leaves the file), an external link is ``external`` and its target is
+    NOT opened, and ``broken`` is a link whose target is gone.
+
+    ``expandable`` is whether the row gets a chevron. An external link
+    gets one even though nothing has been read: expanding it is the
+    user's own decision to open that file, the same bargain the Link
+    card's Follow button makes.
+    """
+
+    name: str
+    kind: str
+    expandable: bool = False
+    detail: str = ""
+    target_kind: str = ""
+
+
+def list_children(f: h5py.File, path: str) -> list[ChildInfo]:
+    """Every child of the group at ``path``, in file order, links intact.
+
+    The listing rule the whole Structure tab rests on: ``keys()`` names
+    the links and ``get(..., getlink=True)`` classifies each one, so a
+    master whose 226 entries are external links to multi-GB scans lists
+    as fast as any other file and opens none of them.
+
+    Each child is classified inside its own guard. One unreadable row -
+    a link into a file that has been moved, a corrupt entry - must cost
+    that row and not the listing, because the tree it fills is the only
+    way the user can reach the row that would fix it.
+
+    Returns an empty list for anything that is not a group, which is
+    what a caller expanding a dataset by mistake should see.
+    """
+    full = normalize_path(path)
+    try:
+        group = f[full]
+    except (KeyError, OSError):
+        return []
+    if not isinstance(group, h5py.Group):
+        return []
+
+    children: list[ChildInfo] = []
+    for name in group.keys():
+        try:
+            children.append(_classify_child(group, str(name)))
+        except (KeyError, OSError, RuntimeError, ValueError):
+            logger.debug("child %s of %s unreadable", name, full, exc_info=True)
+            children.append(ChildInfo(str(name), "broken", detail="unreadable"))
+    return children
+
+
+def _classify_child(group: h5py.Group, name: str) -> ChildInfo:
+    """Classify one child of an open group. Never opens an external file."""
+    link = group.get(name, getlink=True)
+
+    if isinstance(link, h5py.ExternalLink):
+        return ChildInfo(
+            name, "external", expandable=True,
+            detail=f"external link -> {link.filename}::{link.path}",
+        )
+
+    if isinstance(link, h5py.SoftLink):
+        # A soft link stays inside this file, so resolving it is a
+        # pointer chase, not an open. Worth doing: the tree can then
+        # show whether it lands on a group or a dataset.
+        try:
+            target = group[name]
+        except (KeyError, OSError):
+            return ChildInfo(
+                name, "broken", detail=f"soft link -> {link.path} (missing)")
+        kind = "group" if isinstance(target, h5py.Group) else "dataset"
+        return ChildInfo(
+            name, "soft", expandable=kind == "group",
+            detail=f"soft link -> {link.path}", target_kind=kind,
+        )
+
+    obj = group[name]
+    if isinstance(obj, h5py.Group):
+        nx_class = _as_text(obj.attrs.get("NX_class", ""))
+        n = len(obj)
+        return ChildInfo(
+            name, "group", expandable=n > 0,
+            detail=nx_class or ("group" if n else "empty group"),
+        )
+    shape = " x ".join(str(d) for d in obj.shape) if obj.shape else "scalar"
+    return ChildInfo(name, "dataset", detail=f"{obj.dtype} - {shape}")
+
+
 def _as_text(value: Any) -> str:
     """Decode an HDF5 string-ish value to ``str`` without guessing."""
     if isinstance(value, bytes):

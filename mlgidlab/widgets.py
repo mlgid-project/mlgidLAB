@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QProgressBar,
     QProgressDialog,
     QSizePolicy,
@@ -91,6 +92,13 @@ def attach_empty_hint(view: QWidget, text: str) -> QLabel:
     layout = QVBoxLayout(view.viewport())
     layout.setContentsMargins(GAP, GAP, GAP, GAP)
     layout.addWidget(hint)
+    # The hint must not decide how small the view may get. A layout
+    # normally pushes its minimum onto the widget it is set on, and a
+    # word-wrapped sentence at a narrow width is tall — so an empty
+    # table would claim a couple of hundred pixels it does not need,
+    # and in a splitter that is room taken from something that does.
+    # The hint is a message about the view, not a part of it.
+    layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
 
     def sync() -> None:
         # A view whose C++ half is already gone still has live model

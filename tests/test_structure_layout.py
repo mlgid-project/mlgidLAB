@@ -21,8 +21,9 @@ from mlgidlab.workflow_rail import WorkflowRail
 pytestmark = pytest.mark.gui
 
 FOLDED = (
-    "_display_dock", "_pipeline_dock", "_sim_dock", "_conversion_dock",
-    "_logs_dock", "_profile_dock", "_peaks_dock", "_scan_tracking_dock",
+    "_tree_dock", "_display_dock", "_pipeline_dock", "_sim_dock",
+    "_conversion_dock", "_logs_dock", "_profile_dock", "_peaks_dock",
+    "_scan_tracking_dock",
 )
 
 
@@ -58,9 +59,13 @@ def test_the_structure_tab_folds_the_side_and_bottom_docks(opened):
     assert _visible(opened) == set()
 
 
-def test_the_file_browser_stays_open(opened):
-    """It is this tab's navigator; hiding it would leave nothing to edit."""
+def test_the_file_browser_folds_away_too(opened):
+    """It used to stay open as this tab's navigator. The tab has its own
+    tree now, so leaving the browser up would show one file twice."""
+    assert opened._tree_dock.isVisible()
     opened.tabs.setCurrentWidget(opened.structure_panel)
+    assert not opened._tree_dock.isVisible()
+    opened.tabs.setCurrentWidget(opened.viewer)
     assert opened._tree_dock.isVisible()
 
 
@@ -357,3 +362,272 @@ def test_hiding_the_view_cluster_also_settles_the_strip(single_frame):
     button = viewer._radio_cart
     point = button.mapTo(single_frame, button.rect().center())
     assert single_frame.childAt(point) is button
+
+
+# -- the workspace ---------------------------------------------------------
+#
+# The tab was one tall scrolling column. It is now five resizable
+# regions, and the promise is that all five are on screen at once: only
+# the tables and lists inside them scroll. These pin that promise, since
+# it is the kind that erodes one added widget at a time.
+
+
+@pytest.fixture
+def workspace(opened):
+    opened.tabs.setCurrentWidget(opened.structure_panel)
+    opened.resize(1100, 760)
+    opened.show()
+    return opened.structure_panel
+
+
+def _regions(panel):
+    return {
+        "find": panel._search_card,
+        "tree": panel._tree_card,
+        "attributes": panel._attr_card,
+        "check": panel._check_card,
+        "changes": panel._changes_card,
+    }
+
+
+def test_the_page_itself_does_not_scroll(workspace):
+    """No QScrollArea anywhere in the tab — that is the whole request."""
+    from PySide6.QtWidgets import QScrollArea
+
+    assert workspace.findChildren(QScrollArea) == []
+
+
+def test_every_region_is_on_screen_at_once(workspace):
+    for name, card in _regions(workspace).items():
+        assert card.isVisible(), name
+        assert card.height() > 0 and card.width() > 0, name
+
+
+def test_the_regions_still_fit_a_small_window(opened):
+    """A laptop-sized window must not push a section off the tab."""
+    opened.tabs.setCurrentWidget(opened.structure_panel)
+    opened.resize(900, 620)
+    opened.show()
+    panel = opened.structure_panel
+    for name, card in _regions(panel).items():
+        assert card.isVisible(), name
+    assert panel.minimumSizeHint().height() <= 620
+
+
+def test_the_tables_keep_their_own_scrollbars(workspace):
+    """Scrolling moved inside the sections; it did not go away."""
+    from PySide6.QtCore import Qt
+
+    for view in (workspace._attr_table, workspace._issue_table,
+                 workspace._changes_list, workspace._search_list,
+                 workspace.node_tree):
+        assert view.verticalScrollBarPolicy() != Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+
+
+def test_a_section_cannot_be_collapsed_out_of_existence(workspace):
+    for split in workspace._splits.values():
+        assert not split.childrenCollapsible()
+
+
+def test_the_division_is_remembered(workspace):
+    from mlgidlab.structure_panel import _SPLIT_KEYS, StructurePanel
+
+    split = workspace._splits["top"]
+    split.setSizes([300, 700])
+    workspace._save_split("top", split)
+    stored = StructurePanel._stored_sizes("top", 2)
+    assert stored == split.sizes()
+
+    QSettings().remove(_SPLIT_KEYS["top"])
+
+
+def test_a_stale_division_is_ignored_rather_than_applied(workspace):
+    """A stored list from another layout would misplace a section."""
+    from mlgidlab.structure_panel import _SPLIT_KEYS, StructurePanel
+
+    QSettings().setValue(_SPLIT_KEYS["top"], "1,2,3")
+    assert StructurePanel._stored_sizes("top", 2) is None
+    QSettings().setValue(_SPLIT_KEYS["top"], "not,sizes")
+    assert StructurePanel._stored_sizes("top", 2) is None
+    QSettings().remove(_SPLIT_KEYS["top"])
+
+
+# -- the action row --------------------------------------------------------
+
+
+def test_the_action_row_routes_to_the_same_handlers(workspace, opened,
+                                                    monkeypatch):
+    """The row and the context menu must not be two sets of rules."""
+    called = []
+    monkeypatch.setattr(
+        opened, "_structure_selected_target", lambda: ("f.h5", "/entry"))
+    for verb, handler in opened._STRUCTURE_ACTIONS.items():
+        monkeypatch.setattr(
+            opened, handler,
+            lambda target, v=verb: called.append((v, target)))
+        workspace.nodeActionRequested.emit(verb)
+    assert [v for v, _ in called] == list(opened._STRUCTURE_ACTIONS)
+    assert all(target == ("f.h5", "/entry") for _, target in called)
+
+
+def test_the_action_row_no_ops_with_nothing_selected(workspace, opened,
+                                                     monkeypatch):
+    monkeypatch.setattr(opened, "_structure_selected_target", lambda: None)
+    monkeypatch.setattr(
+        opened, "_on_structure_delete",
+        lambda target: pytest.fail("deleted with nothing selected"))
+    workspace.nodeActionRequested.emit("delete")
+
+
+def test_add_actions_are_off_unless_a_group_is_selected(workspace, opened,
+                                                        monkeypatch):
+    from mlgidlab import h5_edit
+
+    class _Node:
+        local_filename = ""
+        local_name = ""
+
+    node = _Node()
+    node.local_filename = str(opened.session.temp_path)
+    node.local_name = "/entry_0000/data/q_xy"
+    opened._render_structure_node(node)
+    assert not workspace._new_btn.isEnabled()
+
+    node.local_name = "/entry_0000/data"
+    opened._render_structure_node(node)
+    assert workspace._new_btn.isEnabled()
+    assert h5_edit.normalize_path(node.local_name) == "/entry_0000/data"
+
+
+# -- the two deferrals -----------------------------------------------------
+#
+# Both exist because the Structure tab hides what they update. Neither
+# may be skipped: a browser holding deleted nodes is a crash waiting for
+# a click, and an entry never applied means the Image tab shows a
+# different scan than the one just edited.
+
+
+def _select(window, h5_path):
+    window.structure_panel.node_tree.select_path(
+        str(window.session.temp_path), h5_path)
+
+
+@pytest.fixture
+def rename_to(monkeypatch):
+    """Answer the rename dialog, and the protected-path confirm behind it.
+
+    ``q_xy`` is a node the viewer reads, so renaming it asks first —
+    which is the behaviour under test everywhere else, and a hang here.
+    """
+    from PySide6.QtWidgets import QInputDialog, QMessageBox
+
+    monkeypatch.setattr(
+        QInputDialog, "getText",
+        staticmethod(lambda *a, **k: ("renamed", True)))
+    monkeypatch.setattr(
+        QMessageBox, "warning",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+
+
+@pytest.fixture
+def editing_tab(opened, rename_to):
+    opened.tabs.setCurrentWidget(opened.structure_panel)
+    opened._refresh_structure_tree_roots()
+    return opened
+
+
+def test_an_edit_behind_the_folded_browser_defers_its_rebuild(editing_tab,
+                                                              monkeypatch):
+    rebuilt = []
+    monkeypatch.setattr(
+        editing_tab, "_rebuild_tree_preserving",
+        lambda *a, **k: rebuilt.append(True))
+
+    _select(editing_tab, "/entry_0000/data/q_xy")
+    editing_tab._on_structure_rename(
+        (editing_tab.session.temp_path, "/entry_0000/data/q_xy"))
+
+    assert rebuilt == []
+    assert editing_tab._browser_needs_rebuild
+
+
+def test_leaving_the_tab_pays_the_deferred_rebuild(editing_tab):
+    _select(editing_tab, "/entry_0000/data/q_xy")
+    editing_tab._on_structure_rename(
+        (editing_tab.session.temp_path, "/entry_0000/data/q_xy"))
+    assert editing_tab._browser_needs_rebuild
+
+    editing_tab.tabs.setCurrentWidget(editing_tab.viewer)
+
+    assert not editing_tab._browser_needs_rebuild
+    # And the browser really does show the new name.
+    key = (str(editing_tab.session.temp_path), ("entry_0000", "data", "renamed"))
+    assert editing_tab._find_tree_index(key) is not None
+
+
+def test_reopening_the_browser_by_hand_pays_it_too(editing_tab):
+    _select(editing_tab, "/entry_0000/data/q_xy")
+    editing_tab._on_structure_rename(
+        (editing_tab.session.temp_path, "/entry_0000/data/q_xy"))
+    assert editing_tab._browser_needs_rebuild
+
+    editing_tab._tree_dock.show()
+
+    assert not editing_tab._browser_needs_rebuild
+
+
+def test_an_edit_with_the_browser_open_rebuilds_at_once(opened, rename_to,
+                                                        monkeypatch):
+    """Nothing is deferred when the browser is on screen — the old path."""
+    rebuilt = []
+    monkeypatch.setattr(
+        opened, "_rebuild_tree_preserving",
+        lambda *a, **k: rebuilt.append(True))
+    assert opened._tree_dock.isVisible()
+
+    opened._on_structure_rename(
+        (opened.session.temp_path, "/entry_0000/data/q_xy"))
+
+    assert rebuilt == [True]
+    assert not opened._browser_needs_rebuild
+
+
+def test_clicking_the_tree_does_not_reload_the_viewer(editing_tab, monkeypatch):
+    loaded = []
+    monkeypatch.setattr(
+        editing_tab, "_activate_entry_for_node",
+        lambda node: loaded.append(node))
+
+    _select(editing_tab, "/entry_0000/data/q_xy")
+
+    assert loaded == []
+    assert editing_tab._structure_pending_activation is not None
+
+
+def test_leaving_the_tab_applies_the_entry_once(editing_tab, monkeypatch):
+    loaded = []
+    monkeypatch.setattr(
+        editing_tab, "_activate_entry_for_node",
+        lambda node: loaded.append(node))
+
+    _select(editing_tab, "/entry_0000/data/q_xy")
+    _select(editing_tab, "/entry_0000/data/q_z")
+    editing_tab.tabs.setCurrentWidget(editing_tab.viewer)
+
+    assert len(loaded) == 1
+    assert loaded[0].local_name == "/entry_0000/data/q_z"
+    assert editing_tab._structure_pending_activation is None
+
+
+def test_a_click_from_another_tab_still_switches_at_once(opened, monkeypatch):
+    """Only the Structure tab defers; the browser's own clicks do not."""
+    loaded = []
+    monkeypatch.setattr(
+        opened, "_activate_entry_for_node", lambda node: loaded.append(node))
+    opened.tabs.setCurrentWidget(opened.viewer)
+    opened._refresh_structure_tree_roots()
+
+    opened._on_structure_tree_selected(
+        str(opened.session.temp_path), "/entry_0000/data/q_xy")
+
+    assert len(loaded) == 1

@@ -457,3 +457,47 @@ def test_two_files_keep_separate_histories(editing, monkeypatch, tmp_path):
         "+ /entry_0000@title = first file"]
     assert editing.structure_panel.change_rows() == [
         "+ /entry_0000@title = second file"]
+
+
+# -- the panel follows the tab's tree, not the folded browser --------------
+
+
+def test_a_re_render_follows_the_tab_not_the_browser(editing, monkeypatch):
+    """The browser is folded away here and may point somewhere else.
+
+    Before the tab had its own tree, a re-render after an edit fell back
+    to the File browser's selection. With the browser hidden that is a
+    stale answer, and the panel would jump to a node the user was not
+    editing the moment they changed an attribute.
+    """
+    stale = _FakeNode(editing.session.temp_path, "/entry_0000")
+    monkeypatch.setattr(editing, "_safe_selected_h5_nodes", lambda: [stale])
+
+    editing._on_structure_tree_selected(
+        str(editing.session.temp_path), "/entry_0000/data/q_xy")
+    assert editing.structure_panel.current.path == "/entry_0000/data/q_xy"
+
+    editing._rerender_structure()
+
+    assert editing.structure_panel.current.path == "/entry_0000/data/q_xy"
+
+
+def test_an_edit_from_the_tab_writes_to_the_node_on_show(editing, monkeypatch):
+    stale = _FakeNode(editing.session.temp_path, "/entry_0000")
+    monkeypatch.setattr(editing, "_safe_selected_h5_nodes", lambda: [stale])
+
+    editing._on_structure_tree_selected(
+        str(editing.session.temp_path), "/entry_0000/data/q_xy")
+    editing.structure_panel.attributeAdded.emit("units", "str", "1/A")
+
+    assert _read(editing, "/entry_0000/data/q_xy", "units") == "1/A"
+    assert "units" not in dict(
+        _read_attrs(editing, "/entry_0000"))
+
+
+def _read_attrs(window, h5_path):
+    handle = window._h5_edit_handle
+    if handle is not None and handle.is_open:
+        return dict(handle.file[h5_path].attrs)
+    with h5py.File(window.session.temp_path, "r") as f:
+        return dict(f[h5_path].attrs)
