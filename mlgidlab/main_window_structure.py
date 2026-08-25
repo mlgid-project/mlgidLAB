@@ -39,16 +39,19 @@ from mlgidlab.browser_widgets import _ImageFileNode
 from mlgidlab.h5_edit import MISSING, EditError, EditHandle
 from mlgidlab.h5_edit_ops import (
     CreateNodeOp,
+    DeleteLinkOp,
     DeleteNodeOp,
     EditHistory,
     MoveNodeOp,
     RenameAttrOp,
+    RetargetLinkOp,
     SetAttrOp,
     WriteCellsOp,
 )
 from mlgidlab.structure_dialogs import (
     NewDatasetDialog,
     NewGroupDialog,
+    NewLinkDialog,
     parse_shape,
 )
 
@@ -179,8 +182,12 @@ class StructureMixin:
         else:
             self._pending_structure_node = node
 
-    def _render_structure_node(self, node) -> None:
+    def _render_structure_node(self, node, *, follow: bool = False) -> None:
         """Fill the Structure panel from a file-browser node.
+
+        ``follow`` resolves an external link instead of describing it —
+        set only by the Follow button, never by a selection change, so
+        browsing a master of external links stays free.
 
         Guarded end to end: a stale silx node, a file that vanished
         under us, or a broken link must leave the panel with an
@@ -220,7 +227,7 @@ class StructureMixin:
                 panel.clear(f"{Path(file_path).name} could not be read.")
                 return
             try:
-                info = h5_edit.node_info(f, h5_path)
+                info = h5_edit.node_info(f, h5_path, follow=follow)
                 # A node that is not there has no attributes to read and
                 # no value to preview; asking would raise. The panel
                 # still shows the path and says it is missing, which is
@@ -655,12 +662,37 @@ class StructureMixin:
                 "New field…",
                 lambda: self._on_structure_new_dataset(target),
             )
+            menu.addAction(
+                "New link…",
+                lambda: self._on_structure_new_link(target),
+            )
+        elif self._structure_link_kind(file_path, h5_path) in ("soft", "external"):
+            menu.addAction(
+                "Retarget link…",
+                lambda: self._on_structure_retarget_link(target),
+            )
         menu.addAction(
             "Rename…", lambda: self._on_structure_rename(target)
         ).setEnabled(h5_path != "/")
         menu.addAction(
             "Delete", lambda: self._on_structure_delete(target)
         ).setEnabled(h5_path != "/")
+
+    def _structure_link_kind(self, file_path, h5_path: str) -> str:
+        """The link kind at a path — ``hard`` when it is a plain object.
+
+        Reads the link, never the target, so asking the question about a
+        row in a master file opens nothing.
+        """
+        with self._structure_read(file_path) as f:
+            if f is None:
+                return "hard"
+            try:
+                link = h5_edit.link_info(f, h5_path)
+            except Exception:
+                logger.debug("link kind probe failed", exc_info=True)
+                return "hard"
+            return link.kind if link is not None else "hard"
 
     def _structure_node_is_group(self, file_path, h5_path: str) -> bool:
         """Whether a node can hold children, without resolving a link."""
@@ -786,6 +818,25 @@ class StructureMixin:
         reason = h5_edit.protection_reason(path)
         if reason and not self._confirm_protected("Delete", path, reason):
             return
+        # A soft or external link is three strings, not a payload.
+        # Snapshotting one would mean copying its TARGET — for an
+        # external link, opening the very file the link exists to keep
+        # closed, and for a dangling one, impossible. Remember the link
+        # instead and write it back on undo.
+        link = h5_edit.link_info(handle.file, path)
+        if link is not None and link.kind in ("soft", "external"):
+            try:
+                h5_edit.delete_node(handle.file, path)
+            except EditError as exc:
+                self._structure_failed("Delete", exc)
+                return
+            self._commit_structure_change(
+                handle,
+                DeleteLinkOp(path, link.kind, link.target, link.filename),
+                path,
+            )
+            return
+
         try:
             size = h5_edit.node_nbytes(
                 handle.file, path, cap=h5_edit.UNDO_SNAPSHOT_LIMIT)
@@ -1067,3 +1118,101 @@ class StructureMixin:
             if dock is not None:
                 dock.show()
         self._structure_folded_docks.clear()
+
+    # -- link intents ------------------------------------------------------
+
+    def _on_structure_new_link(self, target) -> None:
+        opened = self._structure_handle_for(target)
+        if opened is None:
+            return
+        handle, parent_path = opened
+        dialog = NewLinkDialog(self, parent_path=parent_path)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        kind, name, link_target, filename = dialog.result_values()
+        if not name or not link_target:
+            return
+
+        def create(f):
+            return h5_edit.create_link(
+                f, parent_path, name, kind, link_target,
+                filename=filename or None,
+            )
+
+        try:
+            new_path = create(handle.file)
+        except EditError as exc:
+            self._structure_failed("New link", exc)
+            return
+        self._commit_structure_change(
+            handle, CreateNodeOp(new_path, f"{kind} link", recreate=create),
+            new_path,
+        )
+
+    def _on_structure_retarget_link(self, target=None) -> None:
+        """Point an existing soft or external link somewhere else.
+
+        Called with an explicit target from the browser's context menu,
+        and with none from the panel's own button, where the link on show
+        is the one meant.
+        """
+        if target is None:
+            target = getattr(self, "_structure_target", None)
+            if target is None:
+                return
+        opened = self._structure_handle_for(target)
+        if opened is None:
+            return
+        handle, path = opened
+        before = h5_edit.link_info(handle.file, path)
+        if before is None or before.kind == "hard":
+            self._structure_failed(
+                "Retarget link",
+                EditError(
+                    "A hard link is the object itself, not a pointer — "
+                    "there is nothing to retarget."
+                ),
+            )
+            return
+        parent_path, name = h5_edit.split_path(path)
+        dialog = NewLinkDialog(
+            self, parent_path=path, kind=before.kind, name=name,
+            target=before.target, filename=before.filename, retarget=True,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        kind, _, link_target, filename = dialog.result_values()
+        if not link_target:
+            return
+        try:
+            h5_edit.retarget_link(
+                handle.file, path, kind, link_target,
+                filename=filename or None,
+            )
+        except EditError as exc:
+            self._structure_failed("Retarget link", exc)
+            return
+        self._commit_structure_change(
+            handle,
+            RetargetLinkOp(
+                path,
+                before.kind, before.target, before.filename,
+                kind, link_target, filename,
+            ),
+            path,
+        )
+
+    def _on_structure_follow_link(self) -> None:
+        """Resolve the link on show and describe what it points at.
+
+        The only place the editor opens an external link, and only
+        because the user asked. Everything else — the tree walk, the
+        search, the layout check, the panel's own render — describes the
+        link and leaves the target closed.
+        """
+        node = self._pending_structure_node
+        if node is None:
+            nodes = self._safe_selected_h5_nodes()
+            node = nodes[0] if nodes else None
+        if node is not None:
+            self._render_structure_node(node, follow=True)

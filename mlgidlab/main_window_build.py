@@ -116,6 +116,10 @@ class BuildMixin:
             self._on_structure_value_edited)
         self.structure_panel.copyChangesRequested.connect(
             self._on_structure_copy_changes)
+        self.structure_panel.retargetLinkRequested.connect(
+            self._on_structure_retarget_link)
+        self.structure_panel.followLinkRequested.connect(
+            self._on_structure_follow_link)
 
         self.tabs = QTabWidget(self)
         # documentMode flattens the tab-pane border so the image fills

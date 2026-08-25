@@ -282,3 +282,64 @@ class MoveNodeOp:
         if before_parent == after_parent:
             return f"{self.before} renamed to {after_name}"
         return f"{self.before} moved to {self.after}"
+
+
+@dataclass
+class DeleteLinkOp:
+    """An unlinked soft or external link, remembered as a link.
+
+    Deliberately not a ``DeleteNodeOp``: snapshotting would have to copy
+    the link's *target*, which for an external link means opening
+    another file — the multi-GB scan the link exists to avoid — and for
+    a dangling one is impossible. A link is three strings, so undo just
+    writes it again.
+    """
+
+    path: str
+    kind: str
+    target: str
+    filename: str = ""
+
+    def redo(self, f: h5py.File) -> None:
+        h5_edit.delete_node(f, self.path)
+
+    def undo(self, f: h5py.File) -> None:
+        parent, name = h5_edit.split_path(self.path)
+        h5_edit.create_link(
+            f, parent, name, self.kind, self.target,
+            filename=self.filename or None,
+        )
+
+    def describe(self) -> str:
+        return f"- {self.path}  ({self.kind} link)"
+
+
+@dataclass
+class RetargetLinkOp:
+    """A link pointed somewhere else, remembered as both endpoints."""
+
+    path: str
+    before_kind: str
+    before_target: str
+    before_filename: str
+    after_kind: str
+    after_target: str
+    after_filename: str
+
+    def _apply(self, f: h5py.File, kind: str, target: str, filename: str) -> None:
+        h5_edit.retarget_link(
+            f, self.path, kind, target, filename=filename or None)
+
+    def redo(self, f: h5py.File) -> None:
+        self._apply(f, self.after_kind, self.after_target, self.after_filename)
+
+    def undo(self, f: h5py.File) -> None:
+        self._apply(f, self.before_kind, self.before_target, self.before_filename)
+
+    def describe(self) -> str:
+        def spell(kind: str, target: str, filename: str) -> str:
+            return f"{filename}::{target}" if kind == "external" else target
+        return (
+            f"{self.path}: {spell(self.before_kind, self.before_target, self.before_filename)}"
+            f" → {spell(self.after_kind, self.after_target, self.after_filename)}"
+        )

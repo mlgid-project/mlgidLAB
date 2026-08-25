@@ -330,10 +330,11 @@ def link_info(f: h5py.File, path: str) -> LinkInfo | None:
         return None
     if not isinstance(parent, h5py.Group):
         return None
-    # ``name in parent`` resolves the link and is therefore False for a
-    # *broken* one; ``keys()`` lists the link itself. Ask keys() so a
-    # dangling soft or external link is reported rather than hidden —
-    # retargeting it is exactly what the user needs to do.
+    # ``keys()`` lists links without following them, which is the whole
+    # point here: a dangling soft or external link must be reported so
+    # the user can retarget it, not hidden because its target is gone.
+    # (h5py's ``in`` happens to agree — it tests link existence, not the
+    # target's — but asking keys() says what we actually mean.)
     if name not in parent.keys():
         return None
     link = parent.get(name, getlink=True)

@@ -17,8 +17,11 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPushButton,
     QWidget,
 )
 
@@ -203,3 +206,128 @@ def parse_shape(text: str) -> tuple[int, ...]:
     if any(d < 0 for d in dims):
         raise ValueError("A dimension cannot be negative.")
     return dims
+
+
+#: What each link kind means, in the dialog, in plain language.
+LINK_KIND_HELP = {
+    "hard": (
+        "A second name for the same object in this file. Deleting either "
+        "name leaves the data reachable through the other."
+    ),
+    "soft": (
+        "A pointer to another path in this file. It keeps working if the "
+        "target is replaced, and dangles if the target is removed."
+    ),
+    "external": (
+        "A pointer into another HDF5 file. This is how a Bliss master "
+        "refers to its scans: the data stays where it is and is only read "
+        "when something follows the link."
+    ),
+}
+
+
+class NewLinkDialog(QDialog):
+    """Kind, name and target for a new link.
+
+    The target is typed rather than picked from a tree: a link may point
+    at something that does not exist yet, which is legal HDF5 and
+    occasionally what the user means (writing the link before the scan
+    lands). The external file, by contrast, gets a real file picker,
+    because a mistyped filename is the one failure that looks identical
+    to a working link until someone follows it.
+    """
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        parent_path: str = "",
+        kind: str = "soft",
+        name: str = "",
+        target: str = "",
+        filename: str = "",
+        retarget: bool = False,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Retarget link" if retarget else "New link")
+        self._retarget = retarget
+        form = make_form(self)
+
+        if parent_path:
+            where = QLabel(
+                f"{'Link' if retarget else 'Inside'} {parent_path}", self)
+            where.setProperty("status", "muted")
+            form.addRow("", where)
+
+        self.kind_combo = QComboBox(self)
+        self.kind_combo.addItem("Soft link (a path in this file)", "soft")
+        self.kind_combo.addItem("External link (another file)", "external")
+        if not retarget:
+            # A hard link is the object itself, so there is nothing to
+            # retarget — h5_edit.retarget_link refuses it, and offering
+            # it here would only produce that message.
+            self.kind_combo.addItem("Hard link (a second name)", "hard")
+        index = self.kind_combo.findData(kind)
+        if index >= 0:
+            self.kind_combo.setCurrentIndex(index)
+        self.kind_combo.currentIndexChanged.connect(self._on_kind)
+        form.addRow("Kind:", self.kind_combo)
+
+        self.name_edit = QLineEdit(name, self)
+        self.name_edit.setPlaceholderText("the name the link appears under")
+        if retarget:
+            self.name_edit.setEnabled(False)
+        form.addRow("Name:", self.name_edit)
+
+        file_row = QWidget(self)
+        row = QHBoxLayout(file_row)
+        row.setContentsMargins(0, 0, 0, 0)
+        self.file_edit = QLineEdit(filename, file_row)
+        self.file_edit.setPlaceholderText("the HDF5 file to point into")
+        row.addWidget(self.file_edit, 1)
+        self.browse_btn = QPushButton("Browse…", file_row)
+        self.browse_btn.clicked.connect(self._on_browse)
+        row.addWidget(self.browse_btn)
+        self.file_row = file_row
+        form.addRow("File:", file_row)
+
+        self.target_edit = QLineEdit(target, self)
+        self.target_edit.setPlaceholderText("/entry_0000/data")
+        form.addRow("Target path:", self.target_edit)
+
+        self.help = QLabel("", self)
+        self.help.setProperty("status", "muted")
+        self.help.setWordWrap(True)
+        form.addRow("", self.help)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self._on_kind(self.kind_combo.currentIndex())
+
+    def _on_kind(self, _index: int) -> None:
+        kind = self.kind_combo.currentData()
+        self.file_row.setVisible(kind == "external")
+        self.help.setText(LINK_KIND_HELP.get(kind, ""))
+
+    def _on_browse(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Link to file", self.file_edit.text(),
+            "HDF5 files (*.h5 *.hdf5 *.nxs);;All files (*)",
+            options=QFileDialog.Option.DontUseNativeDialog,
+        )
+        if path:
+            self.file_edit.setText(path)
+
+    def result_values(self) -> tuple[str, str, str, str]:
+        """``(kind, name, target, filename)`` as chosen."""
+        return (
+            str(self.kind_combo.currentData()),
+            self.name_edit.text().strip(),
+            self.target_edit.text().strip(),
+            self.file_edit.text().strip(),
+        )

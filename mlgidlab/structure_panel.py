@@ -222,6 +222,10 @@ class StructurePanel(QWidget):
     scalarValueEdited = Signal(str)
     #: Put the changes list on the clipboard.
     copyChangesRequested = Signal()
+    #: Point this link somewhere else.
+    retargetLinkRequested = Signal()
+    #: Resolve this link and describe what it points at.
+    followLinkRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -369,6 +373,23 @@ class StructurePanel(QWidget):
         self._link_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
         card.body_layout.addWidget(self._link_label)
+
+        row = QHBoxLayout()
+        row.setSpacing(GAP)
+        self._follow_btn = QPushButton("Follow", card)
+        self._follow_btn.setToolTip(
+            "Open what this link points at and describe it here. Nothing "
+            "is resolved until you ask, which is what keeps a master of "
+            "external links quick to browse."
+        )
+        self._follow_btn.clicked.connect(self.followLinkRequested)
+        row.addWidget(self._follow_btn)
+        self._retarget_btn = QPushButton("Retarget…", card)
+        self._retarget_btn.setToolTip("Point this link at something else.")
+        self._retarget_btn.clicked.connect(self.retargetLinkRequested)
+        row.addWidget(self._retarget_btn)
+        row.addStretch(1)
+        card.body_layout.addLayout(row)
         return card
 
     def _build_check_card(self, parent: QWidget) -> Card:
@@ -484,6 +505,11 @@ class StructurePanel(QWidget):
         )
         self._value_edit.setEnabled(can_edit)
         self._value_set_btn.setEnabled(can_edit)
+        # A hard link is the object itself, so there is nothing to point
+        # elsewhere; only soft and external links can be retargeted.
+        self._retarget_btn.setEnabled(
+            can_edit and has_node and self._info.link.kind in ("soft", "external")
+        )
 
     def set_note(self, text: str, level: str = "muted") -> None:
         """A line under the type summary — why editing is off, mostly."""
@@ -535,6 +561,9 @@ class StructurePanel(QWidget):
 
         if info.link.kind != "hard":
             self._link_label.setText(info.link.describe())
+            # A followed link shows its target's type on the line above,
+            # so the Follow button has nothing left to do.
+            self._follow_btn.setVisible(info.kind == "link")
             self._link_card.show()
         else:
             self._link_card.hide()

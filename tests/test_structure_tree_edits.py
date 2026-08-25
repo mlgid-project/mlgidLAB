@@ -436,7 +436,8 @@ def _menu_labels(window, h5_path):
 
 def test_a_group_offers_the_full_menu(editing):
     labels = _menu_labels(editing, "/entry_0000")
-    assert labels == ["New group…", "New field…", "Rename…", "Delete"]
+    assert labels == [
+        "New group…", "New field…", "New link…", "Rename…", "Delete"]
 
 
 def test_a_dataset_cannot_hold_children(editing):
