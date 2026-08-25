@@ -852,7 +852,15 @@ class PeaksMixin:
         kinds are deferred per user scope. No-op + status-bar hint when
         nothing copyable is selected. The clipboard remembers the source
         entry so a same-entry paste check is enforced at paste time.
+
+        Ctrl+C is shared with the Structure tab, which copies a node
+        rather than a peak. The editor answers only while its tab is in
+        front or the File browser has focus; everywhere else this is
+        unchanged.
         """
+        if self._structure_owns_clipboard():
+            self._on_structure_copy()
+            return
         if self.session is None:
             return
         sels = [s for s in self.viewer.selected_peaks() if s.kind == "detected"]
@@ -891,7 +899,13 @@ class PeaksMixin:
         immediately and we can multi-select the pasted peaks after the
         reload. Pushes one grouped ``_CallbackAction`` so a single
         Ctrl+Z reverses the whole paste.
+
+        Shared with the Structure tab exactly as Ctrl+C is — see
+        ``_on_copy_peaks``.
         """
+        if self._structure_owns_clipboard():
+            self._on_structure_paste()
+            return
         if self._is_busy():
             return
         entry = self.entry_combo.currentText()

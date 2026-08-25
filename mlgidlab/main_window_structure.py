@@ -28,6 +28,7 @@ from PySide6.QtCore import QItemSelectionModel, QModelIndex, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
+    QFileDialog,
     QInputDialog,
     QMessageBox,
 )
@@ -48,10 +49,12 @@ from mlgidlab.h5_edit_ops import (
     SetAttrOp,
     WriteCellsOp,
 )
+from mlgidlab.structure_clipboard import StructureClip, free_name
 from mlgidlab.structure_dialogs import (
     NewDatasetDialog,
     NewGroupDialog,
     NewLinkDialog,
+    PickNodeDialog,
     parse_shape,
 )
 
@@ -671,6 +674,21 @@ class StructureMixin:
                 "Retarget link…",
                 lambda: self._on_structure_retarget_link(target),
             )
+        menu.addSeparator()
+        menu.addAction(
+            "Copy", lambda: self._on_structure_copy(target)
+        ).setEnabled(h5_path != "/")
+        menu.addAction(
+            "Cut", lambda: self._on_structure_copy(target, cut=True)
+        ).setEnabled(h5_path != "/")
+        paste = menu.addAction(
+            "Paste", lambda: self._on_structure_paste(target))
+        paste.setEnabled(getattr(self, "_structure_clip", None) is not None)
+        menu.addAction(
+            "Paste from file…",
+            lambda: self._on_structure_paste_from_file(target),
+        )
+        menu.addSeparator()
         menu.addAction(
             "Rename…", lambda: self._on_structure_rename(target)
         ).setEnabled(h5_path != "/")
@@ -1216,3 +1234,212 @@ class StructureMixin:
             node = nodes[0] if nodes else None
         if node is not None:
             self._render_structure_node(node, follow=True)
+
+    # -- copy and paste ----------------------------------------------------
+
+    def _structure_owns_clipboard(self) -> bool:
+        """Whether Ctrl+C / Ctrl+V belong to the editor right now.
+
+        The same two ways in as Ctrl+Z: the Structure tab in front, or
+        the File browser holding focus. Everywhere else these stay the
+        peak clipboard's, unchanged.
+        """
+        if not hasattr(self, "structure_panel"):
+            return False
+        in_editor = self.tabs.currentWidget() is self.structure_panel
+        in_browser = hasattr(self, "tree") and self.tree.hasFocus()
+        return in_editor or in_browser
+
+    def _structure_selected_target(self):
+        """``(file, path)`` for the current selection, however it was made."""
+        target = getattr(self, "_structure_target", None)
+        if target is not None:
+            return target
+        nodes = self._safe_selected_h5_nodes()
+        if not nodes:
+            return None
+        file_path = self._node_filename(nodes[0])
+        raw_path = self._node_h5_path(nodes[0])
+        if file_path is None or raw_path is None:
+            return None
+        return (Path(file_path), h5_edit.normalize_path(raw_path))
+
+    def _on_structure_copy(self, target=None, *, cut: bool = False) -> None:
+        """Put a node — or the selected attribute — on the clipboard.
+
+        A reference, not a payload: copying a 4 GB stack costs nothing
+        until it is pasted.
+        """
+        attr = self.structure_panel.selected_attribute()
+        if target is None:
+            target = self._structure_selected_target()
+        if target is None:
+            return
+        file_path, path = target
+        if attr and not cut:
+            self._structure_clip = StructureClip(
+                "attribute", Path(file_path), path, attr=attr)
+        else:
+            self._structure_clip = StructureClip(
+                "node", Path(file_path), path,
+                mode="cut" if cut else "copy")
+        self.statusBar().showMessage(self._structure_clip.describe(), 4000)
+
+    def _on_structure_paste(self, target=None) -> None:
+        """Paste the clipboard into the selected group."""
+        clip = getattr(self, "_structure_clip", None)
+        if clip is None:
+            return
+        if target is None:
+            target = self._structure_selected_target()
+        if target is None:
+            return
+        self._paste_clip(clip, target)
+
+    def _on_structure_paste_from_file(self, target=None) -> None:
+        """Pick a node in a file that is not open, and paste it here."""
+        if target is None:
+            target = self._structure_selected_target()
+        if target is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Copy from file", "",
+            "HDF5 / NeXus files (*.h5 *.hdf5 *.nxs);;All files (*)",
+            options=QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not path:
+            return
+        dialog = PickNodeDialog(path, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        source = dialog.selected_path()
+        if not source:
+            return
+        self._paste_clip(
+            StructureClip("node", Path(path), source), target)
+
+    def _paste_destination(self, handle, path: str) -> str | None:
+        """The group a paste lands in: the node itself, or its parent.
+
+        Dropping onto a dataset means "beside this", which is what a
+        user expects from every file manager they have ever used.
+        """
+        try:
+            info = h5_edit.node_info(handle.file, path)
+        except EditError as exc:
+            self._structure_failed("Paste", exc)
+            return None
+        if info.kind == "group":
+            return path
+        if path == "/":
+            return "/"
+        return h5_edit.split_path(path)[0]
+
+    def _paste_clip(self, clip, target) -> None:
+        opened = self._structure_handle_for(target)
+        if opened is None:
+            return
+        handle, path = opened
+        destination = self._paste_destination(handle, path)
+        if destination is None:
+            return
+
+        if clip.kind == "attribute":
+            self._paste_attribute(handle, clip, destination)
+            return
+
+        same_file = Path(clip.file_path) == handle.path
+        if clip.mode == "cut" and not same_file:
+            self._structure_failed(
+                "Paste",
+                EditError(
+                    "Cut moves a node inside one file. To bring it into "
+                    "another file, copy it and delete the original."
+                ),
+            )
+            return
+        if clip.mode == "cut" and h5_edit.normalize_path(destination).startswith(
+            clip.path.rstrip("/") + "/"
+        ):
+            self._structure_failed(
+                "Paste", EditError("A group cannot be moved inside itself."))
+            return
+
+        try:
+            existing = list(handle.file[destination].keys())
+        except (KeyError, OSError) as exc:
+            self._structure_failed("Paste", EditError(str(exc)))
+            return
+        name = self._ask_paste_name(clip.name, existing, destination)
+        if name is None:
+            return
+
+        if clip.mode == "cut":
+            try:
+                new_path = h5_edit.move_node(
+                    handle.file, clip.path, destination, name)
+            except EditError as exc:
+                self._structure_failed("Paste", exc)
+                return
+            self._structure_clip = None
+            self._commit_structure_change(
+                handle, MoveNodeOp(clip.path, new_path), new_path)
+            return
+
+        source_file = None if same_file else Path(clip.file_path)
+
+        def paste(f):
+            if source_file is None:
+                return h5_edit.copy_node(f, destination, name, f, clip.path)
+            with h5py.File(source_file, "r") as src:
+                return h5_edit.copy_node(f, destination, name, src, clip.path)
+
+        try:
+            new_path = paste(handle.file)
+        except (EditError, OSError) as exc:
+            self._structure_failed("Paste", EditError(str(exc)))
+            return
+        self._commit_structure_change(
+            handle, CreateNodeOp(new_path, "copy", recreate=paste), new_path)
+
+    def _ask_paste_name(self, wanted: str, existing, destination: str):
+        """The name to paste under, or None if the user backed out.
+
+        A free name goes in without a prompt. A collision asks, with a
+        suggestion pre-filled — silently renaming someone's data is how
+        a file ends up with ``q_xy_copy3`` and nobody knowing why.
+        """
+        if wanted not in set(existing):
+            return wanted
+        suggestion = free_name(existing, wanted)
+        name, ok = QInputDialog.getText(
+            self, "Paste",
+            f"{destination} already has {wanted!r}.\nPaste as:",
+            text=suggestion,
+        )
+        if not ok or not name.strip():
+            return None
+        return name.strip()
+
+    def _paste_attribute(self, handle, clip, destination: str) -> None:
+        """Copy one attribute onto the node the paste landed on."""
+        try:
+            if Path(clip.file_path) == handle.path:
+                value = h5_edit.read_attrs(handle.file, clip.path)[clip.attr]
+            else:
+                with h5py.File(clip.file_path, "r") as src:
+                    value = h5_edit.read_attrs(src, clip.path)[clip.attr]
+        except (EditError, KeyError, OSError) as exc:
+            self._structure_failed("Paste attribute", EditError(str(exc)))
+            return
+        # An attribute belongs to whatever is selected, group or dataset
+        # alike, so it pastes onto the node itself rather than its parent.
+        landing = self._structure_selected_target()
+        path = landing[1] if landing is not None else destination
+        try:
+            old = h5_edit.set_attr(handle.file, path, clip.attr, value)
+        except EditError as exc:
+            self._structure_failed("Paste attribute", exc)
+            return
+        self._commit_structure_edit(
+            handle, SetAttrOp(path, clip.attr, old, value), path)

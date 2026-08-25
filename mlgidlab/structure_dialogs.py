@@ -22,6 +22,9 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -331,3 +334,109 @@ class NewLinkDialog(QDialog):
             self.target_edit.text().strip(),
             self.file_edit.text().strip(),
         )
+
+
+class PickNodeDialog(QDialog):
+    """Choose a group or dataset inside another HDF5 file.
+
+    Backs *Paste from file…*: the source is not open in the app, so
+    there is no browser row to right-click. The tree fills one level at
+    a time, on expand, through a short-lived read handle.
+
+    Soft and external links are shown as leaves and never followed. A
+    master file's 226 entries therefore list instantly, and picking one
+    copies the link rather than the multi-GB scan behind it — which is
+    the same choice ``h5_edit.copy_node`` makes.
+    """
+
+    #: Stored on each row so a selection knows its in-file path without
+    #: rebuilding it from the tree's labels.
+    PATH_ROLE = Qt.ItemDataRole.UserRole
+
+    def __init__(self, file_path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        from pathlib import Path
+
+        self.file_path = Path(file_path)
+        self.setWindowTitle(f"Copy from {self.file_path.name}")
+        self.resize(460, 420)
+
+        column = QVBoxLayout(self)
+        hint = QLabel(
+            "Pick what to copy. Links are copied as links, so nothing "
+            "behind them is opened or duplicated.",
+            self,
+        )
+        hint.setProperty("status", "muted")
+        hint.setWordWrap(True)
+        column.addWidget(hint)
+
+        self.tree = QTreeWidget(self)
+        self.tree.setHeaderLabels(["Name", "Type"])
+        self.tree.itemExpanded.connect(self._on_expanded)
+        column.addWidget(self.tree, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        column.addWidget(buttons)
+
+        self._fill(None, "/")
+
+    def _fill(self, parent_item, path: str) -> None:
+        """List one group's children as rows, without following links."""
+        import h5py
+
+        from mlgidlab import h5_edit
+
+        try:
+            with h5py.File(self.file_path, "r") as f:
+                group = f[path] if path != "/" else f
+                if not isinstance(group, h5py.Group):
+                    return
+                rows = []
+                for name in group.keys():
+                    link = group.get(name, getlink=True)
+                    child_path = h5_edit.join_path(path, name)
+                    if isinstance(link, h5py.ExternalLink):
+                        rows.append((name, "external link", child_path, False))
+                    elif isinstance(link, h5py.SoftLink):
+                        rows.append((name, "soft link", child_path, False))
+                    else:
+                        obj = group.get(name)
+                        if isinstance(obj, h5py.Group):
+                            rows.append((name, "group", child_path, len(obj) > 0))
+                        elif obj is not None:
+                            rows.append(
+                                (name, str(obj.dtype), child_path, False))
+        except OSError as exc:
+            QTreeWidgetItem(self.tree, [f"cannot read: {exc}", ""])
+            return
+
+        for name, kind, child_path, expandable in rows:
+            item = (QTreeWidgetItem(parent_item, [name, kind])
+                    if parent_item is not None
+                    else QTreeWidgetItem(self.tree, [name, kind]))
+            item.setData(0, self.PATH_ROLE, child_path)
+            if expandable:
+                # A placeholder makes the row expandable without reading
+                # the group; the real children arrive on expand.
+                QTreeWidgetItem(item, ["…", ""])
+
+    def _on_expanded(self, item: QTreeWidgetItem) -> None:
+        if item.childCount() != 1 or item.child(0).text(0) != "…":
+            return
+        item.takeChildren()
+        path = item.data(0, self.PATH_ROLE)
+        if path:
+            self._fill(item, str(path))
+
+    def selected_path(self) -> str | None:
+        item = self.tree.currentItem()
+        if item is None:
+            return None
+        path = item.data(0, self.PATH_ROLE)
+        return str(path) if path else None

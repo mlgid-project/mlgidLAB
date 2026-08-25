@@ -372,6 +372,10 @@ class MainWindow(
         # Docks folded away because the Structure tab is in front, to be
         # restored on the way back to Image or Data.
         self._structure_folded_docks: set[str] = set()
+        # What the Structure tab holds between a Copy and a Paste. Kept
+        # apart from the peak clipboard: Ctrl+C means a different thing
+        # on each tab.
+        self._structure_clip = None
         # Tools → Export figure window. Built lazily on first open
         # (see ``_action_export_figure``); kept alive across re-opens
         # so settings persist. None until the user invokes Tools →

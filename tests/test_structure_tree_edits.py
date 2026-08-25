@@ -434,15 +434,22 @@ def _menu_labels(window, h5_path):
     return [a.text() for a in menu.actions() if a.text()]
 
 
-def test_a_group_offers_the_full_menu(editing):
-    labels = _menu_labels(editing, "/entry_0000")
-    assert labels == [
-        "New group…", "New field…", "New link…", "Rename…", "Delete"]
+#: What only a group can offer, since only a group holds children.
+CREATE_ACTIONS = {"New group…", "New field…", "New link…"}
+#: What any node offers.
+NODE_ACTIONS = {"Rename…", "Delete", "Copy", "Cut", "Paste"}
+
+
+def test_a_group_offers_the_create_actions(editing):
+    labels = set(_menu_labels(editing, "/entry_0000"))
+    assert CREATE_ACTIONS <= labels
+    assert NODE_ACTIONS <= labels
 
 
 def test_a_dataset_cannot_hold_children(editing):
-    labels = _menu_labels(editing, "/entry_0000/data/q_xy")
-    assert labels == ["Rename…", "Delete"]
+    labels = set(_menu_labels(editing, "/entry_0000/data/q_xy"))
+    assert not (CREATE_ACTIONS & labels)
+    assert NODE_ACTIONS <= labels
 
 
 def test_the_file_root_cannot_be_renamed_or_deleted(editing):
