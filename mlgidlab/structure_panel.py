@@ -226,6 +226,8 @@ class StructurePanel(QWidget):
     retargetLinkRequested = Signal()
     #: Resolve this link and describe what it points at.
     followLinkRequested = Signal()
+    #: Open the value grid for this dataset.
+    editValuesRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -364,6 +366,18 @@ class StructurePanel(QWidget):
         self._value_set_btn.clicked.connect(self._on_set_value)
         row.addWidget(self._value_set_btn)
         card.body_layout.addWidget(self._value_row)
+
+        grid_row = QHBoxLayout()
+        grid_row.setSpacing(GAP)
+        self._edit_values_btn = QPushButton("Edit values…", card)
+        self._edit_values_btn.setToolTip(
+            "Open this dataset in a grid. Compound tables get one column "
+            "per field, with row insert and delete."
+        )
+        self._edit_values_btn.clicked.connect(self.editValuesRequested)
+        grid_row.addWidget(self._edit_values_btn)
+        grid_row.addStretch(1)
+        card.body_layout.addLayout(grid_row)
         return card
 
     def _build_link_card(self, parent: QWidget) -> Card:
@@ -555,6 +569,8 @@ class StructurePanel(QWidget):
             self._value_row.setVisible(scalar)
             if scalar:
                 self._value_edit.setText(preview)
+            # One cell is a field to type into; anything else is a grid.
+            self._edit_values_btn.setVisible(not scalar)
             self._value_card.show()
         else:
             self._value_card.hide()

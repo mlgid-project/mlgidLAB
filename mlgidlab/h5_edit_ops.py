@@ -343,3 +343,35 @@ class RetargetLinkOp:
             f"{self.path}: {spell(self.before_kind, self.before_target, self.before_filename)}"
             f" → {spell(self.after_kind, self.after_target, self.after_filename)}"
         )
+
+
+@dataclass
+class ReplaceDataOp:
+    """A dataset's contents replaced wholesale, both sides remembered.
+
+    Used where a sparse cell diff cannot describe the change — a row
+    inserted or deleted alters the length, so every index after it moves.
+    Both arrays are held in memory, which is affordable because the grid
+    only opens on datasets small enough to edit by hand in the first
+    place (``h5_edit.VIEW_CELL_LIMIT``).
+    """
+
+    path: str
+    before: Any
+    after: Any
+
+    def redo(self, f: h5py.File) -> None:
+        h5_edit.rewrite_dataset(f, self.path, self.after)
+
+    def undo(self, f: h5py.File) -> None:
+        h5_edit.rewrite_dataset(f, self.path, self.before)
+
+    def describe(self) -> str:
+        rows_before = getattr(self.before, "shape", (0,))[:1]
+        rows_after = getattr(self.after, "shape", (0,))[:1]
+        if rows_before != rows_after:
+            return (
+                f"{self.path}: {rows_before[0] if rows_before else 0} → "
+                f"{rows_after[0] if rows_after else 0} rows"
+            )
+        return f"{self.path}: values replaced"

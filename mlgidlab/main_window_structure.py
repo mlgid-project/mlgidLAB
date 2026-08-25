@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import h5py
+import numpy as np
 from PySide6.QtCore import QItemSelectionModel, QModelIndex, Qt
 from PySide6.QtWidgets import (
     QApplication,
@@ -38,6 +39,7 @@ from silx.gui.hdf5 import Hdf5TreeModel
 
 from mlgidlab.browser_widgets import _ImageFileNode
 from mlgidlab.h5_edit import MISSING, EditError, EditHandle
+from mlgidlab.array_edit_dialog import ArrayEditDialog
 from mlgidlab.h5_edit_ops import (
     CreateNodeOp,
     DeleteLinkOp,
@@ -45,6 +47,7 @@ from mlgidlab.h5_edit_ops import (
     EditHistory,
     MoveNodeOp,
     RenameAttrOp,
+    ReplaceDataOp,
     RetargetLinkOp,
     SetAttrOp,
     WriteCellsOp,
@@ -1443,3 +1446,99 @@ class StructureMixin:
             return
         self._commit_structure_edit(
             handle, SetAttrOp(path, clip.attr, old, value), path)
+
+    # -- the value grid ----------------------------------------------------
+
+    def _on_structure_edit_values(self) -> None:
+        """Open the dataset on show in the value grid.
+
+        Three bands, by size. Small enough to edit by hand: an editable
+        grid. Large but still loadable: read-only, with an explicit "Edit
+        anyway" — a grid over a detector image is a way to make a mistake,
+        not a way to fix one. Beyond that it is not loaded at all, because
+        the grid holds the whole array in memory and the Data tab already
+        streams what it cannot.
+        """
+        target = getattr(self, "_structure_target", None)
+        if target is None:
+            return
+        opened = self._structure_handle_for(target)
+        if opened is None:
+            return
+        handle, path = opened
+        try:
+            info = h5_edit.node_info(handle.file, path)
+            if info.kind != "dataset":
+                raise EditError(f"{path} is not a dataset.")
+            if info.n_cells > h5_edit.VIEW_CELL_LIMIT:
+                raise EditError(
+                    f"{path} holds {info.n_cells:,} values — too many to "
+                    "load into a grid. Use the Data tab to look at it."
+                )
+            array = h5_edit.read_block(handle.file, path)
+        except EditError as exc:
+            self._structure_failed("Edit values", exc)
+            return
+
+        editable = info.n_cells <= h5_edit.EDITABLE_CELL_LIMIT
+        reason = "" if editable else (
+            f"{info.n_cells:,} values — opened read-only so a stray "
+            "keystroke cannot rewrite a detector image."
+        )
+        dialog = ArrayEditDialog(
+            self, path=path, array=array, editable=editable,
+            read_only_reason=reason,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._apply_grid_result(handle, path, array, dialog.result_array())
+
+    def _apply_grid_result(self, handle, path, before, after) -> None:
+        """Turn what the grid returned into one undoable edit.
+
+        A changed row count moves every index after it, so a sparse cell
+        diff cannot describe it — that becomes a whole-array replace. An
+        ordinary edit session touches a handful of cells out of however
+        many, so it stays sparse and its undo costs the same handful.
+        """
+        replace = before.shape != after.shape or before.dtype != after.dtype
+        changed = {} if replace else self._diff_cells(before, after)
+        if not replace and not changed:
+            # OK on a grid nobody typed into. Nothing happened, so
+            # nothing is asked and nothing is recorded.
+            return
+        protection = h5_edit.protection_reason(path)
+        if protection and not self._confirm_protected("Change", path, protection):
+            return
+        try:
+            if replace:
+                h5_edit.rewrite_dataset(handle.file, path, after)
+                op = ReplaceDataOp(path, before, after)
+            else:
+                previous = h5_edit.write_cells(handle.file, path, changed)
+                op = WriteCellsOp(path, previous, changed)
+        except EditError as exc:
+            self._structure_failed("Edit values", exc)
+            return
+        self._commit_structure_edit(handle, op, path)
+
+    @staticmethod
+    def _diff_cells(before, after) -> dict:
+        """``{index: new value}`` for every cell that differs.
+
+        Compound arrays are compared field by field so the index is
+        ``(row, field)`` — the same shape ``write_cells`` takes, and the
+        same one an undo writes back.
+        """
+        changed: dict = {}
+        if before.dtype.names:
+            for field in before.dtype.names:
+                rows = np.nonzero(before[field] != after[field])[0]
+                for row in rows:
+                    changed[(int(row), field)] = after[field][row]
+            return changed
+        if before.ndim == 0:
+            return {(): after[()]} if before[()] != after[()] else {}
+        for index in zip(*np.nonzero(before != after)):
+            changed[tuple(int(i) for i in index)] = after[index]
+        return changed

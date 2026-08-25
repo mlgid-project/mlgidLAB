@@ -93,6 +93,12 @@ DTYPE_CHOICES: tuple[str, ...] = (
 #: cell. 250k cells is a 500 x 500 array — comfortably interactive.
 EDITABLE_CELL_LIMIT = 250_000
 
+#: Above this many cells a dataset is not loaded into the grid at all.
+#: The grid holds the whole array in memory and in a table model; 5M
+#: cells is ~20 MB of float32 and already an unreasonable thing to edit
+#: by hand. Bigger datasets are viewed in the Data tab, which streams.
+VIEW_CELL_LIMIT = 5_000_000
+
 #: Deletes whose payload is at most this large are snapshotted in memory
 #: and can be undone. Above it the GUI warns that the delete is final.
 #: 64 MB holds any metadata group and any realistic peak table, while
