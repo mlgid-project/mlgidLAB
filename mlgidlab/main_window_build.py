@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QSettings, QTimer, Qt
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -79,6 +79,10 @@ from mlgidlab import icons
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+#: QSettings key for whether the workflow strip is open or folded.
+RAIL_EXPANDED_KEY = "view/workflow_rail_expanded"
 
 
 def _dirty_dot(diameter: int = 8) -> QPixmap:
@@ -153,6 +157,16 @@ class BuildMixin:
         self.workflow_rail = WorkflowRail(central)
         self.workflow_rail.stageActivated.connect(self._on_rail_stage_activated)
         self.workflow_rail.stageRunRequested.connect(self._on_rail_stage_run)
+        # Folded or open is a per-user preference, like the playback
+        # settings: someone who works from the docks wants the height
+        # back and should not have to reclaim it every launch.
+        self.workflow_rail.set_expanded(
+            str(QSettings().value(RAIL_EXPANDED_KEY, "true")).lower() != "false"
+        )
+        self.workflow_rail.expandedChanged.connect(
+            lambda expanded: QSettings().setValue(
+                RAIL_EXPANDED_KEY, bool(expanded))
+        )
         self.workflow_rail.hide()
         col.addWidget(self.workflow_rail)
         # The tabs share the column with a welcome page, shown whenever

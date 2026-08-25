@@ -942,6 +942,10 @@ class FramesMixin:
             and self._pending_structure_node is not None
         ):
             self._render_structure_node(self._pending_structure_node)
+        # The Structure tab needs the file browser and nothing else, so
+        # the side and bottom docks fold away while it is up and come
+        # back exactly as they were on the way out.
+        self._sync_structure_docks()
 
     def _activate_entry_for_node(self, node) -> None:
         """If the clicked node is inside an ``entry_*`` group, switch the

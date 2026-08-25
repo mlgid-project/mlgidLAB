@@ -369,6 +369,9 @@ class MainWindow(
         # edit and released by ``_detach_silx_tree``.
         self._h5_edit_handle = None
         self._structure_histories: dict = {}
+        # Docks folded away because the Structure tab is in front, to be
+        # restored on the way back to Image or Data.
+        self._structure_folded_docks: set[str] = set()
         # Tools → Export figure window. Built lazily on first open
         # (see ``_action_export_figure``); kept alive across re-opens
         # so settings persist. None until the user invokes Tools →

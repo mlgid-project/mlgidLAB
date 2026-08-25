@@ -955,6 +955,10 @@ class FilesMixin:
             if kind_menu is not None:
                 kind_menu.menuAction().setEnabled(not is_raw)
         self._refresh_workflow_rail()
+        # A mode change decides dock visibility from scratch, which would
+        # pop the side and bottom docks back up while the Structure tab
+        # is in front. Re-apply that tab's own rule afterwards.
+        self._sync_structure_docks()
         self._hide_stale_dock_tab_bars()
         # Re-tabifying above rebuilds the tab entries, and a fresh tab
         # comes up without an icon (Qt reads the dock's windowIcon only

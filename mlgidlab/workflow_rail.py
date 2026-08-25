@@ -18,7 +18,7 @@ looking at is already in memory.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -31,6 +31,10 @@ from PySide6.QtWidgets import (
 from mlgidlab import icons
 from mlgidlab.flow_layout import install_flow
 from mlgidlab.widgets import GAP, PAD
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 #: (key, label, glyph). Order is the order of the workflow, which is the
 #: whole point of the strip.
@@ -139,6 +143,8 @@ class WorkflowRail(QWidget):
     stageActivated = Signal(str)
     #: A stage's run glyph was clicked.
     stageRunRequested = Signal(str)
+    #: The strip was collapsed or expanded, so the choice can be persisted.
+    expandedChanged = Signal(bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -146,20 +152,75 @@ class WorkflowRail(QWidget):
         outer = install_flow(self, margins=(PAD, 2, PAD, 2),
                              hspacing=GAP, vspacing=GAP)
 
+        # The collapse control leads the row, so the strip reads as one
+        # thing that can be folded away rather than as chips with a
+        # stray button after them. The flow layout skips hidden widgets,
+        # so collapsing genuinely reclaims the height.
+        self._toggle = QToolButton(self)
+        self._toggle.setAutoRaise(True)
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(True)
+        self._toggle.setIconSize(QSize(14, 14))
+        self._toggle.toggled.connect(self._on_toggled)
+        outer.addWidget(self._toggle)
+
         self.chips: dict[str, _StageChip] = {}
+        self._blocks: list[_StageBlock] = []
         for index, (key, label, glyph) in enumerate(STAGES):
             chip = _StageChip(key, label, glyph, self)
             chip.activated.connect(self.stageActivated)
             chip.runRequested.connect(self.stageRunRequested)
-            outer.addWidget(
-                _StageBlock(chip, with_arrow=index < len(STAGES) - 1, parent=self)
-            )
+            block = _StageBlock(
+                chip, with_arrow=index < len(STAGES) - 1, parent=self)
+            outer.addWidget(block)
+            self._blocks.append(block)
             self.chips[key] = chip
+
+        # Stands in for the chips when they are folded away, so the
+        # remaining row still says what it is.
+        self._folded_label = QLabel("Workflow", self)
+        self._folded_label.setProperty("status", "muted")
+        self._folded_label.hide()
+        outer.addWidget(self._folded_label)
+        self._apply_expanded()
 
         line = QFrame(self)
         line.setFrameShape(QFrame.Shape.HLine)
         line.setFrameShadow(QFrame.Shadow.Plain)
         line.setFixedHeight(1)
+
+    # -- collapsing ----------------------------------------------------
+
+    def is_expanded(self) -> bool:
+        return self._toggle.isChecked()
+
+    def set_expanded(self, expanded: bool) -> None:
+        """Show or fold the stage chips. Emits ``expandedChanged``."""
+        if bool(expanded) != self._toggle.isChecked():
+            self._toggle.setChecked(bool(expanded))
+
+    def _on_toggled(self, expanded: bool) -> None:
+        self._apply_expanded()
+        self.expandedChanged.emit(bool(expanded))
+
+    def _apply_expanded(self) -> None:
+        expanded = self._toggle.isChecked()
+        for block in self._blocks:
+            block.setVisible(expanded)
+        self._folded_label.setVisible(not expanded)
+        self._toggle.setToolTip(
+            "Fold the workflow strip away" if expanded
+            else "Show the workflow strip"
+        )
+        try:
+            from mlgidlab import icons
+            icons.bind(
+                self._toggle,
+                "chevron-down" if expanded else "chevron-right",
+            )
+        except Exception:  # pragma: no cover - a missing asset costs an icon
+            logger.debug("no chevron for the workflow rail", exc_info=True)
+        self.updateGeometry()
 
     # -- state ---------------------------------------------------------
 

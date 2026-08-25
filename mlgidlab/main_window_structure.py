@@ -1019,3 +1019,51 @@ class StructureMixin:
             logger.debug("re-acquiring the edit handle failed", exc_info=True)
         self._reattach_tree_safely()
         self._restore_tree_state(state)
+
+    # -- dock visibility ---------------------------------------------------
+
+    #: The docks the Structure tab folds away. The File browser is not
+    #: among them on purpose: it is this tab's navigator, so hiding it
+    #: would leave the panel with nothing to describe.
+    _STRUCTURE_FOLDED_DOCKS = (
+        "_display_dock",
+        "_pipeline_dock",
+        "_sim_dock",
+        "_conversion_dock",
+        "_logs_dock",
+        "_profile_dock",
+        "_peaks_dock",
+        "_scan_tracking_dock",
+    )
+
+    def _sync_structure_docks(self) -> None:
+        """Fold the side and bottom docks away while the Structure tab is up.
+
+        Nothing in Display, Pipeline, Profiles, Peaks or Scan tracking
+        applies to editing a file's structure, and on a laptop they leave
+        the panel a narrow column. They come back exactly as they were:
+        only docks that were actually open when the tab was entered are
+        remembered, so one the user had already closed — or one the
+        session mode hides, like Conversion on a converted file — stays
+        closed on the way out.
+
+        The set is added to rather than replaced, because a session-mode
+        change can re-show a dock while the tab is still in front.
+        """
+        if not hasattr(self, "structure_panel") or not hasattr(self, "tabs"):
+            return
+        on_structure = self.tabs.currentWidget() is self.structure_panel
+        if on_structure:
+            for name in self._STRUCTURE_FOLDED_DOCKS:
+                dock = getattr(self, name, None)
+                if dock is not None and dock.isVisible():
+                    self._structure_folded_docks.add(name)
+                    dock.hide()
+            return
+        if not self._structure_folded_docks:
+            return
+        for name in self._structure_folded_docks:
+            dock = getattr(self, name, None)
+            if dock is not None:
+                dock.show()
+        self._structure_folded_docks.clear()
