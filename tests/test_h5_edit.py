@@ -590,6 +590,76 @@ def test_search_matches_names_attributes_and_values(simple_h5):
         assert any(h.where == "attribute" for h in hits)
 
 
+def test_search_reads_a_small_dataset_value(simple_h5):
+    """NeXus metadata is small string datasets, and those are exactly
+    what someone searching a file is looking for."""
+    with h5py.File(simple_h5, "r") as f:
+        hits, _ = h5_edit.walk_search(f, "sample A")
+    assert [(h.path, h.where) for h in hits] == [("/meta/name", "data")]
+
+
+def test_search_leaves_a_big_dataset_unread(simple_h5, monkeypatch):
+    """The bound is what keeps a search from becoming a file read.
+
+    ``size`` is answered by the dataspace, so a detector stack is
+    skipped without a byte of it being touched. Pinned with a cap below
+    the file's own six-element dataset, so the same file has one
+    dataset on each side of the line.
+    """
+    monkeypatch.setattr(h5_edit, "VALUE_SCAN_MAX", 2)
+    with h5py.File(simple_h5, "r") as f:
+        assert h5_edit._dataset_text(f["/meta/counts"]) == ""
+        assert h5_edit._dataset_text(f["/meta/name"]) == "sample A"
+        # ...and the walk therefore cannot match on what it did not read.
+        assert h5_edit.walk_search(
+            f, "0, 1, 2", include_attrs=False)[0] == []
+
+
+def test_a_slash_query_is_a_place_and_a_term(simple_h5):
+    """``meta/counts``: something matching counts, under something
+    matching meta."""
+    with h5py.File(simple_h5, "r") as f:
+        hits, _ = h5_edit.walk_search(f, "meta/counts")
+        assert [h.path for h in hits] == ["/meta/counts"]
+
+        # The lead has to be there. ``nowhere`` matches no component.
+        assert h5_edit.walk_search(f, "nowhere/counts")[0] == []
+
+
+def test_the_lead_need_not_be_adjacent(simple_h5):
+    """What the user knows is the shape of the file, not every group
+    between one landmark and the next."""
+    with h5py.File(simple_h5, "r+") as f:
+        f.create_group("/meta/a/b").create_dataset("counts", data=1)
+    with h5py.File(simple_h5, "r") as f:
+        hits, _ = h5_edit.walk_search(f, "meta/counts")
+    assert "/meta/a/b/counts" in [h.path for h in hits]
+
+
+def test_a_slash_is_still_searchable_as_itself(simple_h5):
+    """``1/Angstrom`` is a unit, ``m/s`` is a unit. Reading every slash
+    as a path would quietly stop finding them."""
+    with h5py.File(simple_h5, "r+") as f:
+        f["/meta/counts"].attrs["units"] = "1/Angstrom"
+    with h5py.File(simple_h5, "r") as f:
+        hits, _ = h5_edit.walk_search(f, "1/Angstrom")
+    assert [(h.path, h.where) for h in hits] == [("/meta/counts", "value")]
+
+
+def test_case_sensitivity_is_a_choice(simple_h5):
+    with h5py.File(simple_h5, "r") as f:
+        assert h5_edit.walk_search(f, "COUNTS")[0]
+        assert not h5_edit.walk_search(f, "COUNTS", case_sensitive=True)[0]
+        assert h5_edit.walk_search(f, "counts", case_sensitive=True)[0]
+
+
+def test_case_sensitivity_applies_to_a_slash_query(simple_h5):
+    with h5py.File(simple_h5, "r") as f:
+        assert h5_edit.walk_search(f, "META/counts")[0]
+        assert not h5_edit.walk_search(
+            f, "META/counts", case_sensitive=True)[0]
+
+
 def test_search_reports_truncation(simple_h5):
     with h5py.File(simple_h5, "r") as f:
         _, truncated = h5_edit.walk_search(f, "meta", max_nodes=1)

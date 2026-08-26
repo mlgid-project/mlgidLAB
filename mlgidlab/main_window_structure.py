@@ -2083,7 +2083,8 @@ class StructureMixin:
 
     # -- search ------------------------------------------------------------
 
-    def _on_structure_search(self, text: str) -> None:
+    def _on_structure_search(self, text: str,
+                             case_sensitive: bool = False) -> None:
         """Search the file on show for ``text`` and list what matched.
 
         Bounded and link-blind: the walk descends only into hard links,
@@ -2103,7 +2104,8 @@ class StructureMixin:
                 self.structure_panel.set_search_results([], False)
                 return
             try:
-                hits, truncated = h5_edit.walk_search(f, text)
+                hits, truncated = h5_edit.walk_search(
+                    f, text, case_sensitive=case_sensitive)
             except Exception:
                 logger.debug("structure search failed", exc_info=True)
                 hits, truncated = [], False

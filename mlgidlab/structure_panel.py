@@ -404,8 +404,8 @@ class StructurePanel(QWidget):
     followLinkRequested = Signal()
     #: Open the value grid for this dataset.
     editValuesRequested = Signal()
-    #: Find nodes whose name or attributes match this text.
-    searchRequested = Signal(str)
+    #: ``(query, case_sensitive)`` — find nodes matching this.
+    searchRequested = Signal(str, bool)
     #: Go to this in-file path.
     searchResultActivated = Signal(str)
     #: One of ``NODE_ACTIONS``' verbs, or copy/cut/paste/rename/delete —
@@ -650,7 +650,7 @@ class StructurePanel(QWidget):
         return card
 
     def _build_search_card(self, parent: QWidget) -> Card:
-        """Find a node by name, attribute name or attribute value.
+        """Find a node by name, path, value or attribute.
 
         Deliberately a jump list rather than a filter on the browser
         tree: filtering silx's model would ask it to resolve rows to
@@ -663,10 +663,25 @@ class StructurePanel(QWidget):
         row.setSpacing(GAP)
         self._search_edit = QLineEdit(card)
         self._search_edit.setPlaceholderText(
-            "name, attribute or value — e.g. wavelength, NX_class, 1/Angstrom")
+            "name, value, or a path — e.g. wavelength, sample/material")
         self._search_edit.setClearButtonEnabled(True)
         self._search_edit.returnPressed.connect(self._on_search)
         row.addWidget(self._search_edit, 1)
+        # "Aa" rather than a word: this is the narrowest region of the
+        # tab, and the toggle has to leave the field itself usable.
+        self._case_btn = QToolButton(card)
+        self._case_btn.setText("Aa")
+        self._case_btn.setCheckable(True)
+        self._case_btn.setProperty("variant", "toggle")
+        self._case_btn.setToolTip(
+            "Match upper and lower case exactly.\n"
+            "Off by default: searching a file someone else wrote means "
+            "not knowing how they capitalised things."
+        )
+        # Flipping it re-runs whatever is in the box, so the toggle
+        # answers a question rather than only arming the next search.
+        self._case_btn.toggled.connect(lambda _: self._on_search())
+        row.addWidget(self._case_btn)
         self._search_btn = QPushButton("Find", card)
         self._search_btn.clicked.connect(self._on_search)
         row.addWidget(self._search_btn)
@@ -684,9 +699,13 @@ class StructurePanel(QWidget):
         # version of why links are never followed lives in the tooltip.
         attach_empty_hint(self._search_list, "Nothing searched yet.")
         self._search_list.setToolTip(
-            "Searches names, attribute names and attribute values. Links "
-            "are never followed, so a master of external scans answers as "
-            "fast as any other file."
+            "Searches names, small dataset values, attribute names and "
+            "attribute values.\n\n"
+            "A query with a slash is a place and then a term: "
+            "sample/material finds a match for 'material' under a group "
+            "matching 'sample'. The parts do not have to be adjacent.\n\n"
+            "Links are never followed, so a master of external scans "
+            "answers as fast as any other file."
         )
         card.body_layout.addWidget(self._search_list)
         return card
@@ -694,7 +713,11 @@ class StructurePanel(QWidget):
     def _on_search(self) -> None:
         text = self._search_edit.text().strip()
         if text:
-            self.searchRequested.emit(text)
+            self.searchRequested.emit(text, self._case_btn.isChecked())
+
+    def case_sensitive(self) -> bool:
+        """Whether the Aa toggle is on, for the window and the tests."""
+        return self._case_btn.isChecked()
 
     def _on_search_activated(self, item) -> None:
         path = item.data(_ATTR_NAME_ROLE)

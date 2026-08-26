@@ -66,6 +66,21 @@ pre-releases.
   visible benefit. Switching entry from the toolbar while editing is
   now instant; the image catches up when you go back to it.
 
+- **Find takes a path, and can be told to respect case.** A query with
+  a slash is read as a place and then a term: `sample/material` finds a
+  match for *material* under a group matching *sample*, and the parts do
+  not have to be adjacent. Searching for a slash still works —
+  `1/Angstrom` is a unit — because both readings run over the same walk.
+  The new **Aa** button matches upper and lower case exactly; it is off
+  by default, and flipping it re-runs what is in the box. Between them,
+  a two-letter term like `Si` is usable in a file that also contains
+  *signal* and *silicon*.
+
+  Find now also searches **small dataset values**, which is where NeXus
+  keeps most of its metadata — a sample name, a chemical formula, a
+  start time. Large datasets are skipped by their declared size, so a
+  detector stack is never read to answer a search.
+
 - **Rename a node where its name is printed.** The Structure tab's
   header splits at the last `/`: where the node lives stays muted and
   read-only, and its own name can be typed over. Double-click it (or

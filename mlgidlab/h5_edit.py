@@ -1157,8 +1157,69 @@ def _walk_hard(f: h5py.File, path: str = "/") -> Iterator[tuple[str, Any]]:
 @dataclass(frozen=True)
 class SearchHit:
     path: str
-    where: Literal["name", "attribute", "value"]
+    #: ``name`` the node's own name, ``data`` a small dataset's value,
+    #: ``attribute`` an attribute's name, ``value`` an attribute's value.
+    where: Literal["name", "data", "attribute", "value"]
     detail: str
+
+
+#: How many elements a dataset may hold before its value is skipped by
+#: a search. NeXus metadata is small strings and scalars — a sample
+#: name, a chemical formula, a start time — and those are exactly what
+#: someone searching a file is looking for. A detector stack is not, and
+#: reading one per node would turn a search into a file read. ``size``
+#: comes from the dataspace, so the big ones are skipped without ever
+#: being touched.
+VALUE_SCAN_MAX = 16
+
+
+def parse_search(query: str) -> tuple[tuple[str, ...], str]:
+    """``"sample/material/Si"`` -> ``(("sample", "material"), "Si")``.
+
+    Everything before the last ``/`` is where to look; the last part is
+    what to look for. A query with no ``/`` is the plain form and comes
+    back with an empty lead.
+    """
+    parts = [part.strip() for part in query.split("/")]
+    parts = [part for part in parts if part]
+    if not parts:
+        return (), ""
+    return tuple(parts[:-1]), parts[-1]
+
+
+def _lead_matches(components: list[str], lead: tuple[str, ...]) -> bool:
+    """Whether ``lead`` appears along ``components``, in order.
+
+    A subsequence, not a prefix and not adjacency: ``sample/material``
+    finds ``/entry_0000/instrument/sample/x/material`` because what the
+    user knows is the shape of the file, not every group between.
+    Both sides arrive already case-folded.
+    """
+    remaining = iter(components)
+    for want in lead:
+        for component in remaining:
+            if want in component:
+                break
+        else:
+            return False
+    return True
+
+
+def _dataset_text(obj: Any) -> str:
+    """A small dataset's value as one line, or ``""``.
+
+    Bounded by ``VALUE_SCAN_MAX`` and defended: a search must not raise
+    on the one dataset in a file with an exotic dtype.
+    """
+    if not isinstance(obj, h5py.Dataset):
+        return ""
+    try:
+        if obj.size > VALUE_SCAN_MAX:
+            return ""
+        return format_value(obj[()])
+    except Exception:
+        logger.debug("reading a dataset value for search failed", exc_info=True)
+        return ""
 
 
 def walk_search(
@@ -1170,34 +1231,68 @@ def walk_search(
     case_sensitive: bool = False,
     include_attrs: bool = True,
 ) -> tuple[list[SearchHit], bool]:
-    """Find nodes whose name or attributes match ``query``.
+    """Find nodes matching ``query`` by name, attribute or small value.
+
+    ``query`` may carry slashes, and then it is *also* read as a place
+    followed by a term: ``material/Si`` is "something matching Si,
+    somewhere under a group matching material". That is what makes a
+    common word usable — plain ``Si`` matches every ``signal`` in the
+    file too, and no amount of reading the list fixes that.
+
+    Also, not instead. A slash is a legitimate thing to search *for*:
+    ``1/Angstrom`` is a unit, ``m/s`` is a unit, and reading those as a
+    path would quietly stop finding them. So both readings run over one
+    walk and a node matches on either. They do not compete for hits in
+    practice: nothing in an HDF5 file is literally named
+    ``material/Si``, and nothing lives under a group called ``1``.
+
+    ``case_sensitive`` is off by default because someone searching a
+    file they did not write does not know how its author capitalised
+    things. It is offered because sometimes they do, and in a file about
+    silicon ``Si`` is not ``si``.
 
     Returns ``(hits, truncated)``. ``truncated`` says the walk hit
     ``max_nodes`` and stopped, so the UI can say so rather than implying
     the result is complete. Never follows a soft or external link.
     """
-    needle = query if case_sensitive else query.lower()
-    if not needle:
+    fold = (lambda text: text) if case_sensitive else (lambda text: text.lower())
+    whole = fold(query.strip())
+    if not whole:
         return [], False
+    lead, term = parse_search(query)
+    lead = tuple(fold(part) for part in lead)
+    needle = fold(term)
+
+    def matches(text: str, scoped: bool) -> bool:
+        """The two readings, in one test. ``scoped`` says the node's
+        path satisfied the lead, so the term alone is enough for it."""
+        hay = fold(text)
+        return whole in hay or (scoped and needle in hay)
+
     hits: list[SearchHit] = []
     seen = 0
     for path, obj in _walk_hard(f, root):
         seen += 1
         if seen > max_nodes:
             return hits, True
+        scoped = bool(lead) and _lead_matches(
+            [fold(part) for part in path.split("/") if part], lead
+        )
         name = path.rsplit("/", 1)[-1]
-        haystack = name if case_sensitive else name.lower()
-        if needle in haystack:
+        if matches(name, scoped):
             hits.append(SearchHit(path, "name", name))
-        if not include_attrs or isinstance(obj, (h5py.SoftLink, h5py.ExternalLink)):
+        if isinstance(obj, (h5py.SoftLink, h5py.ExternalLink)):
+            continue
+        text = _dataset_text(obj)
+        if text and matches(text, scoped):
+            hits.append(SearchHit(path, "data", text))
+        if not include_attrs:
             continue
         for key, value in obj.attrs.items():
-            key_hay = key if case_sensitive else key.lower()
             text = format_value(value)
-            val_hay = text if case_sensitive else text.lower()
-            if needle in key_hay:
+            if matches(key, scoped):
                 hits.append(SearchHit(path, "attribute", f"{key} = {text}"))
-            elif needle in val_hay:
+            elif matches(text, scoped):
                 hits.append(SearchHit(path, "value", f"{key} = {text}"))
     return hits, False
 

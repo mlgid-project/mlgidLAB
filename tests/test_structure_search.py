@@ -79,10 +79,77 @@ def test_an_attribute_value_match(editing, monkeypatch):
     assert any("q_xy" in row and "1/Angstrom" in row for row in rows)
 
 
-def test_the_search_is_case_insensitive(editing, monkeypatch):
+def test_the_search_is_case_insensitive_by_default(editing, monkeypatch):
     _show(editing, "/entry_0000", monkeypatch)
     editing._on_structure_search("SAMPLE")
     assert editing.structure_panel.search_rows()
+    assert not editing.structure_panel.case_sensitive()
+
+
+# The two things that make a common word usable in a real file. Searching
+# "Si" in a silicon dataset also matches every "signal" and every
+# "silicon" in the file, and no amount of reading the list fixes that.
+
+
+def test_a_path_query_narrows_a_common_word(editing, monkeypatch):
+    _show(editing, "/entry_0000", monkeypatch)
+
+    editing._on_structure_search("formula")
+    broad = editing.structure_panel.search_rows()
+    editing._on_structure_search("sample/formula")
+    narrow = editing.structure_panel.search_rows()
+
+    assert any("chemical_formula" in row for row in narrow)
+    assert len(narrow) <= len(broad)
+    # The lead has to be somewhere on the path.
+    editing._on_structure_search("detector/formula")
+    assert editing.structure_panel.search_rows() == []
+
+
+def test_a_dataset_value_is_searchable(editing, monkeypatch):
+    """``chemical_formula`` holds its value in the dataset, not an
+    attribute — which is where NeXus keeps most of its metadata."""
+    _show(editing, "/entry_0000", monkeypatch)
+    editing._on_structure_search("C62H68N2O2S5")
+    rows = editing.structure_panel.search_rows()
+    assert any("chemical_formula" in row for row in rows)
+
+
+def test_the_case_toggle_changes_the_answer(editing, monkeypatch):
+    panel = editing.structure_panel
+    _show(editing, "/entry_0000", monkeypatch)
+    panel._search_edit.setText("SAMPLE")
+
+    panel._on_search()
+    assert panel.search_rows()
+
+    panel._case_btn.setChecked(True)
+    assert panel.case_sensitive()
+    assert panel.search_rows() == []
+
+
+def test_flipping_the_toggle_re_runs_the_search(editing, monkeypatch):
+    """It answers a question rather than only arming the next search."""
+    panel = editing.structure_panel
+    _show(editing, "/entry_0000", monkeypatch)
+    asked = []
+    panel.searchRequested.connect(lambda text, cs: asked.append((text, cs)))
+    panel._search_edit.setText("sample")
+
+    panel._case_btn.setChecked(True)
+
+    assert asked == [("sample", True)]
+
+
+def test_an_empty_box_is_not_re_run_by_the_toggle(editing, monkeypatch):
+    panel = editing.structure_panel
+    _show(editing, "/entry_0000", monkeypatch)
+    asked = []
+    panel.searchRequested.connect(lambda text, cs: asked.append((text, cs)))
+
+    panel._case_btn.setChecked(True)
+
+    assert asked == []
 
 
 def test_no_match_says_so(editing, monkeypatch):
