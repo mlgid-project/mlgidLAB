@@ -66,6 +66,18 @@ pre-releases.
   visible benefit. Switching entry from the toolbar while editing is
   now instant; the image catches up when you go back to it.
 
+- **Shift-select in the Structure tree, and copy a whole range at once.**
+  The tab's tree takes extended selections, and Copy, Cut and Delete act
+  on all of it — the context menu says "Copy 6 nodes" so it is clear
+  which it means. Everything else stays per-node, since there is no
+  sensible reading of "rename these six".
+
+  The whole batch is **one entry in the changes list and one Ctrl+Z**,
+  not one per node. Selecting a group and one of its children copies the
+  group once rather than pasting the child twice. A node whose name
+  clashes still asks, and backing out of that one leaves the rest of the
+  batch to land.
+
 - **Find takes a path, and can be told to respect case.** A query with
   a slash is read as a place and then a term: `sample/material` finds a
   match for *material* under a group matching *sample*, and the parts do

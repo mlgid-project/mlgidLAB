@@ -457,17 +457,29 @@ def test_a_stale_division_is_ignored_rather_than_applied(workspace):
 
 def test_the_action_row_routes_to_the_same_handlers(workspace, opened,
                                                     monkeypatch):
-    """The row and the context menu must not be two sets of rules."""
+    """The row and the context menu must not be two sets of rules.
+
+    Per-node verbs are handed the selected target. Copy, cut and delete
+    are handed nothing, on purpose: they act on the whole tree
+    selection, so each reads it for itself rather than being pinned to
+    whichever row a shift-pick left current.
+    """
     called = []
     monkeypatch.setattr(
         opened, "_structure_selected_target", lambda: ("f.h5", "/entry"))
+    monkeypatch.setattr(
+        opened, "_structure_selected_targets", lambda: [("f.h5", "/entry")])
     for verb, handler in opened._STRUCTURE_ACTIONS.items():
         monkeypatch.setattr(
             opened, handler,
             lambda target, v=verb: called.append((v, target)))
         workspace.nodeActionRequested.emit(verb)
     assert [v for v, _ in called] == list(opened._STRUCTURE_ACTIONS)
-    assert all(target == ("f.h5", "/entry") for _, target in called)
+    for verb, target in called:
+        if verb in opened._STRUCTURE_MULTI_VERBS:
+            assert target is None, verb
+        else:
+            assert target == ("f.h5", "/entry"), verb
 
 
 def test_the_action_row_no_ops_with_nothing_selected(workspace, opened,

@@ -42,6 +42,7 @@ from mlgidlab.browser_widgets import _ImageFileNode
 from mlgidlab.h5_edit import MISSING, EditError, EditHandle
 from mlgidlab.array_edit_dialog import ArrayEditDialog
 from mlgidlab.h5_edit_ops import (
+    BatchOp,
     CreateNodeOp,
     DeleteLinkOp,
     DeleteNodeOp,
@@ -53,7 +54,11 @@ from mlgidlab.h5_edit_ops import (
     SetAttrOp,
     WriteCellsOp,
 )
-from mlgidlab.structure_clipboard import StructureClip, free_name
+from mlgidlab.structure_clipboard import (
+    StructureClip,
+    free_name,
+    prune_descendants,
+)
 from mlgidlab.structure_tree import RootSpec
 from mlgidlab.structure_dialogs import (
     NewDatasetDialog,
@@ -313,7 +318,9 @@ class StructureMixin:
         session = self._session_for_path(str(Path(file_path).resolve()))
         menu = QMenu(self)
         self._structure_menu_actions(
-            menu, Path(file_path), h5_edit.normalize_path(h5_path), session)
+            menu, Path(file_path), h5_edit.normalize_path(h5_path), session,
+            selected=len(self._structure_selected_targets()),
+        )
         if not menu.isEmpty():
             menu.exec(position)
 
@@ -330,16 +337,26 @@ class StructureMixin:
         "paste_from_file": "_on_structure_paste_from_file",
     }
 
+    #: Action-row verbs that act on the WHOLE tree selection rather than
+    #: on one node. They are handed no target, so each handler reads the
+    #: selection itself — the row a shift-pick happens to have made
+    #: current is not what "Copy" means when six rows are highlighted.
+    _STRUCTURE_MULTI_VERBS = ("copy", "cut", "delete")
+
     def _on_structure_action(self, verb: str) -> None:
         """Run one of the action row's buttons against the selection."""
+        if verb in self._STRUCTURE_MULTI_VERBS:
+            if not self._structure_selected_targets():
+                return
+            if verb == "copy":
+                self._on_structure_copy()
+            elif verb == "cut":
+                self._on_structure_copy(cut=True)
+            else:
+                self._on_structure_delete(None)
+            return
         target = self._structure_selected_target()
         if target is None:
-            return
-        if verb == "copy":
-            self._on_structure_copy(target)
-            return
-        if verb == "cut":
-            self._on_structure_copy(target, cut=True)
             return
         handler = getattr(self, self._STRUCTURE_ACTIONS.get(verb, ""), None)
         if handler is not None:
@@ -806,11 +823,14 @@ class StructureMixin:
         # Reversing a structural edit changes the tree's shape as much as
         # making it did, so the browser has to be rebuilt here too. An
         # attribute or value step leaves the shape alone and skips it.
-        if isinstance(op, (CreateNodeOp, DeleteNodeOp, MoveNodeOp)):
+        if isinstance(op, (CreateNodeOp, DeleteNodeOp, MoveNodeOp, BatchOp)):
             # A move touches two parents; ``before`` is only on a move,
-            # and the two collapse to one refresh for a plain rename.
-            for changed in {getattr(op, "path", ""),
-                            getattr(op, "before", "")} - {""}:
+            # and the two collapse to one refresh for a plain rename. A
+            # batch reports every path its members touched.
+            changed_paths = set(getattr(op, "paths", None) or
+                                {getattr(op, "path", ""),
+                                 getattr(op, "before", "")})
+            for changed in changed_paths - {""}:
                 self._refresh_structure_tree_at(handle.path, changed)
             if self._browser_is_hidden():
                 self._browser_needs_rebuild = True
@@ -873,7 +893,7 @@ class StructureMixin:
         )
 
     def _structure_menu_actions(self, menu, file_path, h5_path: str,
-                                session) -> None:
+                                session, selected: int = 1) -> None:
         """Add the edit actions for one node to ``menu``.
 
         One definition, two menus: the File browser's (through silx's
@@ -912,15 +932,22 @@ class StructureMixin:
                 lambda: self._on_structure_retarget_link(target),
             )
         menu.addSeparator()
+        # With a multi-row selection the verbs that can act on all of it
+        # say so and are handed no target, so the handler reads the
+        # selection. The rest stay per-node: there is no reading of
+        # "rename these six".
+        many = selected if selected > 1 else 0
+        suffix = f" {many} nodes" if many else ""
+        pick = None if many else target
         menu.addAction(
-            "Copy", lambda: self._on_structure_copy(target)
+            "Copy" + suffix, lambda: self._on_structure_copy(pick)
         ).setEnabled(h5_path != "/")
         menu.addAction(
-            "Cut", lambda: self._on_structure_copy(target, cut=True)
+            "Cut" + suffix, lambda: self._on_structure_copy(pick, cut=True)
         ).setEnabled(h5_path != "/")
         paste = menu.addAction(
             "Paste", lambda: self._on_structure_paste(target))
-        paste.setEnabled(getattr(self, "_structure_clip", None) is not None)
+        paste.setEnabled(bool(getattr(self, "_structure_clip", None)))
         menu.addAction(
             "Paste from file…",
             lambda: self._on_structure_paste_from_file(target),
@@ -930,7 +957,7 @@ class StructureMixin:
             "Rename…", lambda: self._on_structure_rename(target)
         ).setEnabled(h5_path != "/")
         menu.addAction(
-            "Delete", lambda: self._on_structure_delete(target)
+            "Delete" + suffix, lambda: self._on_structure_delete(pick)
         ).setEnabled(h5_path != "/")
 
     def _structure_link_kind(self, file_path, h5_path: str) -> str:
@@ -1119,19 +1146,79 @@ class StructureMixin:
         self._structure_target = (Path(file_path), new_path)
 
     def _on_structure_delete(self, target) -> None:
-        """Delete a node, snapshotting it first when it is small enough.
+        """Delete the selection, snapshotting what is small enough.
 
-        The size probe walks hard links only and stops at the cap, so
-        asking "can this be undone?" never costs a walk of a 226-entry
-        master.
+        ``target`` pins one node (the context menu passes the row that
+        was right-clicked); without it the whole tree selection goes,
+        because a multi-row selection that quietly deleted one row would
+        be the worst kind of surprise in an editor.
+
+        Deletions run deepest-first. A shift-picked range can hold a
+        node and a sibling ordered before it, and restoring on undo has
+        to put them back in the order they left.
         """
-        opened = self._structure_handle_for(target)
+        targets = [target] if target is not None else (
+            self._structure_selected_targets())
+        if not targets:
+            return
+        if len(targets) == 1:
+            self._delete_targets(targets)
+            return
+        if not self._confirm_multi_delete([path for _, path in targets]):
+            return
+        self._delete_targets(targets)
+
+    def _confirm_multi_delete(self, paths) -> bool:
+        """Ask once before deleting a whole selection."""
+        shown = "\n".join(f"  {p}" for p in paths[:12])
+        if len(paths) > 12:
+            shown += f"\n  … and {len(paths) - 12} more"
+        answer = QMessageBox.question(
+            self,
+            "Delete these nodes?",
+            f"Delete {len(paths)} nodes?\n\n{shown}\n\n"
+            "This is one entry in the changes list and one Ctrl+Z.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _delete_targets(self, targets) -> None:
+        """Delete every target, as one change when there is more than one."""
+        opened = self._structure_handle_for(targets[0])
         if opened is None:
             return
-        handle, path = opened
+        handle = opened[0]
+        # Deepest first, so a parent never takes a sibling's turn with it.
+        ordered = sorted(
+            (path for _, path in targets),
+            key=lambda p: p.count("/"), reverse=True,
+        )
+        ops = []
+        for path in ordered:
+            op = self._delete_one(handle, path)
+            if op is not None:
+                ops.append(op)
+        if not ops:
+            return
+        if len(ops) == 1:
+            self._commit_structure_change(handle, ops[0], ops[0].path)
+            return
+        batch = BatchOp(ops, label=f"{len(ops)} nodes deleted")
+        self._commit_structure_change(
+            handle, batch, batch.path, also=batch.paths)
+
+    def _delete_one(self, handle, path: str):
+        """Delete one node and return its op, or None if it did not go.
+
+        Does not commit: the caller decides whether this is one change
+        or one member of a batch. The size probe walks hard links only
+        and stops at the cap, so asking "can this be undone?" never
+        costs a walk of a 226-entry master.
+        """
         reason = h5_edit.protection_reason(path)
         if reason and not self._confirm_protected("Delete", path, reason):
-            return
+            return None
         # A soft or external link is three strings, not a payload.
         # Snapshotting one would mean copying its TARGET — for an
         # external link, opening the very file the link exists to keep
@@ -1143,13 +1230,8 @@ class StructureMixin:
                 h5_edit.delete_node(handle.file, path)
             except EditError as exc:
                 self._structure_failed("Delete", exc)
-                return
-            self._commit_structure_change(
-                handle,
-                DeleteLinkOp(path, link.kind, link.target, link.filename),
-                path,
-            )
-            return
+                return None
+            return DeleteLinkOp(path, link.kind, link.target, link.filename)
 
         try:
             size = h5_edit.node_nbytes(
@@ -1157,7 +1239,7 @@ class StructureMixin:
             info = h5_edit.node_info(handle.file, path)
         except EditError as exc:
             self._structure_failed("Delete", exc)
-            return
+            return None
 
         snapshot = None
         if size <= h5_edit.UNDO_SNAPSHOT_LIMIT:
@@ -1166,18 +1248,14 @@ class StructureMixin:
             except EditError:
                 logger.debug("snapshot before delete failed", exc_info=True)
         if snapshot is None and not self._confirm_final_delete(path, size):
-            return
+            return None
 
         try:
             h5_edit.delete_node(handle.file, path)
         except EditError as exc:
             self._structure_failed("Delete", exc)
-            return
-        self._commit_structure_change(
-            handle,
-            DeleteNodeOp(path, info.kind, snapshot=snapshot),
-            path,
-        )
+            return None
+        return DeleteNodeOp(path, info.kind, snapshot=snapshot)
 
     def _confirm_final_delete(self, path: str, size: int) -> bool:
         """Ask before a delete that Ctrl+Z will not be able to reverse."""
@@ -1194,7 +1272,8 @@ class StructureMixin:
         )
         return answer == QMessageBox.StandardButton.Yes
 
-    def _commit_structure_change(self, handle, op, path: str) -> None:
+    def _commit_structure_change(self, handle, op, path: str,
+                                 also=()) -> None:
         """Commit an edit that changed the tree's shape.
 
         Same as an attribute commit, plus the three things a structural
@@ -1206,7 +1285,12 @@ class StructureMixin:
         """
         state = self._capture_tree_state()
         self._commit_structure_edit(handle, op, path)
-        self._refresh_structure_tree_at(handle.path, path)
+        # ``also`` carries the other paths a batch touched: pasting into
+        # one group is one re-list, but deleting a shift-picked range can
+        # empty several parents at once.
+        for changed in dict.fromkeys([path, *also]):
+            if changed:
+                self._refresh_structure_tree_at(handle.path, changed)
         if self._browser_is_hidden():
             # Nobody can see it. Tearing the whole browser down and
             # rebuilding it per edit was the largest cost in an editing
@@ -1743,6 +1827,35 @@ class StructureMixin:
         in_browser = hasattr(self, "tree") and self.tree.hasFocus()
         return in_editor or in_browser
 
+    def _structure_selected_targets(self) -> list:
+        """Every ``(file, path)`` the user has selected, nested ones out.
+
+        The tab's own tree can hold a shift-picked range; the File
+        browser stays single-select, and everything else in this class
+        reasons about one node. So this reports a list, ``[]`` when
+        there is nothing, and callers that genuinely act on one node
+        keep using ``_structure_selected_target``.
+        """
+        panel = getattr(self, "structure_panel", None)
+        if panel is not None and self.tabs.currentWidget() is panel:
+            try:
+                picked = panel.node_tree.selected_targets()
+            except Exception:
+                logger.debug("reading the tree selection failed", exc_info=True)
+                picked = []
+            if picked:
+                # Whatever the tree says, however many rows that is. The
+                # panel and the tree are kept in step by
+                # ``_sync_structure_tree_selection``, so for one row this
+                # is the node the panel is showing anyway — and for
+                # several it is the only answer that is not a guess.
+                return [
+                    (Path(file_path), path)
+                    for file_path, path in prune_descendants(picked)
+                ]
+        single = self._structure_selected_target()
+        return [] if single is None else [single]
+
     def _structure_selected_target(self):
         """``(file, path)`` for the current selection, however it was made."""
         target = getattr(self, "_structure_target", None)
@@ -1758,36 +1871,59 @@ class StructureMixin:
         return (Path(file_path), h5_edit.normalize_path(raw_path))
 
     def _on_structure_copy(self, target=None, *, cut: bool = False) -> None:
-        """Put a node — or the selected attribute — on the clipboard.
+        """Put the selection — or the selected attribute — on the clipboard.
 
         A reference, not a payload: copying a 4 GB stack costs nothing
-        until it is pasted.
+        until it is pasted, and copying six of them costs six
+        references.
+
+        ``target`` pins one node (the context menu hands over the row
+        that was right-clicked); without it the whole tree selection is
+        taken, which is what the action row and Ctrl+C mean.
         """
         attr = self.structure_panel.selected_attribute()
-        if target is None:
-            target = self._structure_selected_target()
-        if target is None:
+        targets = [target] if target is not None else (
+            self._structure_selected_targets())
+        if not targets:
             return
-        file_path, path = target
-        if attr and not cut:
-            self._structure_clip = StructureClip(
-                "attribute", Path(file_path), path, attr=attr)
+        if attr and not cut and len(targets) == 1:
+            # An attribute is a property of one node; there is no
+            # sensible reading of "copy this attribute" across six.
+            file_path, path = targets[0]
+            self._structure_clip = [StructureClip(
+                "attribute", Path(file_path), path, attr=attr)]
         else:
-            self._structure_clip = StructureClip(
-                "node", Path(file_path), path,
-                mode="cut" if cut else "copy")
-        self.statusBar().showMessage(self._structure_clip.describe(), 4000)
+            self._structure_clip = [
+                StructureClip("node", Path(file_path), path,
+                              mode="cut" if cut else "copy")
+                for file_path, path in targets
+            ]
+        self.statusBar().showMessage(
+            self._describe_clip(self._structure_clip), 4000)
+
+    @staticmethod
+    def _describe_clip(clips) -> str:
+        """One status line for whatever is on the clipboard."""
+        if not clips:
+            return ""
+        if len(clips) == 1:
+            return clips[0].describe()
+        verb = "Cut" if clips[0].mode == "cut" else "Copied"
+        return f"{verb} {len(clips)} nodes from {clips[0].file_path.name}"
 
     def _on_structure_paste(self, target=None) -> None:
         """Paste the clipboard into the selected group."""
-        clip = getattr(self, "_structure_clip", None)
-        if clip is None:
+        clips = getattr(self, "_structure_clip", None)
+        if not clips:
             return
         if target is None:
             target = self._structure_selected_target()
         if target is None:
             return
-        self._paste_clip(clip, target)
+        if len(clips) == 1:
+            self._paste_clip(clips[0], target)
+            return
+        self._paste_clips(clips, target)
 
     def _on_structure_paste_from_file(self, target=None) -> None:
         """Pick a node in a file that is not open, and paste it here."""
@@ -1829,6 +1965,7 @@ class StructureMixin:
         return h5_edit.split_path(path)[0]
 
     def _paste_clip(self, clip, target) -> None:
+        """Paste one clip. The single-node path, unchanged."""
         opened = self._structure_handle_for(target)
         if opened is None:
             return
@@ -1841,6 +1978,58 @@ class StructureMixin:
             self._paste_attribute(handle, clip, destination)
             return
 
+        op = self._paste_one(handle, clip, destination)
+        if op is None:
+            return
+        if isinstance(op, MoveNodeOp):
+            self._structure_clip = []
+            self._commit_structure_change(handle, op, op.after)
+            return
+        self._commit_structure_change(handle, op, op.path)
+
+    def _paste_clips(self, clips, target) -> None:
+        """Paste several clips into one group, as one undoable change.
+
+        The write is the same per node; what differs is that the whole
+        lot lands as a single ``BatchOp``. Six pastes that need six
+        undos and leave six lines in the changes list would be a worse
+        account of one gesture than the single line this leaves.
+
+        A clip that fails — a name the user backed out of, a cut that
+        cannot cross files — is skipped and the rest still land. Giving
+        up on the first refusal would make one awkward name cost the
+        user the other five pastes.
+        """
+        opened = self._structure_handle_for(target)
+        if opened is None:
+            return
+        handle, path = opened
+        destination = self._paste_destination(handle, path)
+        if destination is None:
+            return
+
+        ops: list = []
+        for clip in clips:
+            if clip.kind == "attribute":
+                continue
+            op = self._paste_one(handle, clip, destination)
+            if op is not None:
+                ops.append(op)
+        if not ops:
+            return
+        if any(isinstance(op, MoveNodeOp) for op in ops):
+            self._structure_clip = []
+        primary = getattr(ops[0], "after", None) or ops[0].path
+        batch = BatchOp(ops, label=f"{len(ops)} nodes pasted into {destination}")
+        self._commit_structure_change(
+            handle, batch, primary, also=batch.paths)
+
+    def _paste_one(self, handle, clip, destination: str):
+        """Write one clip into ``destination`` and return its op, or None.
+
+        Deliberately does not commit: the caller decides whether this is
+        one change or part of a batch.
+        """
         same_file = Path(clip.file_path) == handle.path
         if clip.mode == "cut" and not same_file:
             self._structure_failed(
@@ -1850,22 +2039,24 @@ class StructureMixin:
                     "another file, copy it and delete the original."
                 ),
             )
-            return
+            return None
         if clip.mode == "cut" and h5_edit.normalize_path(destination).startswith(
             clip.path.rstrip("/") + "/"
         ):
             self._structure_failed(
                 "Paste", EditError("A group cannot be moved inside itself."))
-            return
+            return None
 
         try:
             existing = list(handle.file[destination].keys())
         except (KeyError, OSError) as exc:
             self._structure_failed("Paste", EditError(str(exc)))
-            return
+            return None
+        # Read fresh per clip: two nodes pasted from the same batch must
+        # not be offered the same free name.
         name = self._ask_paste_name(clip.name, existing, destination)
         if name is None:
-            return
+            return None
 
         if clip.mode == "cut":
             try:
@@ -1873,11 +2064,8 @@ class StructureMixin:
                     handle.file, clip.path, destination, name)
             except EditError as exc:
                 self._structure_failed("Paste", exc)
-                return
-            self._structure_clip = None
-            self._commit_structure_change(
-                handle, MoveNodeOp(clip.path, new_path), new_path)
-            return
+                return None
+            return MoveNodeOp(clip.path, new_path)
 
         source_file = None if same_file else Path(clip.file_path)
 
@@ -1891,9 +2079,8 @@ class StructureMixin:
             new_path = paste(handle.file)
         except (EditError, OSError) as exc:
             self._structure_failed("Paste", EditError(str(exc)))
-            return
-        self._commit_structure_change(
-            handle, CreateNodeOp(new_path, "copy", recreate=paste), new_path)
+            return None
+        return CreateNodeOp(new_path, "copy", recreate=paste)
 
     def _ask_paste_name(self, wanted: str, existing, destination: str):
         """The name to paste under, or None if the user backed out.

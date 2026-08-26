@@ -384,6 +384,88 @@ def test_the_header_shows_the_new_name_after_the_rename(editing, monkeypatch):
     assert editing.structure_panel._name_edit.text() == "remarks"
 
 
+# Deleting a shift-picked selection. A multi-row selection that quietly
+# deleted one row would be the worst kind of surprise in an editor, so
+# Delete takes the whole thing — as one confirm and one Ctrl+Z.
+
+
+def _pick(window, paths, monkeypatch):
+    window.tabs.setCurrentWidget(window.structure_panel)
+    picked = [(str(window.session.temp_path), path) for path in paths]
+    monkeypatch.setattr(
+        window.structure_panel.node_tree, "selected_targets",
+        lambda: list(picked))
+
+
+def test_deleting_a_selection_takes_all_of_it(editing, monkeypatch,
+                                              confirm_yes):
+    _show(editing, "/entry_0000", monkeypatch)
+    _stub_group_dialog(monkeypatch, "one")
+    editing._on_structure_new_group(_target(editing, "/entry_0000"))
+    _stub_group_dialog(monkeypatch, "two")
+    editing._on_structure_new_group(_target(editing, "/entry_0000"))
+    _pick(editing, ["/entry_0000/one", "/entry_0000/two"], monkeypatch)
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+
+    editing._on_structure_delete(None)
+
+    entry = _read(editing)["entry_0000"]
+    assert "one" not in entry and "two" not in entry
+
+
+def test_a_multi_delete_is_one_undo(editing, monkeypatch, confirm_yes):
+    _show(editing, "/entry_0000", monkeypatch)
+    for name in ("one", "two"):
+        _stub_group_dialog(monkeypatch, name)
+        editing._on_structure_new_group(_target(editing, "/entry_0000"))
+    _pick(editing, ["/entry_0000/one", "/entry_0000/two"], monkeypatch)
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+    editing._on_structure_delete(None)
+
+    editing._action_undo()
+
+    entry = _read(editing)["entry_0000"]
+    assert "one" in entry and "two" in entry
+
+
+def test_declining_the_confirm_deletes_nothing(editing, monkeypatch):
+    _show(editing, "/entry_0000", monkeypatch)
+    for name in ("one", "two"):
+        _stub_group_dialog(monkeypatch, name)
+        editing._on_structure_new_group(_target(editing, "/entry_0000"))
+    _pick(editing, ["/entry_0000/one", "/entry_0000/two"], monkeypatch)
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Cancel))
+
+    editing._on_structure_delete(None)
+
+    entry = _read(editing)["entry_0000"]
+    assert "one" in entry and "two" in entry
+
+
+def test_deleting_one_row_still_asks_nothing_extra(editing, monkeypatch):
+    """A single pick keeps the old path: no batch, no count dialog."""
+    _show(editing, "/entry_0000", monkeypatch)
+    _stub_group_dialog(monkeypatch, "one")
+    editing._on_structure_new_group(_target(editing, "/entry_0000"))
+    _pick(editing, ["/entry_0000/one"], monkeypatch)
+    asked = []
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: asked.append(1) or
+                     QMessageBox.StandardButton.Yes))
+
+    editing._on_structure_delete(None)
+
+    assert asked == []
+    assert "one" not in _read(editing)["entry_0000"]
+
+
 # -- deleting --------------------------------------------------------------
 
 

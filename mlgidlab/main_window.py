@@ -395,7 +395,9 @@ class MainWindow(
         # What the Structure tab holds between a Copy and a Paste. Kept
         # apart from the peak clipboard: Ctrl+C means a different thing
         # on each tab.
-        self._structure_clip = None
+        # A list, because the tab's tree is multi-select: one gesture can
+        # put six nodes on it. Empty when nothing has been copied.
+        self._structure_clip: list = []
         # Tools → Export figure window. Built lazily on first open
         # (see ``_action_export_figure``); kept alive across re-opens
         # so settings persist. None until the user invokes Tools →

@@ -222,6 +222,67 @@ class CreateNodeOp:
 
 
 @dataclass
+class BatchOp:
+    """Several edits the user made with one gesture.
+
+    Pasting six groups is one action to the person who did it, so it is
+    one entry in the changes list and one press of Ctrl+Z. Without this
+    a multi-paste would leave six lines and need six undos, which is a
+    worse answer to "what did I just do?" than the single line it
+    replaces.
+
+    Undo runs the members in REVERSE. It matters: a batch that created
+    ``a`` then ``b`` must remove ``b`` first, and a batch that deleted a
+    group and then its sibling must put the sibling back before the
+    group it was ordered after. Redo replays forwards.
+
+    ``paths`` is what the tree has to re-list afterwards — a batch can
+    touch several parents at once, which no single-path op ever does.
+    """
+
+    ops: list
+    label: str = ""
+
+    @property
+    def path(self) -> str:
+        """The primary path, for the rules that ask an op where it hit."""
+        for op in self.ops:
+            candidate = getattr(op, "path", "")
+            if candidate:
+                return candidate
+        return ""
+
+    @property
+    def paths(self) -> list[str]:
+        """Every path the members touched, including a move's origin."""
+        seen: list[str] = []
+        for op in self.ops:
+            for name in ("path", "before"):
+                candidate = getattr(op, name, "")
+                if candidate and candidate not in seen:
+                    seen.append(candidate)
+        return seen
+
+    @property
+    def reversible(self) -> bool:
+        """False when any member cannot be undone (an oversized delete)."""
+        return all(getattr(op, "reversible", True) for op in self.ops)
+
+    def redo(self, f: h5py.File) -> None:
+        for op in self.ops:
+            op.redo(f)
+
+    def undo(self, f: h5py.File) -> None:
+        for op in reversed(self.ops):
+            op.undo(f)
+
+    def describe(self) -> str:
+        if self.label:
+            return self.label
+        return f"{len(self.ops)} changes"
+
+
+@dataclass
 class DeleteNodeOp:
     """A node that was deleted, with the bytes needed to bring it back.
 

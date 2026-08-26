@@ -45,6 +45,34 @@ class StructureClip:
         return f"{verb} {self.path} from {self.file_path.name}"
 
 
+def prune_descendants(targets: Iterable[tuple]) -> list[tuple]:
+    """Drop any ``(file, path)`` that lives inside another one.
+
+    Shift-selecting a range in a tree picks up whatever rows happen to
+    lie between the two clicks, and an expanded group brings its
+    children with it. Copying both the group and its child would paste
+    the child twice — once inside its parent and once beside it — and
+    deleting both would try to delete a node that its parent already
+    took with it.
+
+    Order is preserved, so the caller still sees the selection in tree
+    order. Comparison is per file: the same path in two files is two
+    different nodes.
+    """
+    kept: list[tuple] = []
+    for file_path, path in targets:
+        prefix = path.rstrip("/") + "/"
+        inside = any(
+            str(other_file) == str(file_path)
+            and prefix.startswith(other.rstrip("/") + "/")
+            and other.rstrip("/") != path.rstrip("/")
+            for other_file, other in targets
+        )
+        if not inside:
+            kept.append((file_path, path))
+    return kept
+
+
 def free_name(existing: Iterable[str], wanted: str) -> str:
     """A name like ``wanted`` that is not already in ``existing``.
 

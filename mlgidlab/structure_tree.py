@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QItemSelectionModel, Qt, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem, QWidget
 
@@ -116,7 +116,11 @@ class StructureTree(QTreeWidget):
         self.setSortingEnabled(False)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.setExpandsOnDoubleClick(True)
-        self.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
+        # Extended, so a range of siblings can be shift-picked and
+        # copied in one go. The panel still follows the CURRENT row —
+        # describing a node is a per-node question — while copy, paste
+        # and delete act on the whole selection.
+        self.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
 
         self.itemExpanded.connect(self._on_expanded)
         self.itemSelectionChanged.connect(self._on_selection_changed)
@@ -343,6 +347,24 @@ class StructureTree(QTreeWidget):
             return None
         return (str(file_path), _norm(str(item.data(0, PATH_ROLE) or "/")))
 
+    def selected_targets(self) -> list[tuple[str, str]]:
+        """``(file, h5 path)`` for every selected row, in tree order.
+
+        Placeholders and rows with no file behind them are skipped. The
+        caller prunes nested picks (``structure_clipboard``); this
+        reports what is selected, not what is sensible to act on.
+        """
+        out: list[tuple[str, str]] = []
+        for item in self.selectedItems():
+            if self._is_placeholder(item):
+                continue
+            file_path = item.data(0, FILE_ROLE)
+            if not file_path:
+                continue
+            out.append(
+                (str(file_path), _norm(str(item.data(0, PATH_ROLE) or "/"))))
+        return out
+
     # -- refresh and reveal ------------------------------------------------
 
     def refresh_path(self, file_path: str, h5_path: str) -> None:
@@ -378,6 +400,13 @@ class StructureTree(QTreeWidget):
         ``quiet`` selects without emitting ``nodeSelected`` — used when
         the tree is putting a selection back after a refresh, where the
         panel is already showing that node.
+
+        A row that is ALREADY part of the selection is only made
+        current, never re-selected. ``setCurrentItem`` clears everything
+        else under ``ExtendedSelection``, and the panel re-syncs to the
+        current row on every render — so without this, shift-picking a
+        second row would collapse the pick the moment the first row's
+        render came back.
         """
         item = self.find_item(file_path, h5_path, populate=True)
         if item is None:
@@ -389,7 +418,11 @@ class StructureTree(QTreeWidget):
             while parent is not None:
                 parent.setExpanded(True)
                 parent = parent.parent()
-            self.setCurrentItem(item)
+            if item.isSelected():
+                self.setCurrentItem(
+                    item, 0, QItemSelectionModel.SelectionFlag.NoUpdate)
+            else:
+                self.setCurrentItem(item)
             # Selecting emits, and a handler may re-list the branch this
             # row is in — leaving the pointer above dangling. Nothing is
             # lost: whatever rebuilt it put the selection back.
@@ -455,7 +488,16 @@ class StructureTree(QTreeWidget):
             # Right-click means "this row", exactly as it does in the
             # File browser — so the row is selected first and the menu is
             # built against it, not against whatever was selected before.
-            self.setCurrentItem(item)
+            #
+            # Unless it is already part of a multi-row selection: there
+            # the click means "these rows", and collapsing the selection
+            # would throw away what the user just shift-picked, right as
+            # they reach for Copy.
+            if item not in self.selectedItems():
+                self.setCurrentItem(item)
+            else:
+                self.setCurrentItem(item, 0,
+                                    QItemSelectionModel.SelectionFlag.NoUpdate)
         target = self.current_target()
         if target is None:
             return
