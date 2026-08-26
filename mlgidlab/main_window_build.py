@@ -136,6 +136,8 @@ class BuildMixin:
             self._on_structure_tree_context)
         self.structure_panel.nodeActionRequested.connect(
             self._on_structure_action)
+        self.structure_panel.renameRequested.connect(
+            self._on_structure_header_rename)
 
         self.tabs = QTabWidget(self)
         # documentMode flattens the tab-pane border so the image fills

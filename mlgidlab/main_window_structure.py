@@ -817,6 +817,12 @@ class StructureMixin:
             else:
                 self._rebuild_tree_preserving(self._capture_tree_state(), handle)
             self._repopulate_entries_after_structure_edit()
+        if isinstance(op, MoveNodeOp):
+            # A step over a move puts the node somewhere else, and the
+            # panel may be showing that very node. Undo walks it back to
+            # where it came from; redo walks it forward again.
+            was, now = (op.before, op.after) if redo else (op.after, op.before)
+            self._follow_renamed_node(handle.path, was, now)
         self._rerender_structure()
         return True
 
@@ -1044,14 +1050,73 @@ class StructureMixin:
             self, "Rename", f"New name for {old_name}:", text=old_name)
         if not ok or not new_name.strip() or new_name.strip() == old_name:
             return
+        self._rename_structure_node(handle, path, new_name.strip())
+
+    def _on_structure_header_rename(self, new_name: str) -> None:
+        """A new name was typed over the one in the panel's header.
+
+        The third route to a rename and the shortest — the other two
+        open a dialog. It has to be the *same* rename, so it lands on
+        the same commit with the same undo entry and asks the same
+        question about a protected node.
+
+        The field has already put the old name back by the time this
+        runs, so a refused prompt or a failed write leaves the header
+        showing what the file still says, with nothing to undo.
+        """
+        target = self._structure_selected_target()
+        if target is None:
+            return
+        opened = self._structure_handle_for(target)
+        if opened is None:
+            return
+        handle, path = opened
         try:
-            new_path = h5_edit.rename_node(
-                handle.file, path, new_name.strip())
+            _, old_name = h5_edit.split_path(path)
+        except EditError:
+            return  # the file root, which has no name to change
+        new_name = new_name.strip()
+        if not new_name or new_name == old_name:
+            return
+        reason = h5_edit.protection_reason(path)
+        if reason and not self._confirm_protected("Rename", path, reason):
+            return
+        self._rename_structure_node(handle, path, new_name)
+
+    def _rename_structure_node(self, handle, path: str, new_name: str) -> None:
+        """Write the rename and record it. Shared by all three routes."""
+        try:
+            new_path = h5_edit.rename_node(handle.file, path, new_name)
         except EditError as exc:
             self._structure_failed("Rename", exc)
             return
+        self._follow_renamed_node(handle.path, path, new_path)
         self._commit_structure_change(
             handle, MoveNodeOp(path, new_path), new_path)
+
+    def _follow_renamed_node(self, file_path, old_path: str,
+                             new_path: str) -> None:
+        """Point the panel at where the node just went.
+
+        The panel holds no state of its own: every commit ends by
+        re-reading the node it is showing. A rename moves that node, so
+        without this the re-read looks up a path the rename has emptied
+        and the header goes on naming a node that is no longer there.
+
+        Only when the panel is actually on the node that moved. A rename
+        driven from the tree's context menu can target a row the panel is
+        not showing, and following that one would move the user somewhere
+        they did not ask to go.
+        """
+        target = getattr(self, "_structure_target", None)
+        if target is None:
+            return
+        if h5_edit.normalize_path(str(target[1])) != h5_edit.normalize_path(
+            old_path
+        ):
+            return
+        self._structure_node = _PathNode(file_path, new_path)
+        self._structure_target = (Path(file_path), new_path)
 
     def _on_structure_delete(self, target) -> None:
         """Delete a node, snapshotting it first when it is small enough.

@@ -270,6 +270,120 @@ def test_renaming_a_protected_node_asks_first(editing, monkeypatch, confirm_no):
     assert "q_xy" in _read(editing)["entry_0000/data"]
 
 
+# The header's name is the third route to a rename and the only one
+# without a dialog. It has to be the SAME rename: same write, same undo
+# entry, same question about a protected node. What is pinned here is
+# that it goes through the shared commit rather than growing a second
+# one that could drift.
+
+
+def test_the_header_name_renames_the_node(editing, monkeypatch):
+    _show(editing, "/entry_0000", monkeypatch)
+    _stub_group_dialog(monkeypatch, "notes")
+    editing._on_structure_new_group(_target(editing, "/entry_0000"))
+    _show(editing, "/entry_0000/notes", monkeypatch)
+
+    editing.structure_panel.renameRequested.emit("remarks")
+
+    f = _read(editing)
+    assert "remarks" in f["entry_0000"] and "notes" not in f["entry_0000"]
+
+
+def test_a_header_rename_is_undoable_like_any_other(editing, monkeypatch):
+    _show(editing, "/entry_0000", monkeypatch)
+    _stub_group_dialog(monkeypatch, "notes")
+    editing._on_structure_new_group(_target(editing, "/entry_0000"))
+    _show(editing, "/entry_0000/notes", monkeypatch)
+
+    editing.structure_panel.renameRequested.emit("remarks")
+    editing._action_undo()
+
+    assert "notes" in _read(editing)["entry_0000"]
+
+
+def test_a_header_rename_of_a_protected_node_asks_first(
+    editing, monkeypatch, confirm_no
+):
+    """No dialog to type in is not a reason to skip the warning."""
+    _show(editing, "/entry_0000/data/q_xy", monkeypatch)
+
+    editing.structure_panel.renameRequested.emit("qxy")
+
+    assert "q_xy" in _read(editing)["entry_0000/data"]
+
+
+def test_the_dialog_rename_updates_the_header_too(editing, monkeypatch):
+    """The panel follows the node whichever route moved it.
+
+    It did not before: every commit ends by re-reading the node the
+    panel is showing, and a rename empties that path, so the header went
+    on naming a node that was no longer there.
+    """
+    _show(editing, "/entry_0000", monkeypatch)
+    _stub_group_dialog(monkeypatch, "notes")
+    editing._on_structure_new_group(_target(editing, "/entry_0000"))
+    _show(editing, "/entry_0000/notes", monkeypatch)
+    monkeypatch.setattr(
+        QInputDialog, "getText", staticmethod(lambda *a, **k: ("remarks", True)))
+
+    editing._on_structure_rename(_target(editing, "/entry_0000/notes"))
+
+    assert editing.structure_panel._name_edit.text() == "remarks"
+    assert editing.structure_panel.current.kind != "missing"
+
+
+def test_undoing_a_rename_puts_the_header_back(editing, monkeypatch):
+    _show(editing, "/entry_0000", monkeypatch)
+    _stub_group_dialog(monkeypatch, "notes")
+    editing._on_structure_new_group(_target(editing, "/entry_0000"))
+    _show(editing, "/entry_0000/notes", monkeypatch)
+    editing.structure_panel.renameRequested.emit("remarks")
+
+    editing._action_undo()
+
+    assert editing.structure_panel._name_edit.text() == "notes"
+
+
+def test_redoing_a_rename_takes_the_header_forward_again(editing, monkeypatch):
+    _show(editing, "/entry_0000", monkeypatch)
+    _stub_group_dialog(monkeypatch, "notes")
+    editing._on_structure_new_group(_target(editing, "/entry_0000"))
+    _show(editing, "/entry_0000/notes", monkeypatch)
+    editing.structure_panel.renameRequested.emit("remarks")
+    editing._action_undo()
+
+    editing._action_redo()
+
+    assert editing.structure_panel._name_edit.text() == "remarks"
+
+
+def test_renaming_something_else_leaves_the_panel_where_it_was(
+    editing, monkeypatch
+):
+    """A context-menu rename can target a row the panel is not showing."""
+    _show(editing, "/entry_0000", monkeypatch)
+    _stub_group_dialog(monkeypatch, "notes")
+    editing._on_structure_new_group(_target(editing, "/entry_0000"))
+    _show(editing, "/entry_0000", monkeypatch)
+    monkeypatch.setattr(
+        QInputDialog, "getText", staticmethod(lambda *a, **k: ("remarks", True)))
+
+    editing._on_structure_rename(_target(editing, "/entry_0000/notes"))
+
+    assert editing.structure_panel._name_edit.text() == "entry_0000"
+
+
+def test_the_header_shows_the_new_name_after_the_rename(editing, monkeypatch):
+    _show(editing, "/entry_0000", monkeypatch)
+    _stub_group_dialog(monkeypatch, "notes")
+    editing._on_structure_new_group(_target(editing, "/entry_0000"))
+    _show(editing, "/entry_0000/notes", monkeypatch)
+
+    editing.structure_panel.renameRequested.emit("remarks")
+
+    assert editing.structure_panel._name_edit.text() == "remarks"
+
+
 # -- deleting --------------------------------------------------------------
 
 

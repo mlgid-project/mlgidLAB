@@ -18,7 +18,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QSettings, Qt, Signal
+from PySide6.QtCore import QSettings, QSize, Qt, Signal
+from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -40,7 +41,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from mlgidlab import icons, nexus_schema
+from mlgidlab import icons, nexus_schema, skin
 from mlgidlab.flow_layout import FlowLayout
 from mlgidlab.h5_edit import Issue, NodeInfo, is_inline_editable
 from mlgidlab.structure_tree import StructureTree
@@ -240,6 +241,146 @@ class NewAttributeDialog(QDialog):
         )
 
 
+class _NameEdit(QLineEdit):
+    """The node's own name, editable where it is printed.
+
+    Renaming already has two routes (the context menu and the action
+    row), and both open a dialog. This is the third and the shortest:
+    the name is right there at the head of the panel, so typing over it
+    is the obvious gesture. It emits, and the window does the work — the
+    same commit, the same undo entry, the same protection prompt.
+
+    Read-only it *is* the title: no frame, no ground, the card-title
+    weight, so the header reads as one line of "where am I" rather than
+    as a form. Editing gives it a real box, because at that point it is
+    a field and has to look like one.
+
+    Double-click, not single, exactly as the attribute table decided: a
+    single click is how you put the caret somewhere to read a long name,
+    and an accidental one-click edit on a file's structure is a bad
+    surprise.
+
+    Losing focus reverts. A rename that happened because the user
+    clicked somewhere else is a change to their file they did not ask
+    for; forgetting to press Enter costs them only the typing.
+    """
+
+    #: The user committed a new name for the node on show.
+    committed = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName(skin.NODE_NAME)
+        self._name = ""
+        self._can_edit = False
+        self._settle()
+        self.returnPressed.connect(self._commit)
+
+    # -- state -------------------------------------------------------------
+
+    @property
+    def editing(self) -> bool:
+        return not self.isReadOnly()
+
+    def set_name(self, name: str) -> None:
+        """Show ``name``. Any edit in flight belonged to the old node."""
+        self._name = name
+        self._settle()
+
+    def set_editable(self, can_edit: bool) -> None:
+        self._can_edit = bool(can_edit)
+        if not can_edit:
+            self._settle()
+        self.setToolTip(
+            "Double-click or F2 to rename" if can_edit else "")
+
+    def begin(self) -> None:
+        if not self._can_edit or self.editing:
+            return
+        self.setReadOnly(False)
+        self.setCursor(Qt.CursorShape.IBeamCursor)
+        self._restyle()
+        self.selectAll()
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _settle(self) -> None:
+        """Back to being a title, showing the name the file has."""
+        self.setReadOnly(True)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.setText(self._name)
+        self.deselect()
+        self.home(False)
+        self._restyle()
+        self.updateGeometry()
+
+    def _restyle(self) -> None:
+        # ``:read-only`` is a QSS pseudo-state, and Qt does not re-run
+        # the sheet when the flag flips on its own.
+        style = self.style()
+        style.unpolish(self)
+        style.polish(self)
+
+    def _commit(self) -> None:
+        if not self.editing:
+            return
+        typed = self.text().strip()
+        old = self._name
+        # Settle first, so a rejected or failed rename leaves the header
+        # showing what the file still says rather than what was typed.
+        self._settle()
+        if typed and typed != old:
+            self.committed.emit(typed)
+
+    # -- Qt ----------------------------------------------------------------
+
+    def sizeHint(self) -> QSize:
+        """As wide as the name, not as wide as a line edit.
+
+        A QLineEdit asks for room for about seventeen characters. Here it
+        sits inline after the path, so it has to ask for the width of the
+        text it is actually showing.
+        """
+        hint = super().sizeHint()
+        width = self.fontMetrics().horizontalAdvance(self.text() or " ")
+        return QSize(width + 14, hint.height())
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if not self.editing:
+            self.begin()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_F2 and not self.editing:
+            self.begin()
+            return
+        if event.key() == Qt.Key.Key_Escape and self.editing:
+            self._settle()
+            return
+        if not self.editing and (
+            event.matches(QKeySequence.StandardKey.Undo)
+            or event.matches(QKeySequence.StandardKey.Redo)
+        ):
+            # A QLineEdit has an undo stack of its own, and this one sits
+            # in a tab where Ctrl+Z means "undo my last edit to the
+            # file". Sitting on the key while showing a title nobody is
+            # typing into would be a quiet, infuriating failure, so it is
+            # passed up to the window. While the field IS being edited it
+            # keeps the key: there the user's own typing is what they
+            # mean to take back, and nothing has been written yet.
+            event.ignore()
+            return
+        super().keyPressEvent(event)
+
+    def focusOutEvent(self, event) -> None:
+        if self.editing:
+            self._settle()
+        super().focusOutEvent(event)
+
+
 class StructurePanel(QWidget):
     """Read-out and editor for one HDF5 node, plus the file's health."""
 
@@ -270,6 +411,8 @@ class StructurePanel(QWidget):
     #: One of ``NODE_ACTIONS``' verbs, or copy/cut/paste/rename/delete —
     #: the action row asking for what the context menu also offers.
     nodeActionRequested = Signal(str)
+    #: A new name typed over the one in the header.
+    renameRequested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -589,16 +732,30 @@ class StructurePanel(QWidget):
         box.setSpacing(2)
 
         top = QHBoxLayout()
-        top.setSpacing(GAP)
+        top.setSpacing(0)
+        # The header is split where the file is: everything down to the
+        # last "/" is where the node lives and is read-only; the last
+        # component is the node's own name and can be typed over. The
+        # split is what keeps this a rename — a single field holding the
+        # whole path would be inviting a move, which is a different
+        # operation with a different undo entry.
         self._path_label = QLabel(parent)
-        self._path_label.setProperty("role", "card-title")
+        self._path_label.setProperty("role", skin.NODE_PATH)
         self._path_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
         # The path is the one thing worth copying out of this panel, so
         # it stays selectable and wraps rather than eliding into a "…"
         # the user cannot recover.
         self._path_label.setWordWrap(True)
-        top.addWidget(self._path_label, 1)
+        top.addWidget(self._path_label, 0, Qt.AlignmentFlag.AlignBottom)
+
+        self._name_edit = _NameEdit(parent)
+        self._name_edit.committed.connect(self.renameRequested)
+        # Bottom-aligned so that when a long path wraps, the name still
+        # sits on the last line of it rather than floating beside the
+        # middle of the block.
+        top.addWidget(self._name_edit, 0, Qt.AlignmentFlag.AlignBottom)
+        top.addStretch(1)
 
         self._badge = QLabel(parent)
         self._badge.setProperty("status", "warn")
@@ -812,6 +969,7 @@ class StructurePanel(QWidget):
         """Empty every section. ``message`` replaces the default hint."""
         self._info = None
         self._path_label.setText(message or _EMPTY_HINT)
+        self._show_name("")
         self._type_label.setText("")
         self._badge.hide()
         self._note_label.hide()
@@ -833,6 +991,11 @@ class StructurePanel(QWidget):
         """
         self._editable = bool(editable)
         self._apply_editable()
+
+    def _show_name(self, name: str) -> None:
+        """Put the node's own name in the header, or take it away."""
+        self._name_edit.set_name(name)
+        self._name_edit.setVisible(bool(name))
 
     def _apply_editable(self) -> None:
         has_node = self._info is not None
@@ -856,6 +1019,10 @@ class StructurePanel(QWidget):
         # not a node you can rename or delete.
         is_group = has_node and self._info.kind == "group"
         is_root = has_node and self._info.path == "/"
+        # The header's name follows the Rename button exactly: same
+        # operation, same rules, so they can never disagree about
+        # whether this node can be renamed.
+        self._name_edit.set_editable(can_edit and not is_root)
         self._new_btn.setEnabled(can_edit and is_group)
         for verb, button in self._node_buttons.items():
             if verb in ("rename", "delete"):
@@ -884,8 +1051,18 @@ class StructurePanel(QWidget):
     ) -> None:
         """Show one node. ``file_label`` prefixes the path when set."""
         self._info = info
-        self._path_label.setText(
-            f"{file_label}::{info.path}" if file_label else info.path)
+        path = info.path
+        if path == "/":
+            # The file root has no name of its own to rename.
+            self._path_label.setText(
+                f"{file_label}::/" if file_label else "/")
+            self._show_name("")
+        else:
+            parent_path, name = path.rsplit("/", 1)
+            head = f"{parent_path}/" if parent_path else "/"
+            self._path_label.setText(
+                f"{file_label}::{head}" if file_label else head)
+            self._show_name(name)
         self._type_label.setText(describe_node(info))
 
         if info.protection:

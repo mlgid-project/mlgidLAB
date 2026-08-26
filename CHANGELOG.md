@@ -66,6 +66,16 @@ pre-releases.
   visible benefit. Switching entry from the toolbar while editing is
   now instant; the image catches up when you go back to it.
 
+- **Rename a node where its name is printed.** The Structure tab's
+  header splits at the last `/`: where the node lives stays muted and
+  read-only, and its own name can be typed over. Double-click it (or
+  press F2), Enter commits, Escape puts the old name back, and so does
+  clicking away — the same rename as the context menu's, with the same
+  undo entry and the same warning on a protected node, minus the
+  dialog. The panel now follows a renamed node instead of going on
+  naming a path the rename emptied, which also fixes the header after
+  the older dialog routes, and after undo and redo.
+
 - **A crash log.** A hard crash — a segfault out of Qt, h5py or a
   driver — used to take the window with it and leave nothing behind.
   Every run now appends to `mlgidlab_crash.log` in the system temp

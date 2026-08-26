@@ -11,6 +11,8 @@ from __future__ import annotations
 import h5py
 import numpy as np
 import pytest
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QFocusEvent, QKeyEvent
 
 from mlgidlab import h5_edit
 from mlgidlab.h5_edit import Issue, LinkInfo, NodeInfo
@@ -72,7 +74,10 @@ def test_set_node_fills_path_type_and_attributes(panel):
     info = _info(path="/meta", kind="group", nx_class="NXcollection", n_children=2)
     panel.set_node(info, {"NX_class": "NXcollection", "comment": "hi"},
                    file_label="scan.h5")
-    assert panel._path_label.text() == "scan.h5::/meta"
+    # The header is split at the last "/": where the node lives, then
+    # its own name, which is the part that can be typed over.
+    assert panel._path_label.text() == "scan.h5::/"
+    assert panel._name_edit.text() == "meta"
     assert "NXcollection" in panel._type_label.text()
     assert panel.attribute_rows() == [
         ("NX_class", "NXcollection"), ("comment", "hi")
@@ -330,3 +335,133 @@ def test_an_external_link_is_described_without_being_opened(main_window, tmp_pat
     panel = main_window.structure_panel
     assert panel.current.kind == "link"
     assert "external link" in panel._type_label.text()
+
+
+# -- the name in the header ------------------------------------------------
+#
+# Renaming already had two routes, both through a dialog. This is the
+# third and the shortest: the name is printed at the head of the panel,
+# so typing over it is the obvious gesture. What is pinned here is that
+# it is hard to do BY ACCIDENT — a rename writes to the user's file.
+
+
+def _named(panel, path="/entry_0000/data/q_xy"):
+    panel.set_node(_info(path=path, kind="dataset", dtype="f4", shape=(4,)), {})
+    panel.set_editable(True)
+    return panel._name_edit
+
+
+def test_the_root_has_no_name_to_change(panel):
+    panel.set_node(_info(path="/", kind="group"), {}, file_label="scan.h5")
+    assert panel._path_label.text() == "scan.h5::/"
+    assert not panel._name_edit.isVisibleTo(panel)
+
+
+def test_the_name_starts_read_only(panel):
+    name = _named(panel)
+    assert name.text() == "q_xy"
+    assert not name.editing
+
+
+def test_a_committed_name_is_emitted_once(panel, qtbot):
+    name = _named(panel)
+    seen = []
+    panel.renameRequested.connect(seen.append)
+
+    name.begin()
+    name.setText("q_par")
+    name.returnPressed.emit()
+
+    assert seen == ["q_par"]
+    # And the field is a title again, showing what the file still says
+    # until the window comes back with the rename applied.
+    assert not name.editing
+    assert name.text() == "q_xy"
+
+
+def test_escape_puts_the_old_name_back(panel, qtbot):
+    name = _named(panel)
+    seen = []
+    panel.renameRequested.connect(seen.append)
+
+    name.begin()
+    name.setText("nonsense")
+    qtbot.keyClick(name, Qt.Key.Key_Escape)
+
+    assert seen == []
+    assert name.text() == "q_xy"
+    assert not name.editing
+
+
+def test_clicking_away_reverts_rather_than_renames(panel):
+    """Losing focus must not write to the file.
+
+    A rename that happened because the user clicked somewhere else is a
+    change they did not ask for. Forgetting Enter costs them the typing.
+    """
+    name = _named(panel)
+    seen = []
+    panel.renameRequested.connect(seen.append)
+
+    name.begin()
+    name.setText("half-typed")
+    name.focusOutEvent(QFocusEvent(QEvent.Type.FocusOut))
+
+    assert seen == []
+    assert name.text() == "q_xy"
+
+
+def test_the_same_name_is_not_a_rename(panel):
+    name = _named(panel)
+    seen = []
+    panel.renameRequested.connect(seen.append)
+
+    name.begin()
+    name.returnPressed.emit()
+    name.begin()
+    name.setText("   ")
+    name.returnPressed.emit()
+
+    assert seen == []
+
+
+def test_a_read_only_node_cannot_be_typed_over(panel):
+    """Raw inputs and files with no session behind them."""
+    panel.set_node(_info(path="/entry_0000", kind="group"), {})
+    panel.set_editable(False)
+
+    panel._name_edit.begin()
+
+    assert not panel._name_edit.editing
+
+
+def test_a_single_click_does_not_start_an_edit(panel, qtbot):
+    """Same rule the attribute table already applies."""
+    name = _named(panel)
+    qtbot.mouseClick(name, Qt.MouseButton.LeftButton)
+    assert not name.editing
+
+
+def test_the_name_field_does_not_sit_on_ctrl_z(panel):
+    """A QLineEdit has an undo stack of its own.
+
+    In this tab Ctrl+Z means "undo my last edit to the file", so a
+    read-only title that swallowed the key while it happened to hold
+    focus would be a quiet, infuriating failure. It passes the key up
+    instead. While the field IS being edited it keeps it: there the
+    user's own typing is what they mean to take back, and nothing has
+    been written yet.
+    """
+    name = _named(panel)
+    undo = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Z,
+                     Qt.KeyboardModifier.ControlModifier)
+
+    name.keyPressEvent(undo)
+    assert not undo.isAccepted()
+
+    name.begin()
+    kept = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Z,
+                     Qt.KeyboardModifier.ControlModifier)
+    name.keyPressEvent(kept)
+    assert kept.isAccepted()
+

@@ -65,6 +65,21 @@ PROGRESS_SELECTOR = 'QProgressBar[mlgid="progress"]'
 REGION_NAME = "MlgidRegion"
 REGION_SELECTOR = f'QFrame#{REGION_NAME}'
 
+#: objectName for the Structure header's inline-rename field
+#: (``structure_panel._NameEdit``). A ``QLineEdit`` that has to read as
+#: part of the title until it is being edited, so it borrows the
+#: card-title weight and loses every bit of chrome a line edit normally
+#: has. An objectName again, for the reason above: qdarkstyle styles
+#: ``QLineEdit`` heavily, and a plain property selector on the same type
+#: would be a coin toss.
+NODE_NAME = "MlgidNodeName"
+NODE_NAME_SELECTOR = f'QLineEdit#{NODE_NAME}'
+
+#: ``role`` on the muted half of that header — where the node lives, as
+#: opposed to what it is called. Muted and upright: it is a path, and
+#: the italics the other muted labels use read as prose.
+NODE_PATH = "node-path"
+
 
 def marker(theme: str) -> str:
     """The comment stamped at the top of the sheet, so a test (or a bug
@@ -272,6 +287,36 @@ QLabel[role="hint"] {{ color: {t['text_muted']}; font-style: italic; }}
     background: {t['surface']};
     border: 1px solid {t['border']};
     border-radius: 6px;
+}}
+
+/* --- where the node lives, beside what it is called -------------------
+   Muted, so the eye lands on the name, which is the half that can be
+   typed over. The padding matches the field beside it so the two sit on
+   one baseline. */
+QLabel[role="{NODE_PATH}"] {{
+    color: {t['text_muted']};
+    padding: 6px 0px 5px 2px;
+}}
+
+/* --- the node's own name, editable in place --------------------------
+   Read-only it is the title: same weight, same padding, no chrome, so
+   the eye reads one line of "where am I". Editing it gives it a real
+   box, because at that point it is a field and has to look like one. */
+{NODE_NAME_SELECTOR} {{
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    padding: 6px 2px 5px 2px;
+    font-weight: bold;
+    color: {t['text']};
+}}
+{NODE_NAME_SELECTOR}:hover:read-only {{
+    border: 1px solid {t['border']};
+}}
+{NODE_NAME_SELECTOR}:!read-only {{
+    background: {t['surface']};
+    border: 1px solid {t['accent']};
+    padding: 6px 4px 5px 4px;
 }}
 
 /* --- item views this application owns -------------------------------
