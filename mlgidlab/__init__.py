@@ -19,12 +19,45 @@ from PySide6.QtWidgets import QApplication
 __version__ = "0.1.0a17"
 
 
+def _enable_crash_log() -> None:
+    """Dump the Python stack of every thread on a hard crash.
+
+    A segfault out of Qt, h5py or a GPU driver takes the window with it
+    and leaves nothing behind — which is the difference between a bug
+    that can be fixed and one that can only be waited for. ``faulthandler``
+    costs nothing until the process dies and then names the exact frame.
+
+    The dump goes to a file rather than stderr because the app is
+    launched from a desktop entry (and, on Windows, from ``pythonw``)
+    more often than from a terminal, and in both cases stderr goes
+    nowhere. The file is kept open for the life of the process on
+    purpose: the handler runs in a broken process and cannot open one.
+    """
+    try:
+        import faulthandler
+        import tempfile
+        from pathlib import Path
+
+        path = Path(tempfile.gettempdir()) / "mlgidlab_crash.log"
+        # Deliberately not closed, and deliberately not a context
+        # manager: the file has to still be open when the process dies.
+        stream = open(path, "a", buffering=1)
+        stream.write(f"--- mlgidLAB started, pid {os.getpid()} ---\n")
+        faulthandler.enable(file=stream, all_threads=True)
+    except Exception:
+        # A missing crash log must never be what stops the app starting.
+        pass
+
+
 def main() -> int:
     from PySide6.QtCore import QSettings, QTimer
     from pathlib import Path
     from mlgidlab.main_window import MainWindow
     from mlgidlab.theme import apply_dark_theme, apply_light_theme
 
+    # Before the QApplication, so a crash inside Qt's own start-up is
+    # caught too.
+    _enable_crash_log()
     app = QApplication(sys.argv)
     # Reclaim working-copy temp dirs leaked by a previous run that was killed
     # before its graceful close ran (see mlgidlab.session). Only removes dirs

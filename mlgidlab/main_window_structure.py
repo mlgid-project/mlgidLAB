@@ -1297,23 +1297,45 @@ class StructureMixin:
                              exc_info=True)
 
     def _restore_tree_state(self, state) -> None:
-        """Put the browser's open rows and selection back after a rebuild."""
+        """Put the browser's open rows and selection back after a rebuild.
+
+        Under a flag, because putting a selection back is not a click.
+        ``select()`` emits ``selectionChanged`` synchronously, and
+        ``_on_tree_selection_changed`` promotes the clicked node's file
+        to the active session — which, with the Structure tab in front,
+        runs ``_apply_session_mode`` → ``_prepare_structure_editing`` →
+        ``_acquire_edit_handle`` → ``_detach_silx_tree``, resetting the
+        very model this index belongs to. The ``setCurrentIndex`` on the
+        next line then hands the sort proxy an index whose internal
+        pointer is gone, and ``QSortFilterProxyModel::parent`` walks it:
+        a hard segfault, not an exception.
+
+        Reachable when the restored selection sits in a file that is not
+        the active session — opening a second file while editing the
+        first, most of all, since that is what makes the promotion do
+        any work. The state being restored was the user's already, so
+        there is nothing here for the handler to react to.
+        """
         expanded, selected = state
-        for key in expanded:
-            index = self._find_tree_index(key)
+        self._restoring_tree_selection = True
+        try:
+            for key in expanded:
+                index = self._find_tree_index(key)
+                if index is not None and index.isValid():
+                    self.tree.expand(index)
+            if selected is None:
+                return
+            index = self._find_tree_index(selected)
             if index is not None and index.isValid():
-                self.tree.expand(index)
-        if selected is None:
-            return
-        index = self._find_tree_index(selected)
-        if index is not None and index.isValid():
-            self.tree.selectionModel().select(
-                index,
-                QItemSelectionModel.SelectionFlag.ClearAndSelect
-                | QItemSelectionModel.SelectionFlag.Rows,
-            )
-            self.tree.selectionModel().setCurrentIndex(
-                index, QItemSelectionModel.SelectionFlag.Current)
+                self.tree.selectionModel().select(
+                    index,
+                    QItemSelectionModel.SelectionFlag.ClearAndSelect
+                    | QItemSelectionModel.SelectionFlag.Rows,
+                )
+                self.tree.selectionModel().setCurrentIndex(
+                    index, QItemSelectionModel.SelectionFlag.Current)
+        finally:
+            self._restoring_tree_selection = False
 
     def _rebuild_tree_preserving(self, state, handle=None) -> None:
         """Rebuild the browser and put its open rows and selection back.
@@ -1462,20 +1484,40 @@ class StructureMixin:
             self._ensure_browser_current()
 
     def _apply_structure_pending_entry(self) -> None:
-        """Switch to the entry of the last node touched in the tab's tree.
+        """Catch the viewer up with whatever moved while the tab was up.
 
-        One frame load on the way out instead of one per click. The
-        viewer therefore lands on what was being edited, which is where
-        the user was looking anyway.
+        Two things can have moved it: a node clicked in the tab's own
+        tree, and the entry combo itself, which stays on the toolbar
+        while everything else folds away. Either way the frame load was
+        skipped, so at most one happens here instead of one per click.
+        The viewer lands on what was being edited, which is where the
+        user was looking anyway.
+
+        The node goes first: it may set the combo, in which case the
+        ordinary handler runs and clears the pending entry on its way
+        through, and nothing is loaded twice.
         """
         node = getattr(self, "_structure_pending_activation", None)
-        if node is None:
+        if node is not None:
+            self._structure_pending_activation = None
+            try:
+                self._activate_entry_for_node(node)
+            except Exception:
+                logger.debug("the deferred entry switch failed", exc_info=True)
+        if getattr(self, "_structure_pending_entry", None) is None:
             return
-        self._structure_pending_activation = None
+        self._structure_pending_entry = None
+        # The combo, not the remembered name: the session it belonged to
+        # may have been closed while the tab was in front, and the combo
+        # is repopulated from whatever is active now. An empty one means
+        # there is nothing left to show.
+        entry = self.entry_combo.currentText()
+        if not entry or self.session is None:
+            return
         try:
-            self._activate_entry_for_node(node)
+            self._on_entry_changed(entry)
         except Exception:
-            logger.debug("the deferred entry switch failed", exc_info=True)
+            logger.debug("the deferred entry load failed", exc_info=True)
 
     def _settle_dock_chrome(self) -> None:
         """Clean up after showing or hiding a tabified dock.
@@ -2035,10 +2077,19 @@ class StructureMixin:
             self._render_structure_node(
                 _PathNode(file_path, h5_edit.normalize_path(path)))
             return
-        self.tree.setCurrentIndex(index)
+        # Order matters. Selecting runs the browser's selection handler,
+        # which can promote a session and rebuild the tree under us — and
+        # then ``index`` points into a model that was reset, which Qt's
+        # sort proxy dereferences without checking (see
+        # ``_restore_tree_state`` for what that costs). So everything
+        # that needs the old index happens first, and the row is looked
+        # up again for the last step.
+        self.tree.scrollTo(index)
         self.tree.selectionModel().select(
             index,
             QItemSelectionModel.SelectionFlag.ClearAndSelect
             | QItemSelectionModel.SelectionFlag.Rows,
         )
-        self.tree.scrollTo(index)
+        index = self._find_tree_index((str(file_path), parts))
+        if index is not None and index.isValid():
+            self.tree.setCurrentIndex(index)

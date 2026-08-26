@@ -633,6 +633,131 @@ def test_a_click_from_another_tab_still_switches_at_once(opened, monkeypatch):
     assert len(loaded) == 1
 
 
+# The entry combo stays on the toolbar while every dock folds away, so
+# it is the one control that can still move the viewer from inside the
+# tab. The read behind it is already off the GUI thread; the install is
+# not, and that is what the user feels.
+
+
+def _entry(window):
+    return window.entry_combo.currentText()
+
+
+def test_switching_entry_in_the_tab_does_not_load_the_frame(editing_tab,
+                                                            monkeypatch):
+    loaded = []
+    monkeypatch.setattr(
+        editing_tab, "_load_entry_async", lambda entry: loaded.append(entry))
+
+    editing_tab._on_entry_changed(_entry(editing_tab))
+
+    assert loaded == []
+    assert editing_tab._structure_pending_entry == _entry(editing_tab)
+
+
+def test_leaving_the_tab_loads_the_entry_once(editing_tab, monkeypatch):
+    loaded = []
+    monkeypatch.setattr(
+        editing_tab, "_load_entry_async", lambda entry: loaded.append(entry))
+    entry = _entry(editing_tab)
+    editing_tab._on_entry_changed(entry)
+    editing_tab._on_entry_changed(entry)
+
+    editing_tab.tabs.setCurrentWidget(editing_tab.viewer)
+
+    assert loaded == [entry]
+    assert editing_tab._structure_pending_entry is None
+
+
+def test_an_entry_change_outside_the_tab_loads_at_once(opened, monkeypatch):
+    """Only this tab defers. Everywhere else the viewer is on screen."""
+    loaded = []
+    monkeypatch.setattr(
+        opened, "_load_entry_async", lambda entry: loaded.append(entry))
+    opened.tabs.setCurrentWidget(opened.viewer)
+
+    opened._on_entry_changed(_entry(opened))
+
+    assert loaded == [_entry(opened)]
+    assert opened._structure_pending_entry is None
+
+
+def test_a_file_closed_behind_the_tab_leaves_nothing_to_catch_up_on(
+    editing_tab, monkeypatch
+):
+    """The combo is the source of truth, not the remembered name.
+
+    A name remembered from a session that has since been closed would
+    be loaded out of a file that is no longer open.
+    """
+    loaded = []
+    monkeypatch.setattr(
+        editing_tab, "_load_entry_async", lambda entry: loaded.append(entry))
+    editing_tab._on_entry_changed(_entry(editing_tab))
+    editing_tab.entry_combo.blockSignals(True)
+    editing_tab.entry_combo.clear()
+    editing_tab.entry_combo.blockSignals(False)
+
+    editing_tab.tabs.setCurrentWidget(editing_tab.viewer)
+
+    assert loaded == []
+    assert editing_tab._structure_pending_entry is None
+
+
+# Putting the browser's selection back after a rebuild used to re-enter
+# the rebuild itself and then use an index the reset had freed. It
+# crashed the process rather than raising: 2026-08-26 10:13:26,
+# ``segfault at 20 ... in libQt6Core.so.6``, which resolves to
+# ``QSortFilterProxyModel::parent`` — the proxy walking a dead internal
+# pointer. A test cannot observe a segfault, so it pins the cause.
+
+
+def test_putting_the_browser_selection_back_is_not_a_click(opened, monkeypatch):
+    """The restore must not run the selection handler.
+
+    The handler promotes the selected node's file to the active
+    session; with the Structure tab in front that reaches
+    ``_detach_silx_tree`` and resets the model mid-restore, leaving the
+    line after it holding a freed index.
+    """
+    from PySide6.QtCore import QItemSelectionModel, QModelIndex
+
+    promoted = []
+    monkeypatch.setattr(
+        opened, "_activate_session_for_node", lambda node: promoted.append(node))
+    # The fixture opens a session but not the browser row for it; the
+    # real open path does this in ``_on_open_finished``.
+    opened.tree.findHdf5TreeModel().insertFile(str(opened.session.temp_path))
+    root = opened.tree.model().index(0, 0, QModelIndex())
+    assert root.isValid()
+    opened.tree.selectionModel().select(
+        root,
+        QItemSelectionModel.SelectionFlag.ClearAndSelect
+        | QItemSelectionModel.SelectionFlag.Rows,
+    )
+    state = opened._capture_tree_state()
+    assert state[1] is not None, "nothing selected — the test proves nothing"
+    promoted.clear()
+
+    opened._rebuild_tree_preserving(state)
+
+    assert promoted == []
+    assert not opened._restoring_tree_selection
+
+
+def test_the_flag_is_lowered_even_when_the_restore_blows_up(opened,
+                                                            monkeypatch):
+    """A stuck flag would silently deafen every later click."""
+    monkeypatch.setattr(
+        opened, "_find_tree_index",
+        lambda key: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    with pytest.raises(RuntimeError):
+        opened._restore_tree_state(([("f", ())], None))
+
+    assert not opened._restoring_tree_selection
+
+
 # -- the region boxes ------------------------------------------------------
 
 

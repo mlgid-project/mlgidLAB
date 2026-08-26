@@ -58,13 +58,35 @@ pre-releases.
   File browser included, since the tab navigates from its own tree — and
   puts back exactly the ones that were open.
 
-  Two things it used to do per click are now done once, when you leave
-  the tab: rebuilding the File browser after a structural edit, and
-  switching the image to the entry you last clicked. Both update
-  something the tab hides, and doing them per edit made a large file
-  feel slow for no visible benefit.
+  Three things it used to do per click are now done once, when you
+  leave the tab: rebuilding the File browser after a structural edit,
+  switching the image to the entry you last clicked, and loading the
+  frame behind the entry combo. All three update something the tab
+  hides, and doing them per edit made a large file feel slow for no
+  visible benefit. Switching entry from the toolbar while editing is
+  now instant; the image catches up when you go back to it.
+
+- **A crash log.** A hard crash — a segfault out of Qt, h5py or a
+  driver — used to take the window with it and leave nothing behind.
+  Every run now appends to `mlgidlab_crash.log` in the system temp
+  directory, and a crash writes the Python stack of every thread into
+  it. Nothing is written while the app is healthy beyond one line per
+  start.
 
 ### Fixed
+
+- **Opening a second file while editing the first could kill the
+  window.** Not an error dialog — the process died outright. After any
+  rebuild of the File browser the app puts the user's selection back,
+  and that selection was being delivered to the click handler as though
+  the user had made it. The handler promotes the selected file to the
+  active session, which — with the Structure tab in front — tears the
+  browser down again mid-restore, leaving the next line holding an index
+  into a model that no longer had one. Qt's sort proxy then walked it.
+  Rare, because it needed the restored selection to sit in a file that
+  was not already active, which is exactly what opening a second file
+  arranges. A restore is now marked as a restore, and the handler
+  ignores it.
 
 - **The view controls above the image could be dead on a single-frame
   file.** With one frame the whole frame transport is hidden, and the

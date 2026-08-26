@@ -383,6 +383,15 @@ class MainWindow(
         # entry is applied when the tab is left, so browsing a file to
         # edit it never reloads the image behind the tab.
         self._structure_pending_activation = None
+        # The entry the combo was moved to while the tab was in front.
+        # The read is async but the install is not, and installing a
+        # frame into a viewer nobody can see is the whole cost for none
+        # of the benefit. Reconciled from the combo on the way out.
+        self._structure_pending_entry = None
+        # Raised while the File browser's selection is being put back
+        # after a rebuild, so the selection handler can tell that apart
+        # from a click. See ``_restore_tree_state``.
+        self._restoring_tree_selection = False
         # What the Structure tab holds between a Copy and a Paste. Kept
         # apart from the peak clipboard: Ctrl+C means a different thing
         # on each tab.

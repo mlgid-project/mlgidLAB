@@ -284,6 +284,9 @@ class FramesMixin:
         # on. Commit it before the switch, while the entry combo still
         # names that entry — the commit reads it from there.
         self.viewer.commit_pending_manual()
+        if self._entry_load_is_deferred(entry):
+            return
+        self._structure_pending_entry = None
         if self.session.kind == "raw":
             self._load_raw_entry_into_viewer(entry)
             self._update_status_entry()
@@ -297,6 +300,30 @@ class FramesMixin:
             self._update_status_entry()
             # Multi-energy files: the parsed CIF cache is entry-specific.
             self._sim_entry_mismatch_hint(entry)
+
+    def _entry_load_is_deferred(self, entry: str) -> bool:
+        """Whether to skip the frame load because Structure is in front.
+
+        The read already happens off the GUI thread; the install does
+        not, and on a large detector frame that install — the image, the
+        autoscale, the overlays, the profile — is the freeze the user
+        feels. All of it lands in widgets the Structure tab has folded
+        away, so while that tab is up the entry is only remembered. It
+        is reconciled from the combo when the tab is left, which is the
+        first moment anyone can see the difference.
+
+        Both attributes are read defensively: this runs during window
+        construction, before the tabs exist, and a missing panel must
+        read as "not on that tab" rather than as "on it".
+        """
+        panel = getattr(self, "structure_panel", None)
+        tabs = getattr(self, "tabs", None)
+        if panel is None or tabs is None or tabs.currentWidget() is not panel:
+            return False
+        self._structure_pending_entry = entry
+        # The status bar is not folded away, so it keeps up.
+        self._update_status_entry()
+        return True
 
     def _on_frame_slider_changed(self, value: int) -> None:
         """User dragged the Display-dock slider — push to the viewer.
@@ -844,6 +871,12 @@ class FramesMixin:
             self.entry_combo.setCurrentText(label)
 
     def _on_tree_selection_changed(self, *_: object) -> None:
+        # A selection the app just put back after rebuilding the tree is
+        # not a click: reacting to it re-enters the rebuild and leaves
+        # the caller holding an index into a model that no longer has
+        # one. See ``_restore_tree_state``.
+        if getattr(self, "_restoring_tree_selection", False):
+            return
         image_node = self._selected_image_node()
         if image_node is not None:
             self._activate_image_node(image_node)
