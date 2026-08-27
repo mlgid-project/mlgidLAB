@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
-    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -29,6 +28,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from mlgidlab import file_dialogs
 
 import logging
 
@@ -47,18 +48,15 @@ class ImportConvertedDialog(QDialog):
     """Collects the parameters for a converted-image import.
 
     ``values()`` is valid only after ``exec()`` returned Accepted.
-    ``icon_provider`` (optional) is installed on the output-path save
-    dialog so browsing a directory full of detector images stays
-    instant (same reasoning as the main Open dialog).
+    The output-path picker runs through ``file_dialogs``, which owns
+    both the shared browsing directory and the constant-time icon
+    provider that keeps a detector-image folder listing instantly.
     """
 
-    def __init__(
-        self, paths: list[Path], parent=None, icon_provider=None
-    ) -> None:
+    def __init__(self, paths: list[Path], parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Import images as converted scan")
         self._paths = list(paths)
-        self._icon_provider = icon_provider
 
         layout = QVBoxLayout(self)
         summary = QLabel(self._summary_text())
@@ -187,21 +185,17 @@ class ImportConvertedDialog(QDialog):
             w.setEnabled(checked)
 
     def _browse_output(self) -> None:
-        dlg = QFileDialog(self, "Save imported scan as")
-        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
-        dlg.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
-        dlg.setNameFilter("NeXus / HDF5 (*.h5 *.hdf5 *.nxs)")
-        dlg.setDefaultSuffix("h5")
-        if self._icon_provider is not None:
-            dlg.setIconProvider(self._icon_provider)
-        current = self.out_path.text().strip()
-        if current:
-            dlg.setDirectory(str(Path(current).parent))
-            dlg.selectFile(Path(current).name)
-        if dlg.exec():
-            files = dlg.selectedFiles()
-            if files:
-                self.out_path.setText(files[0])
+        # The field's *name* carries over; the directory is the
+        # app-wide browsing one (``file_dialogs``), same as every
+        # other picker.
+        path, _ = file_dialogs.save_file(
+            self, "Save imported scan as",
+            "NeXus / HDF5 (*.h5 *.hdf5 *.nxs)",
+            suggested_name=self.out_path.text().strip(),
+            default_suffix="h5",
+        )
+        if path:
+            self.out_path.setText(path)
 
     def _validate_and_accept(self) -> None:
         if not self.out_path.text().strip():

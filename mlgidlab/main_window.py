@@ -86,6 +86,7 @@ from silx.gui.hdf5 import Hdf5TreeModel, Hdf5TreeView
 from silx.gui.hdf5.Hdf5Node import Hdf5Node
 from silx.gui.hdf5.NexusSortFilterProxyModel import NexusSortFilterProxyModel
 
+from mlgidlab import file_dialogs
 from mlgidlab import file_model
 from mlgidlab import frame_range
 from mlgidlab import peak_clipboard
@@ -282,9 +283,10 @@ class MainWindow(
         # select its image without any scan. Rebuilt by
         # ``_populate_raw_entries``.
         self._raw_entry_label_by_path: dict[str, str] = {}
-        # Shared by every Open dialog; ``setIconProvider`` does not take
-        # ownership, so the provider must outlive the dialog.
-        self._file_dialog_icons = _FastFileIconProvider()
+        # Shared by every file dialog in the app; ``setIconProvider``
+        # does not take ownership, so the provider must outlive the
+        # dialog. ``file_dialogs`` owns the single instance.
+        self._file_dialog_icons = file_dialogs.icon_provider()
         self._thread: QThread | None = None
         self._worker: CopyWorker | None = None
         self._pipe_thread: QThread | None = None

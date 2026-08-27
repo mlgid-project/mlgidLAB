@@ -11,17 +11,15 @@ import time
 from PySide6.QtCore import (
     QEventLoop,
     QMetaObject,
-    QSettings,
     QThread,
     Qt,
 )
 from PySide6.QtWidgets import (
     QApplication,
-    QFileDialog,
     QMessageBox,
 )
 from contextlib import contextmanager
-from mlgidlab import file_model
+from mlgidlab import file_dialogs, file_model
 from mlgidlab.browser_widgets import _MlgidHdf5TreeModel
 from mlgidlab.main_window_constants import (
     APP_NAME,
@@ -67,9 +65,9 @@ class FilesMixin:
         beamtime directory holding thousands of detector TIFFs takes
         ages to even become scrollable. The widget dialog with the
         constant-time ``_FastFileIconProvider`` lists such directories
-        instantly (and follows the app theme). The last-visited
-        directory persists across sessions via QSettings — the static
-        native dialog used to remember it only per-run.
+        instantly (and follows the app theme). Both that and the
+        remembered starting directory now come from ``file_dialogs``,
+        which every picker in the app shares.
         """
         paths = self._pick_files("Open file(s)", OPEN_FILTER)
         if paths:
@@ -79,26 +77,12 @@ class FilesMixin:
         """Multi-select file picker shared by Open and Import.
 
         Uses Qt's widget dialog instead of the platform-native one ON
-        PURPOSE (see ``_action_open``); the last-visited directory
-        persists across sessions via QSettings.
+        PURPOSE (see ``_action_open``); the starting directory is the
+        one every other picker in the app uses.
         """
-        dlg = QFileDialog(self, title)
-        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
-        dlg.setFileMode(QFileDialog.FileMode.ExistingFiles)
-        dlg.setNameFilter(name_filter)
-        dlg.setIconProvider(self._file_dialog_icons)
-        last_dir = str(QSettings().value("open/last_dir", "") or "")
-        if last_dir:
-            dlg.setDirectory(last_dir)
-        if not dlg.exec():
-            return []
-        paths = [Path(p) for p in dlg.selectedFiles()]
-        if not paths:
-            return []
-        QSettings().setValue(
-            "open/last_dir", dlg.directory().absolutePath()
-        )
-        return paths
+        return [
+            Path(p) for p in file_dialogs.open_files(self, title, name_filter)
+        ]
 
     def _action_import_converted(self) -> None:
         """File → Import images as converted scan… — explicit entry
@@ -123,9 +107,7 @@ class FilesMixin:
         from mlgidlab.import_dialog import ImportConvertedDialog
 
         paths = sorted(paths, key=_natural_key)
-        dialog = ImportConvertedDialog(
-            paths, parent=self, icon_provider=self._file_dialog_icons
-        )
+        dialog = ImportConvertedDialog(paths, parent=self)
         if not dialog.exec():
             return
         values = dialog.values()
@@ -436,11 +418,12 @@ class FilesMixin:
         if self.session is None or self.session.kind != "nexus":
             return
         assert isinstance(self.session, NexusSession)
-        path, _ = QFileDialog.getSaveFileName(
+        path, _ = file_dialogs.save_file(
             self,
             "Save As",
-            str(self.session.original_path),
             NEXUS_FILTER,
+            suggested_name=self.session.original_path.name,
+            default_suffix="h5",
         )
         if not path:
             return

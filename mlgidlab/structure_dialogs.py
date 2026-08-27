@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -28,7 +27,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from mlgidlab import nexus_schema
+from mlgidlab import file_dialogs, nexus_schema
 from mlgidlab.h5_edit import DTYPE_CHOICES
 from mlgidlab.widgets import make_form
 
@@ -318,10 +317,10 @@ class NewLinkDialog(QDialog):
         self.help.setText(LINK_KIND_HELP.get(kind, ""))
 
     def _on_browse(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Link to file", self.file_edit.text(),
+        path = file_dialogs.open_file(
+            self, "Link to file",
             "HDF5 files (*.h5 *.hdf5 *.nxs);;All files (*)",
-            options=QFileDialog.Option.DontUseNativeDialog,
+            suggested_name=self.file_edit.text(),
         )
         if path:
             self.file_edit.setText(path)

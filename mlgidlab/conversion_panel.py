@@ -20,7 +20,6 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
-    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -41,6 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mlgidlab import file_dialogs
 from mlgidlab.file_model import RawEntry, list_entry_names
 
 import logging
@@ -806,8 +806,8 @@ class ConversionPanel(QWidget):
         )
 
     def _browse_poni(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select PONI file", "",
+        path = file_dialogs.open_file(
+            self, "Select PONI file",
             "PONI calibration (*.poni);;All files (*)",
         )
         if path:
@@ -881,8 +881,8 @@ class ConversionPanel(QWidget):
         )
 
     def _browse_mask(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select mask file", "",
+        path = file_dialogs.open_file(
+            self, "Select mask file",
             "Mask images (*.npy *.tif *.tiff *.edf);;All files (*)",
         )
         if path:
@@ -1079,8 +1079,8 @@ class ConversionPanel(QWidget):
         return section
 
     def _load_smpl_yaml(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load sample metadata", "",
+        path = file_dialogs.open_file(
+            self, "Load sample metadata",
             "YAML (*.yaml *.yml);;All files (*)",
         )
         if not path:
@@ -1093,9 +1093,11 @@ class ConversionPanel(QWidget):
         self.smpl_yaml.setPlainText(text)
 
     def _save_smpl_yaml(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save sample metadata", "",
+        path, _ = file_dialogs.save_file(
+            self, "Save sample metadata",
             "YAML (*.yaml *.yml);;All files (*)",
+            suggested_name="sample.yaml",
+            default_suffix="yaml",
         )
         if not path:
             return
@@ -1404,8 +1406,8 @@ class ConversionPanel(QWidget):
             self.append_entry_combo.setCurrentIndex(len(names) - 1)
 
     def _browse_output_dir(self) -> None:
-        path = QFileDialog.getExistingDirectory(
-            self, "Select output directory", str(Path.home())
+        path = file_dialogs.existing_directory(
+            self, "Select output directory"
         )
         if path:
             self.output_dir.setText(path)

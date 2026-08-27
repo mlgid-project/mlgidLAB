@@ -13,12 +13,12 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QFileDialog,
     QFormLayout,
     QMessageBox,
     QSpinBox,
     QTabBar,
 )
+from mlgidlab import file_dialogs
 from mlgidlab import file_model
 from mlgidlab.image_viewer import SelectedPeak
 from mlgidlab.main_window_dialogs import (
@@ -553,9 +553,11 @@ class MenusMixin:
         # batched exports from multiple opens don't collide on disk.
         base = self.session.original_path.stem
         suggest = f"{base}_{kind}_{scope}.csv"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export peaks as CSV", suggest,
+        path, _ = file_dialogs.save_file(
+            self, "Export peaks as CSV",
             "CSV (*.csv);;All files (*)",
+            suggested_name=suggest,
+            default_suffix="csv",
         )
         if not path:
             return

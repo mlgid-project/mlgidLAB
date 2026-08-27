@@ -29,13 +29,12 @@ from PySide6.QtCore import QItemSelectionModel, QModelIndex, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
-    QFileDialog,
     QInputDialog,
     QMenu,
     QMessageBox,
 )
 
-from mlgidlab import file_model, h5_edit, nexus_schema
+from mlgidlab import file_dialogs, file_model, h5_edit, nexus_schema
 from silx.gui.hdf5 import Hdf5TreeModel
 
 from mlgidlab.browser_widgets import _ImageFileNode
@@ -1931,10 +1930,9 @@ class StructureMixin:
             target = self._structure_selected_target()
         if target is None:
             return
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Copy from file", "",
+        path = file_dialogs.open_file(
+            self, "Copy from file",
             "HDF5 / NeXus files (*.h5 *.hdf5 *.nxs);;All files (*)",
-            options=QFileDialog.Option.DontUseNativeDialog,
         )
         if not path:
             return

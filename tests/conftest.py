@@ -242,6 +242,48 @@ def pytest_runtest_teardown(item, nextitem):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_file_dialog():
+    """Turn a file dialog that actually opens into a failure, not a hang.
+
+    Every picker in the app is built by ``mlgidlab.file_dialogs``, so a
+    test that exercises a Browse button fakes it there -- or patches
+    ``QFileDialog.exec`` itself, which lands on top of this and wins.
+    Anything else reaches a modal ``exec()`` with nobody to answer it
+    and blocks the run forever; a loud error names the test instead.
+
+    Patches by hand rather than through ``monkeypatch`` ON PURPOSE.
+    An autouse fixture is set up before the ones a test asks for, so
+    requesting ``monkeypatch`` here would make it the *first* fixture
+    created and therefore the *last* undone -- after the ``main_window``
+    finalizer instead of before it. Tests that patch a method
+    ``closeEvent`` calls (``test_reopen_keeps_dirty_old_session_on_cancel``
+    patches ``_confirm_discard_changes``) rely on the opposite order:
+    with the patch still live, the close is refused, the window is torn
+    down with its worker threads running, and the deferred-delete flush
+    below hangs the run.
+    """
+    from PySide6.QtWidgets import QFileDialog
+
+    def _refuse(self):
+        raise RuntimeError(
+            "a real QFileDialog.exec() was reached: fake "
+            "mlgidlab.file_dialogs (or patch QFileDialog.exec) in this "
+            "test -- see tests/test_file_dialogs.py"
+        )
+
+    # ``exec`` is inherited from QDialog, so restoring means removing
+    # the override, not writing the parent's method back onto the class.
+    QFileDialog.exec = _refuse
+    try:
+        yield
+    finally:
+        try:
+            del QFileDialog.exec
+        except AttributeError:
+            pass
+
+
+@pytest.fixture(autouse=True)
 def _cleanup_session_temp_dirs():
     """Remove any NexusSession working-copy temp dir a test left open.
 

@@ -15,8 +15,8 @@ construction-time `QTimer.singleShot(0, self._render)` can't fire a real
 from __future__ import annotations
 
 import pytest
-from PySide6.QtWidgets import QFileDialog
 
+from mlgidlab import file_dialogs
 from mlgidlab.figure_export_window import FigureExportWindow, _modified_save_paths
 
 pytestmark = pytest.mark.gui
@@ -43,8 +43,11 @@ def test_browse_save_path_handles_png_and_svg(main_window, qtbot, monkeypatch):
     qtbot.addWidget(win)
 
     def _dialog(ret):
+        # Every picker is built by ``file_dialogs`` now, so that is the
+        # seam to fake — patching ``QFileDialog`` statics would leave a
+        # real modal dialog to block on.
         monkeypatch.setattr(
-            QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: ret)
+            file_dialogs, "save_file", lambda *a, **k: ret
         )
 
     # No extension + SVG filter -> .svg

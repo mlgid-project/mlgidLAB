@@ -22,6 +22,7 @@ Qt-heavy import chain stays out of cold startup.
 from __future__ import annotations
 
 import argparse
+import functools
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +30,6 @@ import numpy as np
 from PySide6.QtCore import QSettings, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QDialog,
-    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mlgidlab import file_dialogs
 from mlgidlab.widgets import PRIMARY as _PRIMARY, set_variant as _set_variant
 
 # These imports trigger a large Qt + matplotlib + silx chain. Done
@@ -59,6 +60,23 @@ from pyFAI.gui.tasks.PeakPickingTask import PeakPickingTask
 
 import logging
 logger = logging.getLogger(__name__)
+
+
+def _adopting(create):
+    """Wrap a pyFAI dialog factory so the result follows the shared dir."""
+
+    @functools.wraps(create)
+    def wrapper(*args, **kwargs):
+        dialog = create(*args, **kwargs)
+        try:
+            file_dialogs.adopt(dialog)
+        except Exception:
+            logger.debug(
+                "could not adopt a pyFAI file dialog", exc_info=True
+            )
+        return dialog
+
+    return wrapper
 
 
 # Task identifiers keyed by stable string IDs so callers don't have
@@ -218,9 +236,33 @@ class CalibrationDialog(QDialog):
         opts, _ = parser.parse_known_args([])
         calib2.setup_model(ctx.getCalibrationModel(), opts)
 
+        self._patch_pyfai_dialogs(ctx)
+
         self._calib_context = ctx
         self._calib_context.setParent(self)
         self._calib_model = ctx.getCalibrationModel()
+
+    def _patch_pyfai_dialogs(self, ctx) -> None:
+        """Make pyFAI's own file dialogs share mlgidLAB's browsing directory.
+
+        Every calibration picker -- load image, load mask, load/save
+        control points, and the "Save as PONI" button the whole
+        dialog exists for -- is built inside pyFAI by
+        ``CalibrationContext.createFileDialog``, which starts it at
+        the process working directory (``/`` under a desktop
+        launcher). Wrapping the factory is the only place we can
+        reach them, and it is why saving a PONI now lands in the same
+        directory the scan and the mask came from.
+
+        Wrapped per instance, not on the class: the context is a
+        singleton that ``_setup_pyfai_context`` releases and rebuilds
+        on each launch, so patching the class would stack wrappers.
+        """
+        for name in ("createFileDialog", "createImageFileDialog"):
+            original = getattr(ctx, name, None)
+            if original is None:
+                continue
+            setattr(ctx, name, _adopting(original))
 
     def _build_tasks(self) -> None:
         """Instantiate the five canonical pyFAI task widgets."""
@@ -634,12 +676,12 @@ class CalibrationDialog(QDialog):
             )
             return
 
-        path_str, name_filter = QFileDialog.getSaveFileName(
+        path_str, name_filter = file_dialogs.save_file(
             self,
             "Save mask",
-            "",
             "NumPy mask (*.npy);;TIFF mask (*.tif *.tiff);;"
             "EDF mask (*.edf);;All files (*)",
+            suggested_name="mask.npy",
         )
         if not path_str:
             return

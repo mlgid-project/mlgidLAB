@@ -112,6 +112,22 @@ pre-releases.
 
 ### Fixed
 
+- **Every Browse button now starts where you left off.** Opening a
+  scan, then picking a mask, then saving a PONI used to drop you in
+  three unrelated directories, and several buttons opened at the
+  filesystem root every time. There is now one browsing directory for
+  the whole app: a dialog opens where the last one finished, whatever
+  it was for, and the choice is kept until you change it — across a
+  restart as well as within a session. A button that suggests a file
+  name still suggests it; only the folder is shared. The calibration
+  window's own pickers follow the same directory, including the *Save
+  as PONI* button inside it.
+
+  Every dialog now uses Qt's own file picker rather than the
+  platform's, which was already true of Open: any of them can now land
+  in a folder of thousands of detector images, and the platform picker
+  makes a thumbnail of every one before the listing can be scrolled.
+
 - **Opening a second file while editing the first could kill the
   window.** Not an error dialog — the process died outright. After any
   rebuild of the File browser the app puts the user's selection back,

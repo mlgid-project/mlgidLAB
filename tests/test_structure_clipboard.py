@@ -431,8 +431,7 @@ def test_paste_from_file_picks_a_node_and_copies_it(
     from mlgidlab import main_window_structure as mws
 
     monkeypatch.setattr(
-        mws.QFileDialog, "getOpenFileName",
-        staticmethod(lambda *a, **k: (str(other), "")),
+        mws.file_dialogs, "open_file", lambda *a, **k: str(other),
     )
 
     class _Picker:
@@ -458,8 +457,7 @@ def test_paste_from_file_cancelled_at_the_picker_does_nothing(
     from mlgidlab import main_window_structure as mws
 
     monkeypatch.setattr(
-        mws.QFileDialog, "getOpenFileName",
-        staticmethod(lambda *a, **k: (str(other), "")),
+        mws.file_dialogs, "open_file", lambda *a, **k: str(other),
     )
 
     class _Picker:
