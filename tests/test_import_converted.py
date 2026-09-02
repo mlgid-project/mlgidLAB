@@ -304,6 +304,52 @@ def test_pipeline_guard_refuses_imported_entry(main_window, tmp_path):
     assert not main_window._entry_missing_geometry(minimal, "entry_0000")
 
 
+def test_import_dialog_takes_an_angle_per_image(
+    main_window, qtbot, tmp_path
+):
+    """Same grammar as the Conversion panel, checked against the image count."""
+    from mlgidlab.import_dialog import ImportConvertedDialog
+
+    # Five images, so three numbers are unambiguously a ramp (with
+    # exactly three they would read as three angles, by design).
+    tifs = _write_float_tiffs(tmp_path / "maps", n=5)
+    dlg = ImportConvertedDialog(tifs, parent=main_window)
+    qtbot.addWidget(dlg)
+
+    dlg.ai_input.setText("0.1, 0.2, 0.3, 0.4, 0.5")
+    assert dlg.values()["ai"] == pytest.approx([0.1, 0.2, 0.3, 0.4, 0.5])
+    assert dlg.ai_hint.text().startswith("5 angles")
+
+    # A ramp gives one MORE angle than its step count.
+    dlg.ai_input.setText("(0.1, 0.5, 4)")
+    assert dlg.values()["ai"] == pytest.approx([0.1, 0.2, 0.3, 0.4, 0.5])
+
+    # ...and getting that wrong is caught while typing, not at Import.
+    dlg.ai_input.setText("(0.1, 0.5, 5)")
+    assert dlg.ai_hint.property("status") == "error"
+    assert "5 image(s)" in dlg.ai_hint.text()
+
+    # An empty field is the old default, not an error.
+    dlg.ai_input.setText("")
+    assert dlg.values()["ai"] == pytest.approx(0.0)
+
+
+def test_import_writes_one_angle_per_frame(tmp_path):
+    """The array lands in instrument/angle_of_incidence, in order."""
+    tifs = _write_float_tiffs(tmp_path / "maps")
+    out = import_converted_stack(
+        tifs, tmp_path / "out.h5", ai=[0.1, 0.2, 0.3],
+    )
+    with h5py.File(out, "r") as f:
+        ai = np.asarray(f["entry_0000/instrument/angle_of_incidence"][()])
+    assert ai == pytest.approx([0.1, 0.2, 0.3])
+
+    with pytest.raises(ValueError, match="2 angles.*3 image"):
+        import_converted_stack(
+            tifs, tmp_path / "bad.h5", ai=[0.1, 0.2],
+        )
+
+
 def test_import_dialog_values_round_trip(
     main_window, qtbot, tmp_path, monkeypatch
 ):
@@ -327,7 +373,7 @@ def test_import_dialog_values_round_trip(
     dlg.qxy_max.setValue(2.5)
     dlg.qz_min.setValue(-0.5)
     dlg.qz_max.setValue(3.0)
-    dlg.ai_input.setValue(0.15)
+    dlg.ai_input.setText("0.15")
     dlg.flip_vertical.setChecked(True)
     dlg.wavelength_input.setValue(0.9601)
     values = dlg.values()

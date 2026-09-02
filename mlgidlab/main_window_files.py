@@ -469,7 +469,7 @@ class FilesMixin:
         # Additive: never tear down existing sessions. The new file simply
         # gets appended to the file browser when the copy completes.
         self._thread = QThread(self)
-        self._worker = CopyWorker(path)
+        self._worker = CopyWorker(path, self._extra_peak_datasets())
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._on_open_finished)
@@ -550,6 +550,18 @@ class FilesMixin:
             # lazily for one entry just before its first pipeline run (see
             # ``_ensure_entry_normalized``), so opening never touches every
             # linked scan.
+            #
+            # A file whose last pipeline run died mid-swap (see
+            # ``peak_lists`` / ``pipeline.recover_swaps``) still has a
+            # primary table sitting under a standard name. Put it back
+            # before anything reads the file, so the viewer never shows
+            # the wrong table as "detected peaks". A no-op, and no
+            # write at all, on the overwhelmingly normal file.
+            try:
+                from mlgidlab.pipeline import recover_swaps
+                recover_swaps(session.temp_path)
+            except Exception:
+                logger.debug("suppressed swap recovery on open", exc_info=True)
             self._sessions.append(session)
             self.tree.findHdf5TreeModel().insertFile(str(session.temp_path))
             # Re-opening a path that's already open REPLACES the old

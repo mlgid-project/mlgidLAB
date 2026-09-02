@@ -49,6 +49,7 @@ from mlgidlab.file_model import (
 
 if TYPE_CHECKING:
     from mlgidlab.file_model import FrameSource
+from mlgidlab import peak_lists
 from mlgidlab.polar import polar_to_qxyz
 from mlgidlab.flow_layout import ToolGroup, wrapping_bar
 from mlgidlab.image_viewer_overlays import ViewerOverlaysMixin
@@ -93,8 +94,11 @@ from mlgidlab.viewer_styles import (
     UNMATCHED_UID,
     _MATCHED_COLORS_KEY,
     _SIM_STATE_COLORS,
-    _load_matched_color_overrides,
-    _save_matched_color_overrides,
+    _load_matched_pen_overrides,
+    _save_matched_pen_overrides,
+    load_overlay_pen_overrides,
+    overlay_pen as _overlay_pen,
+    save_overlay_pen_overrides,
     _sim_intensity_scale,
     _sim_marker_size,
     matched_pen_for,
@@ -232,6 +236,10 @@ class GIWAXSImageViewer(
     # different from what the UI showed last (frame change, fresh load,
     # re-render after pipeline run). Args: (frame, list[MatchedStructure]).
     matchedStructuresChanged = Signal(int, list)
+    # Emitted when the user changes (or resets) the pen of the detected
+    # or fitted overlay. Carries the kind; the Display dock's swatch
+    # button listens so the legend follows the image.
+    overlayPenChanged = Signal(str)
     # Emitted when the set of simulated reflections selected for
     # injection changes (click toggle, Select missed, pattern swap,
     # intensity-cutoff pruning). Carries the sorted reflection indices;
@@ -436,9 +444,17 @@ class GIWAXSImageViewer(
         # the viewbox exists.
         self._install_axis_wheel_handler()
 
-        self._detected = _PeakShapeItem(**OVERLAY_STYLE["detected"])
-        self._fitted = _PeakShapeItem(**OVERLAY_STYLE["fitted"])
-        self._manual = _PeakShapeItem(**OVERLAY_STYLE["manual"])
+        # Hand-set pens for the detected / fitted / manual overlays: one
+        # partial pen per kind, layered over ``OVERLAY_STYLE``. Loaded
+        # BEFORE the items below, which are built from the effective
+        # pens so a customised overlay is right from the first render
+        # rather than flicking to it after the first change.
+        self._overlay_pen_overrides: dict[str, dict] = (
+            load_overlay_pen_overrides()
+        )
+        self._detected = _PeakShapeItem(**self.overlay_pen("detected"))
+        self._fitted = _PeakShapeItem(**self.overlay_pen("fitted"))
+        self._manual = _PeakShapeItem(**self.overlay_pen("manual"))
         self._selection = _PeakShapeItem(**SELECTION_STYLE)
         # Pre-selection preview: outlines the box a bare click would
         # take. Added before the selection item so a box that is both
@@ -468,6 +484,14 @@ class GIWAXSImageViewer(
         vb.addItem(self._hover, ignoreBounds=True)
         vb.addItem(self._selection, ignoreBounds=True)
         vb.addItem(self._fitted_preview, ignoreBounds=True)
+
+        # One item per user-registered extra peak list, rebuilt by
+        # ``set_peak_list_specs`` whenever the registry changes. Kept in
+        # a dict rather than as named attributes because the set is
+        # decided at runtime by Settings, not at construction. Filled at
+        # the END of __init__, once the state it renders against exists.
+        self._list_items: dict[str, _PeakShapeItem] = {}
+        self._peak_list_specs: list = []
 
         self._preview_item = pg.QtWidgets.QGraphicsRectItem()
         preview_pen = pg.mkPen(QColor("#ffeb3b"), width=1.0)
@@ -504,6 +528,9 @@ class GIWAXSImageViewer(
 
         self._frame_peaks: dict[int, dict[str, PeakTable | None]] = {}
         self._manual_peaks: dict[int, list[ManualPeak]] = {}
+        # Per-kind overlay visibility. Registered extra lists are added
+        # to this by ``set_peak_list_specs`` and default to visible, so a
+        # list the user just registered shows up without a second click.
         self._visibility: dict[str, bool] = {kind: True for kind in OVERLAY_KINDS}
 
         # Matched-structure overlays. Variable count per frame (one per row in
@@ -521,11 +548,12 @@ class GIWAXSImageViewer(
         # (previously coloured by per-frame position, which shuffled as
         # the structure set changed frame to frame).
         self._matched_color_index: dict[tuple, int] = {}
-        # User-picked colours per identity, layered over the palette.
-        # Loaded once here; ``set_matched_color`` keeps QSettings in
-        # sync. Survives ``clear()``: a preference, not file state.
-        self._matched_color_overrides: dict[tuple, str] = (
-            _load_matched_color_overrides()
+        # User-set pens per identity, layered over the palette --
+        # partial dicts, so overriding only the width leaves the colour
+        # cycling. Loaded once here; ``set_matched_pen`` keeps QSettings
+        # in sync. Survives ``clear()``: a preference, not file state.
+        self._matched_pen_overrides: dict[tuple, dict] = (
+            _load_matched_pen_overrides()
         )
         self._matched_master_visible: bool = True
         # How matched structures are drawn: "boxes" (default, per-peak
@@ -572,13 +600,15 @@ class GIWAXSImageViewer(
         self._mode = MODE_POLAR
         self._log_scale: bool = False
         # Raw-preview orientation flips, driven by the Conversion panel's
-        # fliplr/flipud checkboxes. Default False (show the frame exactly as
-        # stored); when set, the preview is flipped to match what pygid's
-        # conversion will produce. Only the raw branch of _render_frame reads
-        # these; the converted display is unaffected (its flips are already
-        # baked in by pygid). See set_raw_flips and _apply_raw_flips.
+        # fliplr/flipud/transpose checkboxes. Default False (show the frame
+        # exactly as stored); when set, the preview is reoriented to match
+        # what pygid's conversion will produce. Only the raw branch of
+        # _render_frame reads these; the converted display is unaffected (its
+        # orientation is already baked in by pygid). See set_raw_flips and
+        # _apply_raw_flips.
         self._raw_flip_lr: bool = False
         self._raw_flip_ud: bool = False
+        self._raw_transp: bool = False
         # The contrast (histogram) levels the user has dialed in with the
         # slider, or None to auto-contrast from the data. When set, it is
         # reused across operation re-renders (add-peak, pipeline reattach,
@@ -688,6 +718,10 @@ class GIWAXSImageViewer(
         # pyqtgraph's default "View All" does the same thing under a less
         # discoverable label; this just adds the explicitly-named entry.
         self._install_reset_zoom_action()
+
+        # Last, because it builds overlay items and renders: everything
+        # it touches (_mode, _visibility, _frame_peaks) has to exist.
+        self.set_peak_list_specs(peak_lists.load_specs())
 
     # -- Public API --
 
@@ -843,21 +877,31 @@ class GIWAXSImageViewer(
         self._raw_image_stack = arr_3d
         self._render_active_mode()
 
-    def set_raw_flips(self, flip_lr: bool, flip_ud: bool) -> None:
-        """Set the raw-preview orientation flips and re-render.
+    def set_raw_flips(
+        self, flip_lr: bool, flip_ud: bool, transp: bool = False,
+    ) -> None:
+        """Set the raw-preview orientation and re-render.
 
-        Driven by the Conversion panel's fliplr/flipud checkboxes so the
-        preview shows the raw image in the orientation the conversion will
-        produce (see ``_apply_raw_flips``). The flags persist, so a raw
-        stack loaded later is rendered with the same flips. Re-renders with
+        Driven by the Conversion panel's Orientation row -- fliplr,
+        flipud and transpose -- so the preview shows the raw image in the
+        orientation the conversion will produce (see
+        ``_apply_raw_flips``). The flags persist, so a raw stack loaded
+        later is rendered the same way. Re-renders with
         ``auto_range=False`` so the user's zoom/pan survives the toggle.
         """
         flip_lr, flip_ud = bool(flip_lr), bool(flip_ud)
-        if (flip_lr, flip_ud) == (self._raw_flip_lr, self._raw_flip_ud):
+        transp = bool(transp)
+        current = (self._raw_flip_lr, self._raw_flip_ud, self._raw_transp)
+        if (flip_lr, flip_ud, transp) == current:
             return
+        # A transpose swaps the frame's width and height, so the plot
+        # extent changes shape and the previous zoom rectangle no longer
+        # frames anything sensible. Refit in that case only.
+        refit = transp != self._raw_transp
         self._raw_flip_lr, self._raw_flip_ud = flip_lr, flip_ud
+        self._raw_transp = transp
         if self._mode == MODE_RAW and self._raw_image_stack is not None:
-            self._render_active_mode(auto_range=False)
+            self._render_active_mode(auto_range=refit)
 
     def _drop_raw_stack(self) -> None:
         """Forget the raw stack, closing a lazy stack's h5py handle.
@@ -1212,7 +1256,7 @@ class GIWAXSImageViewer(
             holder.updateGeometry()
 
     def set_overlay_visible(self, kind: str, visible: bool) -> None:
-        if kind not in OVERLAY_KINDS:
+        if kind not in OVERLAY_KINDS and kind not in self._list_items:
             return
         self._visibility[kind] = visible
         item = self._overlay_item(kind)

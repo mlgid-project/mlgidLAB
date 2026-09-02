@@ -300,16 +300,26 @@ def _cleanup_session_temp_dirs():
 
 @pytest.fixture
 def clean_matched_colors():
-    """Drop the persisted custom structure colours around a test.
+    """Drop the persisted custom pens around a test.
 
-    ``GIWAXSImageViewer`` loads the ``matchedColors`` QSettings key at
-    construction, so a test that picks colours would otherwise leak them
-    into every later viewer/MainWindow built in the same run."""
+    ``GIWAXSImageViewer`` loads the ``matchedPens`` and ``overlayPens``
+    QSettings keys at construction, so a test that picks a colour, line
+    style or width would otherwise leak it into every later
+    viewer/MainWindow built in the same run. ``matchedColors`` is the
+    pre-pen key, still read as a fallback, so it has to go too.
+    """
     from PySide6.QtCore import QSettings
 
-    QSettings().remove("matchedColors")
+    keys = ("matchedPens", "matchedColors", "overlayPens")
+
+    def drop() -> None:
+        settings = QSettings()
+        for key in keys:
+            settings.remove(key)
+
+    drop()
     yield
-    QSettings().remove("matchedColors")
+    drop()
 
 
 @pytest.fixture

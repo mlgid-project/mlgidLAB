@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QThread, QTimer, Qt
 from PySide6.QtWidgets import QMessageBox
-from mlgidlab import file_model
+from mlgidlab import file_model, peak_lists
 from mlgidlab.main_window_constants import APP_NAME
 from mlgidlab.pipeline import PipelineCommand
 from mlgidlab.widgets import make_progress_dialog
@@ -171,7 +171,21 @@ class PipelineMixin:
         return False
 
     def _enqueue_pipeline(self, file_path: Path, command: PipelineCommand) -> None:
-        """Queue ``(file_path, command)`` and start it if no run is in flight."""
+        """Queue ``(file_path, command)`` and start it if no run is in flight.
+
+        The single funnel every pipeline command passes through, which
+        is why the primary-table plan is stamped HERE rather than at the
+        eight ``PipelineCommand(...)`` construction sites: none of them
+        changes, and the multi-entry expansion in ``_on_pipeline_run``
+        (which rebuilds the command per entry) still lands here.
+
+        Reading the registry on this side is deliberate. The worker has
+        no business touching QSettings, so what crosses the thread
+        boundary is finished plain data.
+        """
+        command.table_swap = peak_lists.swap_plan(
+            command.op_name, peak_lists.load_specs()
+        )
         self._pipeline_queue.append((file_path, command))
         if self._pipe_thread is None:
             self._run_next_pipeline_command()
@@ -413,6 +427,11 @@ class PipelineMixin:
         Writes directly, without detaching silx: the only caller runs
         while the tree is still detached for the pipeline job (it
         reattaches when the queue drains).
+
+        Follows the run's primary tables: a redirected fit wrote its
+        rows to the primary fitted table and read the primary detected
+        one, so re-keying the standard pair would be pairing two tables
+        this run never touched.
         """
         from mlgidlab.peak_link import link_enabled
 
@@ -421,6 +440,9 @@ class PipelineMixin:
         entry_arg = cmd.kwargs.get("entry")
         frame_arg = cmd.kwargs.get("frame_num")
         frame = int(frame_arg) if isinstance(frame_arg, int) else None
+        swap = getattr(cmd, "table_swap", None)
+        detected_ds = peak_lists.swapped_name(swap, "detected_peaks")
+        fitted_ds = peak_lists.swapped_name(swap, "fitted_peaks")
         try:
             if isinstance(entry_arg, str) and entry_arg:
                 entries = [entry_arg]
@@ -430,6 +452,7 @@ class PipelineMixin:
             for ent in entries:
                 changed += file_model.rekey_fitted_ids_to_detected(
                     self.session.temp_path, ent, frame=frame,
+                    detected_dataset=detected_ds, fitted_dataset=fitted_ds,
                 )
         except Exception as exc:
             self.pipeline_panel.append_log(
@@ -493,12 +516,19 @@ class PipelineMixin:
         # phase-tracking results for that entry are stale. Invalidate
         # when the finished command was a fitting run touching the
         # tracked entry (kwargs without an entry ran on every entry).
+        # A run redirected to a primary fitted table did NOT rewrite
+        # fitted_peaks — the tracks still describe the rows they were
+        # built from, so invalidating them would throw away a good
+        # (and expensive) result.
         if (
             error is None
             and self._scan_track_entry is not None
             and cmd is not None
             and cmd.op_name == "run_fitting"
             and cmd.kwargs.get("entry") in (None, self._scan_track_entry)
+            and not peak_lists.redirects_dataset(
+                cmd.table_swap, "fitted_peaks"
+            )
         ):
             self._invalidate_scan_tracks()
 

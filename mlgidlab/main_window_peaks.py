@@ -20,6 +20,7 @@ from mlgidlab import (
     file_model,
     frame_range,
     peak_clipboard,
+    peak_lists,
     pipeline,
 )
 from mlgidlab.image_viewer import SelectedPeak
@@ -52,6 +53,61 @@ class _CallbackAction:
 
 
 class PeaksMixin:
+    def _on_score_edit_requested(self, value: float) -> None:
+        """Write a new confidence score to every detected-FLAVOURED peak
+        selected: the built-in layer, and any registered extra list the
+        user chose to treat as detected.
+
+        The Parameter panel's Score-row editor is deliberately ignorant
+        of how many peaks it covers, because relabelling a frame is
+        Ctrl-click a handful and press one button. Members of the
+        selection that are not score-editable are skipped rather than
+        refused: a mixed selection is a normal thing to have, and
+        stopping the whole write because one fitted box came along with
+        it would be useless.
+
+        A list's write lands in that list's own dataset (resolved in
+        ``_on_peak_row_write_requested``), so this stays inside the
+        no-spill rule: an extra layer is still readable and writable
+        only as itself.
+
+        The viewer applies them as ONE undoable gesture and fires the
+        file writes through the existing ``peakRowWriteRequested``
+        plumbing, so the silx detach dance and the dirty flag are
+        already handled.
+        """
+        if self.session is None or self._pipe_thread is not None:
+            return
+        targets = [
+            (sel.frame, sel.kind, int(sel.peak_id), float(value))
+            for sel in self.viewer.selected_peaks()
+            if self._score_is_editable(sel)
+        ]
+        if not targets:
+            return
+        self.viewer.set_peak_scores(targets)
+
+    def _score_is_editable(self, sel) -> bool:
+        """Whether this selection's score may be rewritten.
+
+        The built-in detected layer always qualifies. A registered extra
+        list qualifies when it is treated as detected AND its table
+        actually has a score column -- ``update_peak_row`` writes only
+        the fields the dtype carries, so without that check a table
+        without one would take the edit in memory and drop it on disk.
+        Everything else (fitted, matched, manual, an unregistered list)
+        is skipped.
+        """
+        if sel.kind == "detected":
+            return True
+        if not peak_lists.is_list_kind(sel.kind):
+            return False
+        spec = self.viewer.peak_list_spec(sel.kind)
+        if spec is None or spec.treat_as != peak_lists.TREAT_DETECTED:
+            return False
+        table = (self.viewer._frame_peaks.get(sel.frame) or {}).get(sel.kind)
+        return table is not None and table.has_score
+
     def _on_add_to_detected(self) -> None:
         """Commit the active manual box to detected_peaks at the chosen
         confidence score.
@@ -1952,6 +2008,13 @@ class PeaksMixin:
             sel is None or sel.kind == "manual"
             or self.session is None or self._pipe_thread is not None
         ):
+            return
+        # A registered extra peak list falls through to the ``matched``
+        # branch below if it gets this far, which would hand mlgidbase a
+        # kind it has never heard of. The button is disabled for it, so
+        # this only catches the keyboard route -- but that is exactly
+        # the one nobody would think to check.
+        if peak_lists.is_list_kind(sel.kind):
             return
         entry = self.entry_combo.currentText()
         if not entry:

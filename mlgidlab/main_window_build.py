@@ -14,6 +14,7 @@ from PySide6.QtGui import (
     QAction,
     QColor,
     QFont,
+    QIcon,
     QKeySequence,
     QPainter,
     QPixmap,
@@ -61,10 +62,12 @@ from mlgidlab.profile_viewer import ProfileViewer
 from mlgidlab.scan_tracking_panel import ScanTrackingPanel
 from mlgidlab.structure_panel import StructurePanel
 from mlgidlab.update_ui import _UpdateBanner
+from mlgidlab.pen_picker import PenPopup
 from mlgidlab.welcome_view import WelcomeView
 from mlgidlab.workflow_rail import WorkflowRail
-from mlgidlab import file_model, theme_tokens
+from mlgidlab import file_model, peak_lists, theme_tokens
 from mlgidlab.widgets import (
+    GAP,
     PRIMARY,
     Card,
     make_debounced_timer,
@@ -392,6 +395,10 @@ class BuildMixin:
         # to do. The viewer's internal _visibility["manual"] stays True
         # by default — see GIWAXSImageViewer.__init__.
         self._overlay_checks: dict[str, QCheckBox] = {}
+        # The swatch is a button, like the matched-structure rows': it
+        # opens the same pen editor, so the colour, line style and width
+        # of every overlay are set where that overlay is named.
+        self._overlay_swatches: dict[str, QToolButton] = {}
         for kind, label in (
             ("detected", "Detected peaks"),
             ("fitted", "Fitted peaks"),
@@ -399,8 +406,18 @@ class BuildMixin:
             row = QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(6)
-            swatch = QLabel()
-            swatch.setPixmap(_make_pen_swatch(OVERLAY_STYLE[kind]))
+            swatch = QToolButton()
+            swatch.setAutoRaise(True)
+            swatch.setCursor(Qt.CursorShape.PointingHandCursor)
+            swatch.setToolTip(
+                f"Click to set the {label.lower()} colour, line style "
+                f"and width"
+            )
+            swatch.clicked.connect(
+                lambda _=False, k=kind: self._open_overlay_pen_popup(k)
+            )
+            self._overlay_swatches[kind] = swatch
+            self._refresh_overlay_swatch(kind)
             row.addWidget(swatch)
             chk = QCheckBox(label)
             chk.setChecked(True)
@@ -447,6 +464,18 @@ class BuildMixin:
                 score_row_widget.setLayout(score_row)
                 layout.addWidget(score_row_widget)
 
+        # Rows for the user's registered extra peak lists, below the two
+        # built-in layers. Its own container so a Settings visit rebuilds
+        # only these rows -- the Detected row owns the min-score slider,
+        # and tearing that down to add an unrelated layer would be a good
+        # way to lose the user's cutoff.
+        self._peak_list_rows_widget = QWidget()
+        self._peak_list_rows_layout = QVBoxLayout(self._peak_list_rows_widget)
+        self._peak_list_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._peak_list_rows_layout.setSpacing(GAP)
+        layout.addWidget(self._peak_list_rows_widget)
+        self._refresh_peak_list_rows()
+
         # Matched peaks: master toggle + per-structure rows. The per-structure
         # rows are rebuilt on every frame change because different frames can
         # have different matching solutions.
@@ -461,7 +490,7 @@ class BuildMixin:
         # spacer a transparent pixmap of the same dimensions so its
         # sizing semantics line up byte-for-byte with the real
         # swatches above.
-        _ref_swatch = _make_pen_swatch(OVERLAY_STYLE["detected"])
+        _ref_swatch = _make_pen_swatch(self.viewer.overlay_pen("detected"))
         _spacer_pixmap = QPixmap(_ref_swatch.size())
         _spacer_pixmap.fill(Qt.GlobalColor.transparent)
         _matched_swatch_spacer = QLabel()
@@ -616,6 +645,9 @@ class BuildMixin:
 
         self._refresh_matched_panel(0, [])
         self.viewer.matchedStructuresChanged.connect(self._refresh_matched_panel)
+        # The legend swatch has to follow the image, including
+        # after "Automatic" puts the preset back.
+        self.viewer.overlayPenChanged.connect(self._refresh_overlay_swatch)
 
         # "Expected pattern": forward-simulated reflections of a parsed
         # CIF, rendered as a display-only overlay. Fed by the Pipeline
@@ -854,6 +886,11 @@ class BuildMixin:
         layout.addSpacing(6)
 
         self.parameter_panel = ParameterPanel(self)
+        # So a list registered in a previous session reads through its
+        # treat-as flavour before Settings is ever opened.
+        self.parameter_panel.set_peak_list_specs(
+            self.viewer.peak_list_specs()
+        )
         layout.addWidget(self.parameter_panel)
 
         # Note: the long polar-mode hint that used to live here has
@@ -1247,6 +1284,13 @@ class BuildMixin:
         self.parameter_panel.deletePeakRequested.connect(
             lambda: self._on_delete_peak_requested(self.viewer.selected_peak)
         )
+        # Relabelling: the Score row's editor writes the whole selection.
+        self.parameter_panel.scoreEditRequested.connect(
+            self._on_score_edit_requested
+        )
+        self.viewer.selectionsChanged.connect(
+            lambda sels: self.parameter_panel.set_selection_count(len(sels))
+        )
 
         # Direct-h5py geometry writes for detected/fitted ROI edits.
         self.viewer.peakRowWriteRequested.connect(self._on_peak_row_write_requested)
@@ -1262,6 +1306,117 @@ class BuildMixin:
         # goes stale and must be invalidated.
         self.viewer.manualPeakRemoved.connect(self._on_manual_peak_removed)
         self.viewer.manualPeakAdded.connect(self._on_manual_peak_added)
+
+    # --- Registered extra peak lists (Display dock) ---
+
+    def _refresh_peak_list_rows(self) -> None:
+        """Rebuild the Display dock's rows for the registered peak lists.
+
+        One row per list: the same pen-editor swatch and visibility
+        checkbox the built-in layers get, labelled with the name the
+        user gave it. Called at construction and after Settings changes.
+        """
+        layout = getattr(self, "_peak_list_rows_layout", None)
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        for spec in self.viewer.peak_list_specs():
+            kind = spec.kind
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            swatch = QToolButton()
+            swatch.setAutoRaise(True)
+            swatch.setCursor(Qt.CursorShape.PointingHandCursor)
+            swatch.setToolTip(
+                f"Click to set the {spec.display_label} colour, line "
+                f"style and width"
+            )
+            swatch.clicked.connect(
+                lambda _=False, k=kind: self._open_overlay_pen_popup(k)
+            )
+            self._overlay_swatches[kind] = swatch
+            self._refresh_overlay_swatch(kind)
+            row.addWidget(swatch)
+            chk = QCheckBox(spec.display_label)
+            chk.setToolTip(
+                f"Show the {spec.dataset} table from this file's analysis "
+                f"group, drawn like {spec.treat_as} peaks. A display "
+                f"layer: nothing else in the app reads it."
+            )
+            chk.setChecked(self.viewer._visibility.get(kind, True))
+            chk.toggled.connect(
+                lambda v, k=kind: self.viewer.set_overlay_visible(k, v)
+            )
+            row.addWidget(chk)
+            row.addStretch(1)
+            row_widget = QWidget()
+            row_widget.setLayout(row)
+            layout.addWidget(row_widget)
+            self._overlay_checks[kind] = chk
+
+    def _apply_peak_list_specs(self) -> None:
+        """Re-read the registry after Settings and put it into effect.
+
+        Three things have to move together: the viewer's overlay items,
+        the dock's rows, and the frame's peak tables -- a newly
+        registered list has never been read from the file.
+        """
+        specs = peak_lists.load_specs()
+        stale = set(self._overlay_swatches) - {"detected", "fitted"}
+        for kind in stale:
+            self._overlay_swatches.pop(kind, None)
+            self._overlay_checks.pop(kind, None)
+        self.viewer.set_peak_list_specs(specs)
+        self.parameter_panel.set_peak_list_specs(specs)
+        self._refresh_peak_list_rows()
+        # Force the frame's peaks to be re-read: the cached tables were
+        # loaded without the newly registered dataset in them.
+        self._loaded_peak_frames = set()
+        entry = self.entry_combo.currentText()
+        if entry:
+            self._load_frame_peaks(entry, int(self.viewer.current_frame))
+
+    # --- Overlay pens (Display dock) ---
+
+    def _refresh_overlay_swatch(self, kind: str) -> None:
+        """Redraw one overlay row's swatch from the pen in effect.
+
+        The legend has to follow the image, including after "Automatic"
+        puts the preset back, so this is driven by the viewer's
+        ``overlayPenChanged`` rather than by the popup.
+        """
+        swatch = self._overlay_swatches.get(kind)
+        if swatch is None:
+            return
+        pix = _make_pen_swatch(self.viewer.overlay_pen(kind))
+        swatch.setIcon(QIcon(pix))
+        swatch.setIconSize(pix.size())
+        swatch.setFixedSize(pix.width() + 4, pix.height() + 4)
+
+    def _open_overlay_pen_popup(self, kind: str) -> None:
+        """Pen editor under a Detected / Fitted swatch."""
+        swatch = self._overlay_swatches.get(kind)
+        if swatch is None:
+            return
+        popup = PenPopup(
+            self,
+            current=self.viewer.overlay_pen(kind),
+            override=self.viewer.overlay_pen_override(kind),
+            title=f"{kind.capitalize()} peak colour",
+        )
+        popup.penChanged.connect(
+            lambda pen, k=kind: self.viewer.set_overlay_pen(k, pen)
+        )
+        popup.resetPicked.connect(
+            lambda k=kind: self.viewer.set_overlay_pen(k, None)
+        )
+        popup.show_under(swatch)
 
     def _hide_stale_dock_tab_bars(self) -> None:
         """Hide ghost dock tab bars.

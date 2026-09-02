@@ -919,6 +919,11 @@ class MenusMixin:
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         dlg.save_to_qsettings()
+        # The extra-list registry needs a real re-apply: the viewer's
+        # overlay items, the dock's rows and the frame's peak tables all
+        # have to move together, and a newly registered list has never
+        # been read from the file.
+        self._apply_peak_list_specs()
         # If playback is currently running, push the new schedule onto
         # the timer right away. The next tick will use it.
         if self._play_timer.isActive():

@@ -90,18 +90,55 @@ def _robust_levels(frame: np.ndarray) -> tuple[float, float]:
     return lo, hi
 
 
-def _apply_raw_flips(frame: np.ndarray, flip_lr: bool, flip_ud: bool) -> np.ndarray:
+def _apply_raw_flips(
+    frame: np.ndarray,
+    flip_lr: bool,
+    flip_ud: bool,
+    transp: bool = False,
+) -> np.ndarray:
     """Orient a file-order (H, W) raw detector frame for preview.
 
-    Mirrors pygid's ``process_image`` (flipud then fliplr) so the preview
-    matches the orientation the conversion will produce. Returns the frame
-    unchanged when neither flip is set.
+    Mirrors pygid's ``process_image`` **in its order** -- transpose,
+    then flipud, then fliplr -- so the preview matches the orientation
+    the conversion will produce. The order matters: transposing after a
+    flip is a different image. Returns the frame unchanged when nothing
+    is set.
     """
+    if transp:
+        frame = frame.T
     if flip_ud:
         frame = np.flipud(frame)
     if flip_lr:
         frame = np.fliplr(frame)
     return frame
+
+
+def _raw_pixel_index(
+    row: int,
+    col: int,
+    shape: tuple[int, int],
+    flip_lr: bool,
+    flip_ud: bool,
+    transp: bool = False,
+) -> tuple[int, int]:
+    """Map a displayed (row, col) back to the file-order pixel.
+
+    ``_apply_raw_flips`` is what the user is looking at, so a cursor
+    position is an index into the *oriented* frame; the intensity has to
+    be read from the stack, which is in file order. This inverts the
+    orientation -- undo fliplr, undo flipud, undo transpose -- against
+    the file-order ``shape`` (H, W). Returns ``(-1, -1)`` when the point
+    lies outside the oriented frame, which the caller reports as NaN.
+    """
+    height, width = int(shape[0]), int(shape[1])
+    out_h, out_w = (width, height) if transp else (height, width)
+    if not (0 <= row < out_h and 0 <= col < out_w):
+        return -1, -1
+    if flip_lr:
+        col = out_w - 1 - col
+    if flip_ud:
+        row = out_h - 1 - row
+    return (col, row) if transp else (row, col)
 
 
 @dataclass
@@ -276,7 +313,7 @@ class ManualReplaceAction:
 @dataclass
 class FileGeomAction:
     frame: int
-    kind: str  # "detected" | "fitted"
+    kind: str  # "detected" | "fitted" | "list:<dataset>"
     peak_id: int
     before: tuple[float, float, float, float]
     after: tuple[float, float, float, float]
@@ -286,6 +323,52 @@ class FileGeomAction:
 
     def redo(self, viewer: "GIWAXSImageViewer") -> None:
         viewer._apply_file_geom(self.frame, self.kind, self.peak_id, self.after)
+
+
+@dataclass
+class FileScoreAction:
+    """One file-backed peak's confidence score changing.
+
+    Separate from ``FileGeomAction`` because the two must not be
+    conflated: undoing a relabel has to leave the box exactly where it
+    is, and undoing a drag has to leave the label alone.
+    """
+
+    frame: int
+    kind: str
+    peak_id: int
+    before: float
+    after: float
+
+    def undo(self, viewer: "GIWAXSImageViewer") -> None:
+        viewer._apply_file_score(
+            self.frame, self.kind, self.peak_id, self.before
+        )
+
+    def redo(self, viewer: "GIWAXSImageViewer") -> None:
+        viewer._apply_file_score(
+            self.frame, self.kind, self.peak_id, self.after
+        )
+
+
+@dataclass
+class BatchAction:
+    """Several actions the user made in one gesture, undone as one.
+
+    Members undo in REVERSE and redo forwards, the same rule
+    ``h5_edit_ops.BatchOp`` follows for the Structure tree: an action
+    that depends on an earlier one must be taken back first.
+    """
+
+    actions: list
+
+    def undo(self, viewer: "GIWAXSImageViewer") -> None:
+        for action in reversed(self.actions):
+            action.undo(viewer)
+
+    def redo(self, viewer: "GIWAXSImageViewer") -> None:
+        for action in self.actions:
+            action.redo(viewer)
 
 
 def _peaks_subset(table: PeakTable, ids: list[int]) -> PeakTable:
@@ -518,8 +601,24 @@ class _PeakShapeItem(pg.GraphicsObject):
         dark plot ground and near-black on the light one, and the item is
         built once at construction.
         """
-        pen = pg.mkPen(QColor(color), width=self._pen.widthF())
-        pen.setStyle(self._pen.style())
+        self.set_pen(color=color)
+
+    def set_pen(
+        self,
+        color: str | None = None,
+        style: Qt.PenStyle | None = None,
+        width: float | None = None,
+    ) -> None:
+        """Replace any part of the outline pen, keeping the rest.
+
+        The item is built once at construction, so every later change --
+        a theme switch, a user-picked overlay pen -- comes through here.
+        """
+        pen = pg.mkPen(
+            QColor(color) if color is not None else self._pen.color(),
+            width=self._pen.widthF() if width is None else float(width),
+        )
+        pen.setStyle(self._pen.style() if style is None else style)
         pen.setCosmetic(True)
         self._pen = pen
         self.update()

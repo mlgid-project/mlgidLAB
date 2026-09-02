@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QToolButton,
     QWidget,
 )
-from mlgidlab.color_picker import ColorGridPopup
+from mlgidlab.pen_picker import PenPopup
 from mlgidlab.image_viewer import MATCHED_STYLE, UNMATCHED_COLOR
 from mlgidlab.widgets import make_pen_swatch as _make_pen_swatch
 
@@ -166,10 +166,12 @@ class MatchedLegendMixin:
         swatch.setIconSize(pix.size())
         swatch.setFixedSize(pix.width() + 4, pix.height() + 4)
         swatch.setCursor(Qt.CursorShape.PointingHandCursor)
-        swatch.setToolTip("Click to choose a colour for this structure")
+        swatch.setToolTip(
+            "Click to set this structure's colour, line style and width"
+        )
         swatch.clicked.connect(
-            lambda _=False, key=s.color_key, c=pen["color"], b=swatch:
-                self._open_matched_color_popup(b, key, c)
+            lambda _=False, key=s.color_key, b=swatch:
+                self._open_matched_pen_popup(b, key)
         )
         row.addWidget(swatch)
         chk = QCheckBox(s.label)
@@ -183,29 +185,37 @@ class MatchedLegendMixin:
         row_widget.setLayout(row)
         return row_widget, chk
 
-    def _open_matched_color_popup(
-        self, button: QToolButton, key: tuple, current: str
+    def _open_matched_pen_popup(
+        self, button: QToolButton, key: tuple
     ) -> None:
-        """Colour-grid popup under a legend swatch. A grid pick or
-        "More..." choice sets the override; "Automatic" clears it."""
-        popup = ColorGridPopup(self, current=current)
-        popup.colorPicked.connect(
-            lambda c, k=key: self._on_matched_color_picked(k, c)
+        """Pen editor under a legend swatch.
+
+        Seeded with the pen the structure is actually drawn with, so the
+        controls start where the eye is, and with the part of it the
+        user had already set, which is what gets extended. "Automatic"
+        clears the whole override.
+        """
+        popup = PenPopup(
+            self,
+            current=self.viewer._pen_for_key(tuple(key)),
+            override=self.viewer.matched_pen_override(key),
+            title="Structure colour",
+        )
+        popup.penChanged.connect(
+            lambda pen, k=key: self._on_matched_pen_picked(k, pen)
         )
         popup.resetPicked.connect(
-            lambda k=key: self._on_matched_color_picked(k, None)
+            lambda k=key: self._on_matched_pen_picked(k, None)
         )
         popup.show_under(button)
 
-    def _on_matched_color_picked(
-        self, key: tuple, color: str | None
-    ) -> None:
-        """Apply a picked colour (``None`` = back to automatic) for a
+    def _on_matched_pen_picked(self, key: tuple, pen: dict | None) -> None:
+        """Apply a picked pen (``None`` = back to automatic) for a
         structure identity. The viewer re-renders the overlays and
         re-emits ``matchedStructuresChanged``, which rebuilds both
         legends' swatches; the phase views follow via the CIF-level
-        override push."""
-        self.viewer.set_matched_color(key, color)
+        override push (colour only — a width is not a hue)."""
+        self.viewer.set_matched_pen(key, pen)
         self._push_phase_color_overrides()
 
     def _push_phase_color_overrides(self) -> None:

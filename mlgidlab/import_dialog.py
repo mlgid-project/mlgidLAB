@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from mlgidlab import file_dialogs
+from mlgidlab import ai_values, file_dialogs
 
 import logging
 
@@ -129,11 +129,27 @@ class ImportConvertedDialog(QDialog):
         form.addRow("Wavelength:", self.wavelength_input)
         self._on_use_q_toggled(False)
 
-        self.ai_input = _range_spin(0.0, 90.0, 0.0)
-        self.ai_input.setToolTip(
-            "Recorded as instrument/angle_of_incidence for every frame."
+        # Same grammar as the Conversion panel's field: one angle for
+        # every frame, or one per image. See ``ai_values``.
+        self.ai_input = QLineEdit("0")
+        self.ai_input.setPlaceholderText(
+            "0.2   or   0.1,0.3,0.5   or   (0.1,1.5,13)"
         )
+        self.ai_input.setToolTip(
+            "Recorded as instrument/angle_of_incidence.\n"
+            "  0.2                 the same angle for every frame\n"
+            "  0.1,0.3,0.5         an explicit angle per image\n"
+            "  (0.1,1.5,13)        a ramp: start, end, STEPS\n"
+            "A ramp gives one more angle than its step count (13 steps "
+            "= 14 angles), matching pygid's own scan convention."
+        )
+        self.ai_input.textChanged.connect(self._refresh_ai_hint)
         form.addRow("Incidence angle (deg):", self.ai_input)
+        self.ai_hint = QLabel("")
+        self.ai_hint.setProperty("status", "muted")
+        self.ai_hint.setWordWrap(True)
+        form.addRow("", self.ai_hint)
+        self._refresh_ai_hint()
 
         self.flip_vertical = QCheckBox(
             "Flip images vertically (q_z direction reversed in source)"
@@ -197,6 +213,42 @@ class ImportConvertedDialog(QDialog):
         if path:
             self.out_path.setText(path)
 
+    def _refresh_ai_hint(self, *_args) -> None:
+        """Echo what the angle text resolved to, so the ramp's +1 shows."""
+        text = self.ai_input.text().strip()
+        if not text:
+            self.ai_hint.setText("")
+            self.ai_hint.setVisible(False)
+            return
+        try:
+            value = ai_values.parse_ai(text, n_frames=len(self._paths))
+        except ValueError as exc:
+            self._set_ai_hint(str(exc), error=True)
+            return
+        if isinstance(value, list) and len(value) != len(self._paths):
+            self._set_ai_hint(
+                f"{ai_values.describe(value)} — but {len(self._paths)} "
+                f"image(s) are being imported",
+                error=True,
+            )
+            return
+        self._set_ai_hint(ai_values.describe(value), error=False)
+
+    def _set_ai_hint(self, text: str, error: bool) -> None:
+        self.ai_hint.setText(text)
+        self.ai_hint.setProperty("status", "error" if error else "muted")
+        style = self.ai_hint.style()
+        style.unpolish(self.ai_hint)
+        style.polish(self.ai_hint)
+        self.ai_hint.setVisible(bool(text))
+
+    def _ai_value(self) -> float | list[float]:
+        """The parsed angle, or 0.0 when the field is empty."""
+        text = self.ai_input.text().strip()
+        if not text:
+            return 0.0
+        return ai_values.parse_ai(text, n_frames=len(self._paths))
+
     def _validate_and_accept(self) -> None:
         if not self.out_path.text().strip():
             QMessageBox.warning(
@@ -217,6 +269,19 @@ class ImportConvertedDialog(QDialog):
                     "Each q range needs min < max.",
                 )
                 return
+        try:
+            ai = self._ai_value()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Import", str(exc))
+            return
+        if isinstance(ai, list) and len(ai) != len(self._paths):
+            QMessageBox.warning(
+                self, "Import",
+                f"{len(ai)} angles of incidence were given for "
+                f"{len(self._paths)} image(s). A ramp gives one more "
+                f"angle than its step count.",
+            )
+            return
         self.accept()
 
     def values(self) -> dict:
@@ -232,7 +297,7 @@ class ImportConvertedDialog(QDialog):
             "qz_range": (
                 (self.qz_min.value(), self.qz_max.value()) if use_q else None
             ),
-            "ai": self.ai_input.value(),
+            "ai": self._ai_value(),
             "flip_vertical": self.flip_vertical.isChecked(),
             "wavelength_A": (
                 wavelength if use_q and wavelength > 0 else None

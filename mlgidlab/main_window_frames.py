@@ -20,6 +20,7 @@ from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import QApplication, QMessageBox
 from mlgidlab import file_model
 from mlgidlab import icons
+from mlgidlab import peak_lists
 from mlgidlab.browser_widgets import _ImageFileNode
 from mlgidlab.image_viewer import OVERLAY_KINDS
 from mlgidlab.main_window_constants import (
@@ -183,9 +184,11 @@ class FramesMixin:
                 "files in the tree on the left to see their structure.",
             )
 
-    def _on_raw_flips_changed(self, flip_lr: bool, flip_ud: bool) -> None:
-        """Apply the conversion panel's fliplr/flipud to the raw preview."""
-        self.viewer.set_raw_flips(flip_lr, flip_ud)
+    def _on_raw_flips_changed(
+        self, flip_lr: bool, flip_ud: bool, transp: bool = False,
+    ) -> None:
+        """Apply the Conversion panel's Orientation row to the raw preview."""
+        self.viewer.set_raw_flips(flip_lr, flip_ud, transp)
 
     def _load_raw_entry_into_viewer(self, label: str) -> None:
         """Load the picked raw entry into the viewer in pixel coords.
@@ -1210,6 +1213,37 @@ class FramesMixin:
                 return Path(p)
         return None
 
+    def _extra_peak_datasets(self) -> tuple[str, ...]:
+        """Dataset names of the user's registered extra peak lists.
+
+        The viewer, not QSettings, is the source of truth: it holds the
+        specs that actually have overlay items, so this can never ask for
+        a list that would not be rendered anyway.
+
+        EVERY path that fills a frame's overlay dict must pass these --
+        the two worker prewarms as much as the on-demand read here. A
+        path that omits them produces a dict with no ``list:`` keys, and
+        because the caller then marks the frame loaded, the layer stays
+        blank until something invalidates the frame.
+        """
+        return tuple(spec.dataset for spec in self.viewer.peak_list_specs())
+
+    def _overlays_have_registered_lists(self, peaks: dict) -> bool:
+        """Whether an overlay dict covers every registered extra list.
+
+        Read off-thread overlays are trusted only when they do. The check
+        is a key comparison, not a value one: ``read_peaks`` always
+        returns a key per requested list (``None`` when that frame has no
+        such dataset), so a missing KEY means the read never asked for it
+        -- a stale worker request, or a list registered while the read
+        was in flight. Falling back to a fresh read costs one small
+        HDF5 navigation and only in that case.
+        """
+        return all(
+            f"{peak_lists.KIND_PREFIX}{name}" in peaks
+            for name in self._extra_peak_datasets()
+        )
+
     def _load_frame_peaks(self, entry: str, frame: int) -> None:
         """Load + install one frame's detected/fitted/matched peaks into
         the viewer, at most once per frame per entry load.
@@ -1234,11 +1268,16 @@ class FramesMixin:
         # enough — this peak read still ran on the GUI thread). Fall back to
         # open-by-path only when no live handle is available.
         src = self.viewer._frame_source
+        # The user's registered extra peak lists ride the same read, so a
+        # custom layer costs no extra file open on a frame scrub.
+        extra = self._extra_peak_datasets()
         try:
             if src is not None and src.is_open and src.entry == entry:
-                peaks, matched = src.read_frame_overlays(frame)
+                peaks, matched = src.read_frame_overlays(frame, extra)
             else:
-                peaks = file_model.load_peaks(self.session.temp_path, entry, frame)
+                peaks = file_model.load_peaks(
+                    self.session.temp_path, entry, frame, extra
+                )
                 matched = file_model.load_matched_peaks(
                     self.session.temp_path, entry, frame, peaks.get("fitted")
                 )
@@ -1333,7 +1372,10 @@ class FramesMixin:
                 self.session.temp_path, entry, self.viewer.n_frames
             )
         cur = self.viewer.current_frame
-        if overlays is not None and overlays[0] == cur:
+        if (
+            overlays is not None and overlays[0] == cur
+            and self._overlays_have_registered_lists(overlays[1])
+        ):
             # Peaks for the landed frame were read off-thread (worker) — install
             # them directly so the GUI does no SFTP read here. Other frames
             # still load on demand via ``_load_frame_peaks``.
@@ -1426,6 +1468,7 @@ class FramesMixin:
         self._sb_open_bar.show()
         self._entryLoadRequest.emit(
             str(self.session.temp_path), entry, self._entry_req_id,
+            self._extra_peak_datasets(),
         )
 
     def _on_entry_loaded(self, request_id: int, entry: str, source, overlays=None) -> None:

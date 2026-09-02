@@ -110,7 +110,151 @@ pre-releases.
   it. Nothing is written while the app is healthy beyond one line per
   start.
 
+- **Correct a detected peak's score.** The *Score* row showed the
+  model's confidence and nothing more, so fixing a wrong call meant
+  re-labelling the peak from scratch. It is now an editor: **High**,
+  **Medium** and **Low** buttons (the same 1.0 / 0.5 / 0.1 an added
+  peak has always got) plus a box for any value in between.
+
+  It applies to everything you have selected, so Ctrl-click a handful
+  of peaks and one press relabels all of them — and one Ctrl+Z puts
+  them all back. Changing a score only changes the score: the box does
+  not move.
+
+- **Show another peak table from your file.** If a file has a peak
+  table mlgidLAB does not know about — say `Br_peaks` in the analysis
+  group — you can now put it on screen. In **Settings → Extra peak
+  lists**, add it (the dataset is picked from what the open file
+  actually has), give it a name, and say whether it should read and
+  look like detected or fitted peaks. It then appears in the Display
+  dock as its own layer, with its own show/hide box and its own
+  colour, line style and width.
+
+  It is a display layer and stays one. You can click a box to see its
+  numbers and drag it, which writes back to that table and only that
+  table. Everything else — the Peaks table, CSV export, fitting,
+  matching, peak tracking, Add to fitted, Delete — carries on as if it
+  were not there.
+
+- **Every overlay's colour, line style and width can be set.** The
+  swatch beside a matched structure used to open a colour grid; it now
+  opens a small editor with the grid, a row of line-style buttons and a
+  width box. The same editor is behind the **Detected peaks** and
+  **Fitted peaks** swatches in the Display dock, which were previously
+  just pictures.
+
+  Nothing looks different until you change something: every layer keeps
+  the style it has always had, and **Automatic** puts it back.
+
+  The editor stays open while you work, so you can set a colour and a
+  width without reopening it, and the image follows each change as you
+  make it. Only what you actually touch is remembered — widen one
+  structure's line and it still picks up a fresh colour from the
+  palette when the structures in the file change. Your choices are kept
+  per structure and per overlay, across files and restarts, and colours
+  you had already picked carry over.
+
+- **A different incidence angle for every frame.** Conversion's
+  *Angle of incidence* took one number, so a scan measured at a varying
+  angle came out with every frame labelled — and converted — at the
+  same one. It now takes any of three things:
+
+  - `0.2` — one angle for the whole scan, as before;
+  - `0.1, 0.3, 0.5, 0.7` — an angle per frame, written out;
+  - `(0.1, 1.5, 13)` — a ramp from 0.1° to 1.5°.
+
+  **A ramp gives one more angle than its step count**: 13 steps is 14
+  angles. That is the same convention pygid uses, so the three numbers
+  mean the same thing here as they do there — but because it reads
+  backwards, the line under the field always tells you what your text
+  came to ("14 angles, 0.1° to 1.5°"), goes red the moment that
+  disagrees with what you have selected, and the count is repeated in
+  the log when the run starts. Three numbers are a ramp unless you have
+  exactly three frames selected, in which case they are three angles.
+
+  The array has one value per frame of the files you ticked, in order —
+  so converting frames 3 and 7 of a fourteen-image stack still wants
+  fourteen angles, and uses the fourth and eighth. Scans over 32 frames
+  keep the single-value field for now; the reason is upstream and
+  reported.
+
+  The import dialog for already-converted images takes the same thing.
+
+- **Transpose sits with the flips.** It was buried in Conversion's
+  collapsed *Manual overrides*, which read as a rarely-needed
+  correction, and unlike *Flip horizontally* and *Flip vertically* it
+  did nothing to the picture in front of you. It is now the third
+  checkbox in the **Orientation** row and reorients the live raw
+  preview the moment you tick it, in the order pygid applies them, so
+  what you see is what the conversion writes. Flipping keeps your zoom;
+  transposing refits, because it swaps the frame's width and height.
+
+  While there: the pixel readout under the cursor was reading the
+  *unflipped* frame, so with a flip on it named and measured the wrong
+  pixel. It now follows whatever orientation is showing.
+
+- **Run the pipeline into a table of your own.** Detection and Fitting
+  always overwrote `detected_peaks` and `fitted_peaks`, so trying a
+  second model or a second parameter set meant destroying the first
+  result. Register an extra peak list in **Settings** and tick
+  **Pipeline primary**, and Detection and Fitting read and write that
+  table instead of the standard one for its flavour, letting a second
+  analysis sit beside the first. One table per flavour.
+
+  Niche on purpose, and narrow on purpose: nothing else changes. The
+  Peaks table, CSV export, peak tracking and matching all keep using
+  the standard tables, so with a primary Fitted table matching goes on
+  matching a table the pipeline is no longer updating. The Settings
+  hint says so.
+
+  A run interrupted partway (a crash, or the GPU taking the process
+  with it) is repaired automatically the next time the file is opened
+  or run, and never at the cost of the interrupted run's output.
+
+### Changed
+
+- **The mouse wheel no longer changes a value.** Scrolling a dock used
+  to step whatever field the cursor happened to be over — a `dq`, a
+  range, a frame count — which is easy to do without noticing and
+  produces a wrong result rather than an error. Comboboxes were already
+  protected; spin boxes now are too. The wheel scrolls the panel
+  instead, so a long form is no more awkward to move through than
+  before. Sliders are unchanged, and so is an open dropdown's list.
+
+- **A registered extra peak list treated as detected can now have its
+  scores edited**, the same way the built-in detected layer can, since
+  relabelling is usually why such a table is registered in the first
+  place. The write goes to that list's own dataset and nothing else. A
+  list treated as fitted is unaffected, and a table with no score column
+  at all now shows no Score row instead of a synthesised `0.000`.
+
 ### Fixed
+
+- **The Display dock now reports a saved fitted peak, not a refit of
+  it.** Selecting a peak that the pipeline had already fitted showed
+  numbers in the Selected-peak panel that did not match the same peak's
+  row in the Peaks dock. The panel's Fitted block was fed by the profile
+  viewer's live 1D Gaussian for every kind of selection, so the widths
+  were FWHM against the dock's stored `2σ` (a fixed 1.177×), the centre
+  and width came from a fresh fit of the current profile rather than
+  from the file, and the amplitude was a 1D height on an axis-averaged
+  profile instead of the stored 2D Gaussian height. A `fitted`,
+  `matched` or fitted-flavoured extra-list selection now reads its own
+  stored row, in the same quantities and formats the Peaks dock prints,
+  and the block is labelled `r / Δr / a / Δa` to match. A **manual**
+  peak is unchanged and still previews what Add-to-fitted would write,
+  now under a heading that says so. The profile plot's fit curve is
+  unchanged in every case: it still follows the data on screen.
+
+- **A registered extra peak list now keeps rendering after an entry
+  switch.** The layer appeared on the entry it was registered on and
+  then stayed blank for the rest of the session — the only way back was
+  to remove and re-add it in Settings. The peaks for the frame an entry
+  lands on are read on a worker thread, and that read was not asking for
+  the registered lists; the window nevertheless recorded the frame as
+  loaded, so nothing ever read them. Both worker paths now carry the
+  registered dataset names, and an overlay read that predates a
+  registration is refetched rather than trusted.
 
 - **Every Browse button now starts where you left off.** Opening a
   scan, then picking a mask, then saving a PONI used to drop you in

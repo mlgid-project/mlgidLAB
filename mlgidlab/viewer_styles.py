@@ -12,6 +12,83 @@ from mlgidlab import theme_tokens
 
 
 OVERLAY_KINDS = ("detected", "fitted", "manual")
+
+# Named line styles, for the pen editor's buttons and for persistence:
+# ``Qt.PenStyle`` is an enum, and an enum is not JSON. Order is the
+# order the buttons appear in.
+PEN_STYLES: tuple[tuple[str, str, Qt.PenStyle], ...] = (
+    ("solid", "Solid", Qt.PenStyle.SolidLine),
+    ("dash", "Dashed", Qt.PenStyle.DashLine),
+    ("dot", "Dotted", Qt.PenStyle.DotLine),
+    ("dashdot", "Dash-dot", Qt.PenStyle.DashDotLine),
+    ("dashdotdot", "Dash-dot-dot", Qt.PenStyle.DashDotDotLine),
+)
+#: Bounds for a hand-set line width, in the same units as the presets
+#: (1.2 detected / fitted, 1.6 manual and matched).
+PEN_WIDTH_MIN = 0.5
+PEN_WIDTH_MAX = 6.0
+
+
+def pen_style_name(style) -> str:
+    """``Qt.PenStyle`` -> its stored name; unknown styles fall back to solid."""
+    for name, _label, value in PEN_STYLES:
+        if value == style:
+            return name
+    return PEN_STYLES[0][0]
+
+
+def pen_style_from_name(name: str) -> Qt.PenStyle:
+    """A stored name -> ``Qt.PenStyle``; unknown names fall back to solid."""
+    for stored, _label, value in PEN_STYLES:
+        if stored == str(name):
+            return value
+    return PEN_STYLES[0][2]
+
+
+def pen_to_json(pen: dict) -> dict:
+    """A ``{color, style, width}`` pen as JSON-safe primitives.
+
+    Partial pens are preserved: an override that only sets the width
+    stays width-only, so the structure keeps cycling through the
+    automatic palette for its colour.
+    """
+    out: dict = {}
+    if "color" in pen:
+        out["color"] = str(pen["color"])
+    if "style" in pen:
+        out["style"] = pen_style_name(pen["style"])
+    if "width" in pen:
+        out["width"] = float(pen["width"])
+    return out
+
+
+def pen_from_json(raw) -> dict:
+    """The inverse of ``pen_to_json``; anything unreadable is dropped.
+
+    Also accepts a bare hex string, which is what the colour-only
+    override format stored before line style and width were editable.
+    """
+    if isinstance(raw, str):
+        return {"color": raw} if raw else {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    color = raw.get("color")
+    if color:
+        out["color"] = str(color)
+    if "style" in raw:
+        out["style"] = pen_style_from_name(raw["style"])
+    width = raw.get("width")
+    if width is not None:
+        try:
+            out["width"] = _clamp_width(float(width))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _clamp_width(width: float) -> float:
+    return min(PEN_WIDTH_MAX, max(PEN_WIDTH_MIN, float(width)))
 MODE_CARTESIAN = "cartesian"
 MODE_POLAR = "polar"
 # Raw detector data preview — pixel coordinates, no overlays. Reached only
@@ -203,28 +280,85 @@ def matched_pen_for(index: int) -> dict:
     return {"color": color, "style": style, "width": MATCHED_LINE_WIDTH}
 
 
-# User-picked colours per structure identity (CIF + hkl), overriding the
+# User-set pens per structure identity (CIF + hkl), overriding the
 # automatic palette. Persisted app-wide (same JSON-in-QSettings idiom as
-# the recent-files list) so a structure keeps its chosen colour across
-# sessions and files.
+# the recent-files list) so a structure keeps its look across sessions
+# and files.
+#
+# Overrides are PARTIAL on purpose: setting only the width leaves the
+# colour cycling through the palette, so a structure the user widened
+# still picks up a distinguishable hue when the file's structure list
+# changes.
+_MATCHED_PENS_KEY = "matchedPens"
+#: Read-only fallback. Before line style and width were editable this
+#: key held ``[[key, "#hex"], ...]``; honoured so an upgrading user
+#: keeps their colours, never written to again.
 _MATCHED_COLORS_KEY = "matchedColors"
 
 
-def _load_matched_color_overrides() -> dict[tuple, str]:
-    raw = QSettings().value(_MATCHED_COLORS_KEY, "")
+def _load_matched_pen_overrides() -> dict[tuple, dict]:
+    settings = QSettings()
+    for key in (_MATCHED_PENS_KEY, _MATCHED_COLORS_KEY):
+        raw = settings.value(key, "")
+        if not raw:
+            continue
+        try:
+            pairs = json.loads(str(raw))
+            out = {
+                (str(c), int(h), int(k), int(l)): pen_from_json(pen)
+                for (c, h, k, l), pen in pairs
+            }
+        except (ValueError, TypeError):
+            continue
+        return {k: v for k, v in out.items() if v}
+    return {}
+
+
+def _save_matched_pen_overrides(overrides: dict[tuple, dict]) -> None:
+    pairs = [
+        [list(key), pen_to_json(pen)]
+        for key, pen in overrides.items()
+        if pen
+    ]
+    QSettings().setValue(_MATCHED_PENS_KEY, json.dumps(pairs))
+
+
+# Hand-set pens for the detected / fitted overlays. One pen per kind,
+# app-wide, same partial-override semantics as the matched pens above:
+# whatever the user did not touch keeps its ``OVERLAY_STYLE`` default.
+_OVERLAY_PENS_KEY = "overlayPens"
+
+
+def load_overlay_pen_overrides() -> dict[str, dict]:
+    raw = QSettings().value(_OVERLAY_PENS_KEY, "")
+    if not raw:
+        return {}
     try:
-        pairs = json.loads(str(raw)) if raw else []
-        return {
-            (str(c), int(h), int(k), int(l)): str(color)
-            for (c, h, k, l), color in pairs
-        }
+        stored = json.loads(str(raw))
     except (ValueError, TypeError):
         return {}
+    if not isinstance(stored, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for kind in OVERLAY_KINDS:
+        pen = pen_from_json(stored.get(kind))
+        if pen:
+            out[kind] = pen
+    return out
 
 
-def _save_matched_color_overrides(overrides: dict[tuple, str]) -> None:
-    pairs = [[list(key), color] for key, color in overrides.items()]
-    QSettings().setValue(_MATCHED_COLORS_KEY, json.dumps(pairs))
+def save_overlay_pen_overrides(overrides: dict[str, dict]) -> None:
+    QSettings().setValue(_OVERLAY_PENS_KEY, json.dumps(
+        {kind: pen_to_json(pen) for kind, pen in overrides.items() if pen}
+    ))
+
+
+def overlay_pen(kind: str, overrides: dict[str, dict] | None = None) -> dict:
+    """The effective pen for an overlay kind: preset, user pen on top."""
+    pen = dict(OVERLAY_STYLE[kind])
+    if overrides:
+        pen.update(overrides.get(kind) or {})
+    return pen
 
 # Curated list of colormaps. Names are matplotlib's; pg.colormap.get falls
 # back to matplotlib's registry, which is always available since matplotlib

@@ -8,11 +8,14 @@ Delete shortcut.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QSettings, Qt, Signal, Slot
+import math
+
+from PySide6.QtCore import QSettings, QSignalBlocker, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -22,6 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mlgidlab import peak_lists
 from mlgidlab.fit import GaussianFit
 from mlgidlab.main_window_constants import QUICK_TARGET_KEY
 from mlgidlab.image_viewer import SelectedPeak
@@ -91,6 +95,11 @@ class ParameterPanel(Card):
     # ``_update_fitted_preview`` in main_window).
     fitModeChanged = Signal(str)
     deletePeakRequested = Signal()
+    # A new confidence score for the CURRENT SELECTION, from the Score
+    # row's editor (a High/Medium/Low preset or the spin box). The panel
+    # does not know how many peaks that is -- the host walks the
+    # selection and writes each detected one.
+    scoreEditRequested = Signal(float)
     # Quick-select mode on/off, and the token of the target dropdown
     # beside it. The host uses the first to arm the viewer and paint the
     # status-bar cell, and reads the second at commit time.
@@ -157,6 +166,9 @@ class ParameterPanel(Card):
         # visible; the other is removed from the layout flow rather
         # than just blanked.
         self._detected_section_label = self._make_section_label("Detected peak")
+        # Registered extra peak lists, so a selection from one can be
+        # read through its treat-as flavour and named in the header.
+        self._peak_list_specs: list = []
         form.addRow(self._detected_section_label)
         self._row_detected_header = form.rowCount() - 1
         form.addRow("Radius:", self._radius_label)
@@ -177,25 +189,77 @@ class ParameterPanel(Card):
             "Confidence saved with a detected peak added from this manual "
             "box (High = 1.0, Medium = 0.5, Low = 0.1)."
         )
+        # ...and for an EXISTING detected peak the same row becomes an
+        # editor, because a model's confidence is exactly what a human
+        # is there to correct when labelling validation data. Presets
+        # write the same numbers the manual-commit dropdown above does,
+        # so "Medium" means one thing in this app.
+        self._score_editor = QWidget()
+        score_edit_row = QHBoxLayout(self._score_editor)
+        score_edit_row.setContentsMargins(0, 0, 0, 0)
+        score_edit_row.setSpacing(4)
+        self._score_preset_buttons: list[QPushButton] = []
+        for label, value in self.CONFIDENCE_LEVELS:
+            btn = QPushButton(label)
+            btn.setToolTip(f"Set the score to {value:g}")
+            btn.clicked.connect(
+                lambda _=False, v=value: self._emit_score_edit(v)
+            )
+            score_edit_row.addWidget(btn)
+            self._score_preset_buttons.append(btn)
+        self._score_spin = QDoubleSpinBox()
+        self._score_spin.setRange(0.0, 1.0)
+        self._score_spin.setDecimals(3)
+        self._score_spin.setSingleStep(0.05)
+        self._score_spin.setToolTip(
+            "Confidence stored with this peak. Editing it rewrites the "
+            "score column and nothing else -- the box does not move."
+        )
+        self._score_spin.editingFinished.connect(
+            lambda: self._emit_score_edit(self._score_spin.value())
+        )
+        score_edit_row.addWidget(self._score_spin)
+        score_edit_row.addStretch(1)
+
         self._score_stack = QStackedWidget()
         self._score_stack.addWidget(self._score_label)       # page 0: readout
         self._score_stack.addWidget(self._confidence_combo)  # page 1: picker
+        self._score_stack.addWidget(self._score_editor)      # page 2: editor
         form.addRow("Score:", self._score_stack)
         self._row_score = form.rowCount() - 1
+        # How many peaks a preset click would relabel. Only shown when
+        # that is more than one, so a batch write is never a surprise.
+        self._selection_count = 1
+        self._score_count_label = QLabel("")
+        self._score_count_label.setProperty("status", "muted")
+        form.addRow("", self._score_count_label)
+        self._row_score_count = form.rowCount() - 1
         self._detected_rows = list(range(
             self._row_detected_header, form.rowCount()
         ))
         self._fitted_section_label = self._make_section_label("Fitted peak")
         form.addRow(self._fitted_section_label)
         self._row_fitted_header = form.rowCount() - 1
-        form.addRow("Center r:", self._fit_radius_label)
-        form.addRow("FWHM r:", self._fit_fwhm_r_label)
-        form.addRow("Center a:", self._fit_angle_label)
-        form.addRow("FWHM a:", self._fit_fwhm_a_label)
-        form.addRow("Amplitude:", self._fit_amp_label)
+        # The row captions are swapped at selection time, because this
+        # block reports two different things (see ``_set_fit_captions``):
+        # the stored row for a saved fitted/matched peak, and a live
+        # preview for a manual one. Held as widgets so the captions can
+        # change; a plain ``addRow("text", field)`` would bury them.
+        self._fit_captions = [QLabel() for _ in range(5)]
+        for caption, field in zip(self._fit_captions, (
+            self._fit_radius_label, self._fit_fwhm_r_label,
+            self._fit_angle_label, self._fit_fwhm_a_label,
+            self._fit_amp_label,
+        )):
+            form.addRow(caption, field)
+        self._set_fit_captions(stored=False)
         self._fitted_rows = list(range(
             self._row_fitted_header, form.rowCount()
         ))
+        # True while the Fitted block is showing the values stored in
+        # the file. ``set_fits`` leaves the block alone in that state so
+        # a live 1D profile fit cannot overwrite the saved numbers.
+        self._showing_stored_fit = False
         self._form = form
 
         self._mlgidbase_available = is_mlgidbase_available()
@@ -413,6 +477,7 @@ class ParameterPanel(Card):
                 self._form.setRowVisible(r, False)
             for r in self._fitted_rows:
                 self._form.setRowVisible(r, False)
+            self._showing_stored_fit = False
             return
         source = _SOURCE_LABEL.get(peak.kind, peak.kind.capitalize())
         if peak.kind == "matched":
@@ -445,12 +510,53 @@ class ParameterPanel(Card):
         #   manual           → Detected + Fitted (user is choosing what to commit)
         #   detected         → Detected only
         #   fitted / matched → Fitted only
-        show_detected = peak.kind in ("manual", "detected")
-        show_fitted = peak.kind in ("manual", "fitted", "matched")
+        # A registered extra peak list reads through the flavour it was
+        # registered as, so a table the user calls "detected" shows the
+        # radius/angle/score block and one they call "fitted" shows the
+        # centre/FWHM/amplitude block. Its own kind never matches the
+        # built-in tuples, which is what keeps it out of everything else.
+        effective_kind = peak.kind
+        if peak_lists.is_list_kind(peak.kind) and self._peak_list_specs:
+            spec = peak_lists.spec_for_kind(self._peak_list_specs, peak.kind)
+            if spec is not None:
+                effective_kind = spec.treat_as
+        show_detected = effective_kind in ("manual", "detected")
+        show_fitted = effective_kind in ("manual", "fitted", "matched")
+        # Name the source in the header. Two layers can look identical
+        # on the image, so "Detected peak" over a Br_peaks box would be
+        # a straight lie about which table is being read.
+        list_spec = (
+            peak_lists.spec_for_kind(self._peak_list_specs, peak.kind)
+            if peak_lists.is_list_kind(peak.kind)
+            else None
+        )
+        self._detected_section_label.setText(
+            list_spec.display_label if list_spec is not None
+            else "Detected peak"
+        )
+        # "(preview)" only for a manual peak, where the block forecasts
+        # what Add-to-fitted would write and there is no stored row yet.
+        # Everything else reads its own saved values, so the plain
+        # heading is now the truth.
+        self._fitted_section_label.setText(
+            list_spec.display_label if list_spec is not None
+            else ("Fitted peak (preview)" if effective_kind == "manual"
+                  else "Fitted peak")
+        )
         for r in self._detected_rows:
             self._form.setRowVisible(r, show_detected)
         for r in self._fitted_rows:
             self._form.setRowVisible(r, show_fitted)
+
+        # A saved fitted / matched row reports what is IN THE FILE, in
+        # the same quantities and formats the Peaks dock prints, so the
+        # two readouts of one peak agree digit for digit. Only a manual
+        # peak keeps the live-fit preview, where a forecast is the whole
+        # point (see ``set_fits``).
+        self._showing_stored_fit = show_fitted and effective_kind != "manual"
+        self._set_fit_captions(stored=self._showing_stored_fit)
+        if self._showing_stored_fit:
+            self._show_stored_fit(peak)
 
         if show_detected:
             self._radius_label.setText(f"{peak.radius:.3f} Å⁻¹")
@@ -461,20 +567,43 @@ class ParameterPanel(Card):
         # score the new detected peak gets on "Add to detected"); for an
         # existing detected peak it is the read-only model score. Hidden
         # for fitted / matched (their Detected block is collapsed).
+        # Three pages, one row:
+        #   manual   -> the confidence picker (score the commit will write)
+        #   detected -> the EDITOR (correcting a model's call is the point)
+        #   anything else with a score -> a read-only readout
         is_manual = peak.kind == "manual"
         has_score = peak.score is not None and not is_manual
+        # ``effective_kind``, so a registered list the user chose to
+        # treat as detected is editable exactly like the built-in layer
+        # -- that flavour is a statement about what the table IS, and
+        # relabelling is the reason such a list gets registered. The
+        # write still goes to that list's own dataset and nowhere else.
+        # ``has_score`` keeps the editor off a table with no score
+        # column: ``update_peak_row`` writes only fields the dtype has,
+        # so offering it there would drop the write silently.
+        is_editable_score = (
+            effective_kind == "detected" and show_detected
+            and not is_manual and has_score
+        )
         self._form.setRowVisible(
             self._row_score, show_detected and (is_manual or has_score)
         )
-        self._score_stack.setCurrentWidget(
-            self._confidence_combo
-            if (show_detected and is_manual)
-            else self._score_label
-        )
+        if show_detected and is_manual:
+            page = self._confidence_combo
+        elif is_editable_score:
+            page = self._score_editor
+        else:
+            page = self._score_label
+        self._score_stack.setCurrentWidget(page)
+        if is_editable_score:
+            with QSignalBlocker(self._score_spin):
+                self._score_spin.setValue(float(peak.score or 0.0))
         if has_score and show_detected:
             self._score_label.setText(f"{peak.score:.3f}")
         else:
             self._score_label.setText(EMPTY)
+        # Re-apply the count line against the page that is now showing.
+        self.set_selection_count(getattr(self, "_selection_count", 1))
         # Detected rows are hidden when ``show_detected`` is False, so
         # we don't blank them — set_fits / next show will refresh.
 
@@ -489,16 +618,96 @@ class ParameterPanel(Card):
             ):
                 lbl.setText(EMPTY)
 
+    # Captions for the Fitted block. The stored set names exactly what
+    # the Peaks dock's Fitted tab names, including the ``2sigma`` width
+    # convention, because the two are showing one row and any
+    # difference in wording reads as a difference in value.
+    _FIT_CAPTIONS_STORED = ("r:", "Δr:", "a:", "Δa:", "Amplitude:")
+    _FIT_CAPTIONS_PREVIEW = (
+        "Center r:", "FWHM r:", "Center a:", "FWHM a:", "Amplitude:",
+    )
+
+    # Same wording as the Peaks dock header tooltips, so the width
+    # convention is discoverable from whichever dock the user is in.
+    _FIT_TIPS_STORED = (
+        "Radius (Å⁻¹), as stored in the file",
+        "Radial width = 2σ_r (Å⁻¹). Same convention as pygidfit / "
+        "pipeline; FWHM_r ≈ 1.177 × Δr.",
+        "Angle (°), as stored in the file",
+        "Angular width = 2σ_a (°). Same convention as pygidfit / "
+        "pipeline; FWHM_a ≈ 1.177 × Δa.",
+        "Peak amplitude (2D-Gaussian height), as stored in the file",
+    )
+    _FIT_TIPS_PREVIEW = (
+        "Radial centre the next Add-to-fitted would save",
+        "Radial FWHM of the preview fit (stored as 2σ_r = FWHM / 1.177)",
+        "Angular centre the next Add-to-fitted would save",
+        "Angular FWHM of the preview fit (stored as 2σ_a = FWHM / 1.177)",
+        "Amplitude of the preview fit",
+    )
+
+    def _set_fit_captions(self, *, stored: bool) -> None:
+        captions = (
+            self._FIT_CAPTIONS_STORED if stored
+            else self._FIT_CAPTIONS_PREVIEW
+        )
+        tips = self._FIT_TIPS_STORED if stored else self._FIT_TIPS_PREVIEW
+        fields = (
+            self._fit_radius_label, self._fit_fwhm_r_label,
+            self._fit_angle_label, self._fit_fwhm_a_label,
+            self._fit_amp_label,
+        )
+        for widget, field, text, tip in zip(
+            self._fit_captions, fields, captions, tips,
+        ):
+            widget.setText(text)
+            widget.setToolTip(tip)
+            field.setToolTip(tip)
+
+    def _show_stored_fit(self, peak: SelectedPeak) -> None:
+        """Fill the Fitted block from the peak's own stored row.
+
+        Formats mirror ``peaks_table_panel._fill_fitted`` field for
+        field (``.3f`` radius and width, ``.2f`` angles, ``.3g``
+        amplitude) so selecting a peak and finding it in the Peaks dock
+        gives identical digits. Widths are printed as stored, pygidfit's
+        ``2sigma``, NOT converted to FWHM: a conversion here is what
+        made the same peak read 18% wider in one dock than the other.
+
+        A ring's non-finite ``angle_width`` prints as ``inf``, which is
+        what the Peaks dock and the Detected block above both already
+        print for the same value: matching means matching. Only
+        ``amplitude`` can be genuinely absent (``None`` on a hand-built
+        selection), and that blanks its row.
+        """
+        self._fit_radius_label.setText(f"{peak.radius:.3f} Å⁻¹")
+        self._fit_fwhm_r_label.setText(f"{peak.radius_width:.3f} Å⁻¹")
+        self._fit_angle_label.setText(f"{peak.angle:.2f}°")
+        self._fit_fwhm_a_label.setText(f"{peak.angle_width:.2f}°")
+        if peak.amplitude is None or not math.isfinite(peak.amplitude):
+            self._fit_amp_label.setText(EMPTY)
+        else:
+            self._fit_amp_label.setText(f"{peak.amplitude:.3g}")
+
     @Slot(object, object)
     def set_fits(
         self, rfit: GaussianFit | None, afit: GaussianFit | None,
     ) -> None:
         """Update the Fitted-peak rows from the profile viewer's 1D fits.
 
+        Ignored while the block is showing a saved row
+        (``_showing_stored_fit``): the profile viewer re-fits the live
+        data for every selection, and letting that land here is what
+        made a stored fitted peak read differently in the Display dock
+        than in the Peaks dock. The profile curve still comes from the
+        live fit; only the numbers are pinned to the file.
+
         Skipped (and blanked) for detected selections — those don't have a
         meaningful fitted-peak readout. Either fit may be ``None`` (no
         convergence, ring with inf width, no selection) → blank that row.
         """
+        if self._showing_stored_fit:
+            return
         peak = self._last_peak
         if peak is not None and peak.kind == "detected":
             for lbl in (
@@ -560,6 +769,36 @@ class ParameterPanel(Card):
             lambda _i: QSettings().setValue(
                 QUICK_TARGET_KEY, self.quick_select_target()
             )
+        )
+
+    def _emit_score_edit(self, value: float) -> None:
+        """Ask the host to write ``value`` to every detected peak selected.
+
+        Guarded on the editor actually being the visible page: the spin
+        box's ``editingFinished`` also fires when focus leaves during a
+        selection change, and without this a stale value would be
+        written to whatever was selected next.
+        """
+        if self._score_stack.currentWidget() is not self._score_editor:
+            return
+        value = max(0.0, min(1.0, float(value)))
+        with QSignalBlocker(self._score_spin):
+            self._score_spin.setValue(value)
+        self.scoreEditRequested.emit(value)
+
+    def set_peak_list_specs(self, specs) -> None:
+        """The registered extra lists, so a selection from one can be read."""
+        self._peak_list_specs = list(specs)
+
+    def set_selection_count(self, count: int) -> None:
+        """How many peaks a score edit would reach (0/1 hides the line)."""
+        self._selection_count = int(count)
+        self._score_count_label.setText(
+            f"{count} peaks selected" if count > 1 else ""
+        )
+        self._form.setRowVisible(
+            self._row_score_count,
+            count > 1 and self._score_stack.currentWidget() is self._score_editor,
         )
 
     def save_as_ring(self) -> bool:
@@ -693,7 +932,16 @@ class ParameterPanel(Card):
         # non-manual peaks (manual uses the Delete shortcut).
         is_manual = peak is not None and peak.kind == "manual"
         is_addable_to_fitted = peak is not None and peak.kind in ("manual", "detected")
-        is_file_peak = peak is not None and peak.kind != "manual"
+        # A registered extra peak list is a display layer: mlgidLAB draws
+        # it and lets the user nudge a box, but deleting rows out of a
+        # table it does not own is not on offer. This is the ONE place
+        # the enable rule is "anything but manual" rather than an
+        # explicit list, so it is the one that has to say no.
+        is_file_peak = (
+            peak is not None
+            and peak.kind != "manual"
+            and not peak_lists.is_list_kind(peak.kind)
+        )
         self.btn_add_detected.setEnabled(is_manual)
         self.btn_add_fitted.setEnabled(is_addable_to_fitted)
         self.chk_save_as_ring.setEnabled(is_addable_to_fitted)

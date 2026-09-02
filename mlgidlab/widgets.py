@@ -17,6 +17,9 @@ from mlgidlab.skin import DANGER, PRIMARY, REGION_NAME  # noqa: F401  (re-export
 from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractScrollArea,
+    QAbstractSpinBox,
+    QApplication,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
@@ -420,10 +423,21 @@ def row_wrap(layout: QHBoxLayout) -> QWidget:
 
 
 def make_pen_swatch(style: dict, width: int = 26, height: int = 12) -> QPixmap:
-    """Render a small line preview matching an overlay's pen color/style."""
+    """Render a small line preview matching an overlay's pen.
+
+    The drawn thickness is the pen's own width but never thinner than
+    2 px. The presets are 1.2-1.6, and dropping to those would make
+    every existing swatch fainter than it has always been for no gain;
+    the floor keeps them looking exactly as they do while still letting
+    a hand-widened pen read as wider in the legend.
+    """
     pix = QPixmap(width, height)
     pix.fill(Qt.GlobalColor.transparent)
-    pen = QPen(QColor(style["color"]), 2)
+    try:
+        line_width = max(2.0, float(style.get("width", 2.0)))
+    except (TypeError, ValueError):
+        line_width = 2.0
+    pen = QPen(QColor(style["color"]), line_width)
     pen.setStyle(style["style"])
     painter = QPainter(pix)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -433,18 +447,50 @@ def make_pen_swatch(style: dict, width: int = 26, height: int = 12) -> QPixmap:
     return pix
 
 
-class ComboWheelBlocker(QObject):
-    """Application-wide event filter that swallows wheel events on
-    CLOSED comboboxes.
+class ValueWheelBlocker(QObject):
+    """Application-wide event filter that stops the mouse wheel from
+    changing a value: comboboxes and spin boxes alike.
 
-    Qt's default lets the mouse wheel step through a combobox's items
-    on hover, so scrolling a dock accidentally changes settings (entry,
-    overlay CIF/orientation, display style, …). Only the closed
-    combobox is filtered — the popup list is a separate widget and
-    keeps normal wheel scrolling.
+    Qt's default lets the wheel step a combobox through its items and
+    a spin box through its range on hover, so scrolling a dock silently
+    rewrites settings the cursor happened to pass over. That is bad for
+    a display toggle and *dangerous* for a conversion parameter — a
+    changed ``dq`` produces a plausible-looking wrong result rather than
+    an error. Scrolling is never how any of these are meant to be set,
+    so the wheel is taken away from all of them.
+
+    Only the closed combobox is filtered: the popup list is a separate
+    widget (a QListView) and keeps normal wheel scrolling, as does any
+    slider — a frame scrubber is a place the wheel genuinely helps and
+    it changes nothing on disk.
+
+    **The event is forwarded, not eaten.** The conversion panel is a
+    long scrollable form packed with spin boxes; consuming the wheel
+    outright would leave it barely scrollable, with the page freezing
+    wherever the cursor crossed a field. So the event is re-sent to the
+    nearest scrollable ancestor's viewport, giving the behaviour the
+    user actually wants: the page scrolls, the value does not move. The
+    viewport is never one of the target types, so this cannot recurse.
     """
 
+    _TARGETS = (QComboBox, QAbstractSpinBox)
+
     def eventFilter(self, obj, event):  # noqa: N802 (Qt API)
-        if event.type() == QEvent.Type.Wheel and isinstance(obj, QComboBox):
-            return True
-        return False
+        if event.type() != QEvent.Type.Wheel:
+            return False
+        if not isinstance(obj, self._TARGETS):
+            return False
+        area = self._scroll_ancestor(obj)
+        if area is not None:
+            QApplication.sendEvent(area.viewport(), event)
+        return True
+
+    @staticmethod
+    def _scroll_ancestor(widget: QWidget) -> QAbstractScrollArea | None:
+        """The nearest scrollable ancestor, or None when there is none."""
+        node = widget.parentWidget()
+        while node is not None:
+            if isinstance(node, QAbstractScrollArea):
+                return node
+            node = node.parentWidget()
+        return None

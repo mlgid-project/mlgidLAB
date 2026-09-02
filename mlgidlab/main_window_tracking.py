@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QMessageBox, QProgressDialog
-from mlgidlab import file_model, phase_tracking
+from mlgidlab import file_model, peak_lists, phase_tracking
 from mlgidlab.phase_views_window import PhaseViewsWindow
 from mlgidlab.peak_link import link_enabled
 from mlgidlab.pipeline import PipelineCommand
@@ -930,7 +930,18 @@ class TrackingMixin:
     def _on_peak_row_write_requested(
         self, frame: int, kind: str, peak_id: int, polar: dict
     ) -> None:
-        """Persist a detected/fitted box edit straight to the NeXus file.
+        """Persist a peak-row edit straight to the NeXus file.
+
+        Carries a geometry change (the four polar fields) or a score
+        change, whichever the caller put in ``polar`` --
+        ``update_peak_row`` writes only what it is given, so a relabel
+        cannot move a box and a drag cannot rewrite a label.
+
+        ``kind`` may name a registered extra peak list, in which case the
+        write is routed to THAT dataset rather than
+        ``detected_peaks`` / ``fitted_peaks``. An unregistered list kind
+        is dropped: the layer is gone, and writing to a table nobody is
+        showing is worse than doing nothing.
 
         Drops silx's read handle for the duration of the write (matching the
         pipeline-run dance in ``_on_pipeline_run``) so h5py can open r+, then
@@ -942,10 +953,17 @@ class TrackingMixin:
         entry = self.entry_combo.currentText()
         if not entry:
             return
+        dataset = None
+        if peak_lists.is_list_kind(kind):
+            spec = self.viewer.peak_list_spec(kind)
+            if spec is None:
+                return
+            dataset = spec.dataset
         with self._detached_silx_tree():
             try:
                 file_model.update_peak_row(
-                    self.session.temp_path, entry, frame, kind, peak_id, **polar
+                    self.session.temp_path, entry, frame, kind, peak_id,
+                    dataset=dataset, **polar
                 )
             except KeyError:
                 QMessageBox.warning(

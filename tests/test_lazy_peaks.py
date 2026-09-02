@@ -28,9 +28,9 @@ def test_entry_load_loads_only_landed_frame(
     real = file_model.read_peaks
     frames_loaded: list[int] = []
 
-    def _spy(f, entry, frame):
+    def _spy(f, entry, frame, extra=()):
         frames_loaded.append(int(frame))
-        return real(f, entry, frame)
+        return real(f, entry, frame, extra)
 
     monkeypatch.setattr(file_model, "read_peaks", _spy)
 

@@ -138,9 +138,15 @@ class CopyWorker(QObject):
     finished = Signal(object)  # the result dict above
     progress = Signal(int, str)  # (percent 0..100, status label)
 
-    def __init__(self, original_path: Path):
+    def __init__(self, original_path: Path, extra_peak_datasets: tuple = ()):
         super().__init__()
         self._original_path = original_path
+        # The user's registered extra peak lists (dataset names), read on
+        # the GUI thread and handed over at construction. The prewarm
+        # overlay read below MUST include them: the GUI installs this
+        # result and marks the frame loaded, so a list missing here is a
+        # layer that never renders until the frame is invalidated.
+        self._extra_peaks = tuple(extra_peak_datasets)
 
     def run(self) -> None:
         result: dict = {
@@ -216,7 +222,9 @@ class CopyWorker(QObject):
                 pw = result["prewarm"]
                 if pw is not None:
                     try:
-                        peaks, matched = pw[1].read_frame_overlays(0)
+                        peaks, matched = pw[1].read_frame_overlays(
+                            0, self._extra_peaks
+                        )
                         result["prewarm_overlays"] = (0, peaks, matched)
                     except Exception:
                         logger.debug("suppressed overlay prewarm in CopyWorker", exc_info=True)
@@ -346,8 +354,10 @@ class EntryLoadWorker(QObject):
     # of ``loaded`` (raw stacks have no overlays / polar view).
     raw_loaded = Signal(int, str, object)
 
-    @Slot(str, str, int)
-    def load(self, file_path: str, entry: str, request_id: int) -> None:
+    @Slot(str, str, int, object)
+    def load(
+        self, file_path: str, entry: str, request_id: int, extra: object = (),
+    ) -> None:
         from mlgidlab import file_model  # lazy: defer h5py until a worker actually runs
 
         source = None
@@ -363,9 +373,15 @@ class EntryLoadWorker(QObject):
             # Read frame 0's peaks here too (same open handle), so the GUI
             # does ZERO SFTP I/O when it installs the entry — the peak read
             # on the GUI thread was the residual per-switch freeze on a
-            # high-latency SFTP mount.
+            # high-latency SFTP mount. ``extra`` carries the user's
+            # registered peak lists (dataset names, resolved on the GUI
+            # thread at request time): the GUI marks the landed frame
+            # loaded from this result, so omitting them here left a
+            # registered layer unrendered for the rest of the session.
             try:
-                peaks, matched = source.read_frame_overlays(0)
+                peaks, matched = source.read_frame_overlays(
+                    0, tuple(extra or ()),
+                )
                 overlays = (0, peaks, matched)
             except Exception:
                 logger.debug("suppressed overlay read in EntryLoadWorker", exc_info=True)
@@ -639,7 +655,7 @@ class ImportWorker(QObject):
         entry_name: str,
         qxy_range: tuple[float, float] | None,
         qz_range: tuple[float, float] | None,
-        ai: float,
+        ai: float | list[float],
         flip_vertical: bool,
         wavelength_A: float | None = None,
     ) -> None:
