@@ -120,8 +120,6 @@ def execute(
     ``OUTPUT_SINGLE_ENTRY`` mode it's a single path holding one fresh
     ``entry_NNNN`` whose image stack grows by one frame per scan.
     """
-    import pygid  # lazy
-
     if not scans:
         raise ValueError("No scans selected for conversion")
     if cfg.poni_path is None:
@@ -137,6 +135,14 @@ def execute(
         )
     if isinstance(cfg.ai, list):
         _check_per_frame_ai(cfg.ai, scans)
+
+    # Imported here, below the checks above and not at the top of
+    # ``execute``: every one of them is a pure config check that needs
+    # no backend, and a user whose config is wrong should be told which
+    # field is wrong rather than that ``pygid`` is missing. It also lets
+    # the refusals be tested on a box without the ``[pipeline]`` extra,
+    # which is what CI installs.
+    import pygid  # lazy
 
     output_dir = Path(cfg.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
