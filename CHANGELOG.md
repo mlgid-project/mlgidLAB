@@ -230,6 +230,22 @@ pre-releases.
 
 ### Fixed
 
+- **Deleting from a file now frees the space when you save.** HDF5
+  unlinks an object without shrinking the file -- the blocks become
+  reusable inside that file and its size on disk does not move -- and
+  saving was a byte copy of the working copy, so the holes were
+  reproduced faithfully and deleting a large stack freed nothing, ever.
+  Saving now rewrites the file without them when there is enough to
+  reclaim to be worth it, measured by comparing the file's size against
+  what its datasets actually occupy. A file with nothing to reclaim
+  takes the same byte copy it always did. Chunking, compression,
+  attributes and links are all carried across; a link stays a link
+  rather than being expanded into a copy of its target. Saving is also
+  atomic now: both paths write beside the target and rename into place,
+  so an interrupted save cannot leave half a file. The working copy
+  still carries the holes until you save, because repacking after every
+  delete would rewrite the whole file each time.
+
 - **The app icon now shows in the Linux dash, switcher and top bar.**
   The window carried the right icon, but GNOME resolves a window to an
   *application* before it draws any of those surfaces and takes the icon

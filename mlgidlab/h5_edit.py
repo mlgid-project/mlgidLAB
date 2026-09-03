@@ -796,9 +796,18 @@ def create_dataset(
 def delete_node(f: h5py.File, path: str) -> None:
     """Unlink ``path``.
 
-    HDF5 never reclaims the space; the working copy just grows. That is
-    accepted — the copy is temporary, and the saved file is written from
-    it in full.
+    HDF5 does not shrink the file: the blocks become reusable *within*
+    this file and its size on disk is unchanged. The working copy
+    therefore only grows during a session, which is accepted -- it is
+    temporary, and repacking it after every delete would rewrite the
+    whole file each time.
+
+    The saved file is a different matter. An earlier version of this
+    note claimed the save "is written from it in full" and left it
+    there, but ``NexusSession.save`` was a byte copy, so the holes were
+    copied faithfully into the user's file and deleting never freed
+    anything. ``h5_repack.copy_or_repack`` now handles that at save
+    time.
     """
     full = normalize_path(path)
     if full == "/":
