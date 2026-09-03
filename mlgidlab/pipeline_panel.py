@@ -21,7 +21,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
-    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -37,6 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mlgidlab import file_dialogs
 from mlgidlab.frame_range import parse_frame_range
 from mlgidlab.pipeline import PipelineCommand, is_mlgidbase_available
 
@@ -1094,10 +1094,9 @@ class PipelinePanel(QWidget):
         return True
 
     def _browse_detect_config(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
+        path = file_dialogs.open_file(
             self,
             "Select detection config (YAML)",
-            "",
             "YAML (*.yaml *.yml);;All files (*)",
         )
         if path:
@@ -1110,10 +1109,9 @@ class PipelinePanel(QWidget):
         this back out and wraps the CIFs in a CifPattern at run time.
         Pickle input has its own dedicated picker — see ``_browse_pickle``.
         """
-        paths, _ = QFileDialog.getOpenFileNames(
+        paths = file_dialogs.open_files(
             self,
             "Select CIF file(s)",
-            "",
             "CIF files (*.cif);;All files (*)",
         )
         if not paths:
@@ -1122,18 +1120,17 @@ class PipelinePanel(QWidget):
 
     def _browse_cif_dir(self) -> None:
         """Pick a directory of .cif files. Forwarded as a single path."""
-        directory = QFileDialog.getExistingDirectory(
-            self, "Select folder with CIF files", ""
+        directory = file_dialogs.existing_directory(
+            self, "Select folder with CIF files"
         )
         if directory:
             self.cif_path.setText(directory)
 
     def _browse_pickle(self) -> None:
         """Pick a single preprocessed CifPattern pickle file."""
-        path, _ = QFileDialog.getOpenFileName(
+        path = file_dialogs.open_file(
             self,
             "Select preprocessed CIF pickle",
-            "",
             "Pickle (*.pickle *.pkl);;All files (*)",
         )
         if path:

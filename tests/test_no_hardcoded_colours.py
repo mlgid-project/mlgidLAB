@@ -35,7 +35,7 @@ DATA_DRIVEN = {
     "phase_views_window.py": "per-structure legend tint",
     "phase_views_dialogs.py": "per-structure export list tint",
     "parameter_panel.py": "matched-structure swatch fill",
-    "color_picker.py": "the swatch grid IS the colours",
+    "pen_picker.py": "the swatch grid IS the colours",
     "controls_help.py": "rich-text renderer, migrates in a later stage",
 }
 

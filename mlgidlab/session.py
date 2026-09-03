@@ -8,6 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import Literal
 
+from mlgidlab import h5_repack
+
 
 SessionKind = Literal["nexus", "raw"]
 
@@ -233,8 +235,16 @@ class NexusSession(BaseSession):
         shutil.copystat(src, dst)
 
     def save(self) -> None:
-        """Overwrite the original from the temp file."""
-        shutil.copy2(self.temp_path, self._original_path)
+        """Overwrite the original from the temp file.
+
+        Repacks instead of copying when the working copy is carrying the
+        holes a delete left behind -- HDF5 unlinks an object without
+        shrinking the file, so a plain byte copy would hand the user back
+        a file exactly as large as before they deleted a 2 GB stack. See
+        ``h5_repack``: the decision is measured, and a file with nothing
+        to reclaim takes the same byte copy it always did.
+        """
+        h5_repack.copy_or_repack(self.temp_path, self._original_path)
         self.dirty = False
         self._disk_stat = _disk_signature(self._original_path)
 
@@ -245,7 +255,7 @@ class NexusSession(BaseSession):
         callers that re-open the silx tree afterward will see the new name.
         """
         new = Path(new_path).resolve()
-        shutil.copy2(self.temp_path, new)
+        h5_repack.copy_or_repack(self.temp_path, new)
 
         new_temp = self.temp_path.parent / new.name
         if new_temp != self.temp_path:

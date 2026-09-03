@@ -20,6 +20,7 @@ from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import QApplication, QMessageBox
 from mlgidlab import file_model
 from mlgidlab import icons
+from mlgidlab import peak_lists
 from mlgidlab.browser_widgets import _ImageFileNode
 from mlgidlab.image_viewer import OVERLAY_KINDS
 from mlgidlab.main_window_constants import (
@@ -183,9 +184,11 @@ class FramesMixin:
                 "files in the tree on the left to see their structure.",
             )
 
-    def _on_raw_flips_changed(self, flip_lr: bool, flip_ud: bool) -> None:
-        """Apply the conversion panel's fliplr/flipud to the raw preview."""
-        self.viewer.set_raw_flips(flip_lr, flip_ud)
+    def _on_raw_flips_changed(
+        self, flip_lr: bool, flip_ud: bool, transp: bool = False,
+    ) -> None:
+        """Apply the Conversion panel's Orientation row to the raw preview."""
+        self.viewer.set_raw_flips(flip_lr, flip_ud, transp)
 
     def _load_raw_entry_into_viewer(self, label: str) -> None:
         """Load the picked raw entry into the viewer in pixel coords.
@@ -284,6 +287,9 @@ class FramesMixin:
         # on. Commit it before the switch, while the entry combo still
         # names that entry — the commit reads it from there.
         self.viewer.commit_pending_manual()
+        if self._entry_load_is_deferred(entry):
+            return
+        self._structure_pending_entry = None
         if self.session.kind == "raw":
             self._load_raw_entry_into_viewer(entry)
             self._update_status_entry()
@@ -297,6 +303,30 @@ class FramesMixin:
             self._update_status_entry()
             # Multi-energy files: the parsed CIF cache is entry-specific.
             self._sim_entry_mismatch_hint(entry)
+
+    def _entry_load_is_deferred(self, entry: str) -> bool:
+        """Whether to skip the frame load because Structure is in front.
+
+        The read already happens off the GUI thread; the install does
+        not, and on a large detector frame that install — the image, the
+        autoscale, the overlays, the profile — is the freeze the user
+        feels. All of it lands in widgets the Structure tab has folded
+        away, so while that tab is up the entry is only remembered. It
+        is reconciled from the combo when the tab is left, which is the
+        first moment anyone can see the difference.
+
+        Both attributes are read defensively: this runs during window
+        construction, before the tabs exist, and a missing panel must
+        read as "not on that tab" rather than as "on it".
+        """
+        panel = getattr(self, "structure_panel", None)
+        tabs = getattr(self, "tabs", None)
+        if panel is None or tabs is None or tabs.currentWidget() is not panel:
+            return False
+        self._structure_pending_entry = entry
+        # The status bar is not folded away, so it keeps up.
+        self._update_status_entry()
+        return True
 
     def _on_frame_slider_changed(self, value: int) -> None:
         """User dragged the Display-dock slider — push to the viewer.
@@ -637,6 +667,11 @@ class FramesMixin:
 
         With the controls living in the image-viewer toolbar (no
         form / no row container), each widget is toggled directly.
+
+        The strip's layout is then re-run: hiding all six empties their
+        whole cluster, and a wrapping layout has to be told, or it keeps
+        placing the controls that are left where they used to be. See
+        ``GIWAXSImageViewer.refresh_toolbar_layout``.
         """
         for w in (
             self.prev_frame_button,
@@ -647,6 +682,7 @@ class FramesMixin:
             self.frame_label,
         ):
             w.setVisible(visible)
+        self.viewer.refresh_toolbar_layout()
 
     def _refresh_frame_nav_enabled(self) -> None:
         """Disable prev/next at the boundaries so the user can see
@@ -838,10 +874,17 @@ class FramesMixin:
             self.entry_combo.setCurrentText(label)
 
     def _on_tree_selection_changed(self, *_: object) -> None:
+        # A selection the app just put back after rebuilding the tree is
+        # not a click: reacting to it re-enters the rebuild and leaves
+        # the caller holding an index into a model that no longer has
+        # one. See ``_restore_tree_state``.
+        if getattr(self, "_restoring_tree_selection", False):
+            return
         image_node = self._selected_image_node()
         if image_node is not None:
             self._activate_image_node(image_node)
             self._set_or_defer_data_node(image_node)
+            self._set_or_defer_structure_node(image_node)
             return
         nodes = self._safe_selected_h5_nodes()
         if not nodes:
@@ -870,6 +913,10 @@ class FramesMixin:
         # a single click on the Image tab never pays the external-link
         # resolve for a dataset the user can't even see.
         self._set_or_defer_data_node(node)
+        # Same deferral for the Structure tab: describing a node costs a
+        # small read, and there is no reason to pay it while the tab that
+        # would show the result is hidden.
+        self._set_or_defer_structure_node(node)
 
     def _on_tree_activated(self, *_: object) -> None:
         image_node = self._selected_image_node()
@@ -922,14 +969,25 @@ class FramesMixin:
             )
 
     def _on_main_tab_changed(self, _index: int) -> None:
-        """When the user switches to the Data tab, render any node that was
-        clicked while the tab was hidden (deferred to keep Image-tab clicks
-        from paying the external-link resolve)."""
+        """Render whatever was clicked while the newly-shown tab was hidden.
+
+        Both the Data viewer and the Structure panel defer a tree click
+        they cannot display, to keep Image-tab clicks from paying the
+        external-link resolve (Data) or a metadata read (Structure)."""
         if (
             self.tabs.currentWidget() is self.data_viewer
             and self._pending_data_node is not None
         ):
             self._set_data_node(self._pending_data_node)
+        elif (
+            self.tabs.currentWidget() is self.structure_panel
+            and self._pending_structure_node is not None
+        ):
+            self._render_structure_node(self._pending_structure_node)
+        # The Structure tab needs the file browser and nothing else, so
+        # the side and bottom docks fold away while it is up and come
+        # back exactly as they were on the way out.
+        self._sync_structure_docks()
 
     def _activate_entry_for_node(self, node) -> None:
         """If the clicked node is inside an ``entry_*`` group, switch the
@@ -1155,6 +1213,37 @@ class FramesMixin:
                 return Path(p)
         return None
 
+    def _extra_peak_datasets(self) -> tuple[str, ...]:
+        """Dataset names of the user's registered extra peak lists.
+
+        The viewer, not QSettings, is the source of truth: it holds the
+        specs that actually have overlay items, so this can never ask for
+        a list that would not be rendered anyway.
+
+        EVERY path that fills a frame's overlay dict must pass these --
+        the two worker prewarms as much as the on-demand read here. A
+        path that omits them produces a dict with no ``list:`` keys, and
+        because the caller then marks the frame loaded, the layer stays
+        blank until something invalidates the frame.
+        """
+        return tuple(spec.dataset for spec in self.viewer.peak_list_specs())
+
+    def _overlays_have_registered_lists(self, peaks: dict) -> bool:
+        """Whether an overlay dict covers every registered extra list.
+
+        Read off-thread overlays are trusted only when they do. The check
+        is a key comparison, not a value one: ``read_peaks`` always
+        returns a key per requested list (``None`` when that frame has no
+        such dataset), so a missing KEY means the read never asked for it
+        -- a stale worker request, or a list registered while the read
+        was in flight. Falling back to a fresh read costs one small
+        HDF5 navigation and only in that case.
+        """
+        return all(
+            f"{peak_lists.KIND_PREFIX}{name}" in peaks
+            for name in self._extra_peak_datasets()
+        )
+
     def _load_frame_peaks(self, entry: str, frame: int) -> None:
         """Load + install one frame's detected/fitted/matched peaks into
         the viewer, at most once per frame per entry load.
@@ -1179,11 +1268,16 @@ class FramesMixin:
         # enough — this peak read still ran on the GUI thread). Fall back to
         # open-by-path only when no live handle is available.
         src = self.viewer._frame_source
+        # The user's registered extra peak lists ride the same read, so a
+        # custom layer costs no extra file open on a frame scrub.
+        extra = self._extra_peak_datasets()
         try:
             if src is not None and src.is_open and src.entry == entry:
-                peaks, matched = src.read_frame_overlays(frame)
+                peaks, matched = src.read_frame_overlays(frame, extra)
             else:
-                peaks = file_model.load_peaks(self.session.temp_path, entry, frame)
+                peaks = file_model.load_peaks(
+                    self.session.temp_path, entry, frame, extra
+                )
                 matched = file_model.load_matched_peaks(
                     self.session.temp_path, entry, frame, peaks.get("fitted")
                 )
@@ -1278,7 +1372,10 @@ class FramesMixin:
                 self.session.temp_path, entry, self.viewer.n_frames
             )
         cur = self.viewer.current_frame
-        if overlays is not None and overlays[0] == cur:
+        if (
+            overlays is not None and overlays[0] == cur
+            and self._overlays_have_registered_lists(overlays[1])
+        ):
             # Peaks for the landed frame were read off-thread (worker) — install
             # them directly so the GUI does no SFTP read here. Other frames
             # still load on demand via ``_load_frame_peaks``.
@@ -1371,6 +1468,7 @@ class FramesMixin:
         self._sb_open_bar.show()
         self._entryLoadRequest.emit(
             str(self.session.temp_path), entry, self._entry_req_id,
+            self._extra_peak_datasets(),
         )
 
     def _on_entry_loaded(self, request_id: int, entry: str, source, overlays=None) -> None:

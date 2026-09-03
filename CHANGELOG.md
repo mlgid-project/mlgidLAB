@@ -4,6 +4,346 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## Unreleased
+
+### Added
+
+- **Interactive NeXus/HDF5 editing.** A new **Structure** tab, beside
+  Image and Data, makes every field, attribute, group and link in the
+  open file editable in place. Edits land in the session's working copy
+  the moment they are committed; the file on disk is untouched until you
+  save, so closing without saving is a complete revert.
+
+  - Attributes: add, rename, retype, edit, remove. An edited attribute
+    keeps its own type, and `NX_class` and `units` come with real
+    suggestions instead of a blank box.
+  - Structure: create groups and fields from the tree's action row or
+    its context menu, with NeXus templates that pre-create what a group
+    nearly always has. Rename, move, delete.
+  - Links: create hard, soft and external links, see what one points at,
+    retarget it, or unlink it — all without following it. **Follow** is
+    the only thing that opens an external link, and only on request.
+  - Copy and paste, within a file and *between* two open files, plus
+    **Paste from file…** for a file that is not open at all. The
+    clipboard holds a reference, so copying a large stack costs nothing
+    until it is pasted, and copying a link keeps it a link.
+  - A value grid for datasets: axis selectors for N-d arrays, one column
+    per field for compound tables, and row insert and delete.
+  - Undo and redo for all of it, with a running list of what has changed
+    that can be copied out as text.
+  - **Find** by name, attribute name or attribute value.
+  - A **Check** section that reports what would stop the viewer or the
+    pipeline from reading the file, and names the fix.
+  - Raw detector files are read-only throughout: they have no working
+    copy, and the editor never opens one for writing.
+
+  - **Its own tree**, of every file you have open — so a group can be
+    copied out of one and pasted into another without leaving the tab.
+    It lists lazily and never follows a link, so a master of external
+    scans opens as fast as any other file, and it holds no file handle
+    of its own.
+
+- The **workflow strip** above the image can be folded away with the
+  chevron at its left, and remembers the choice.
+
+- The Structure tab is a workspace rather than a page: find and the tree
+  on the left, the selected node on the right, the file's health and
+  this session's changes below. **Nothing scrolls at the tab level** —
+  each section scrolls inside itself — and every division is a splitter
+  you can drag, remembered between launches. Each region is drawn as a
+  bordered pane, so a section has an edge rather than a rule that stops
+  in mid-air.
+
+- The Structure tab folds every dock away while it is in front — the
+  File browser included, since the tab navigates from its own tree — and
+  puts back exactly the ones that were open.
+
+  Three things it used to do per click are now done once, when you
+  leave the tab: rebuilding the File browser after a structural edit,
+  switching the image to the entry you last clicked, and loading the
+  frame behind the entry combo. All three update something the tab
+  hides, and doing them per edit made a large file feel slow for no
+  visible benefit. Switching entry from the toolbar while editing is
+  now instant; the image catches up when you go back to it.
+
+- **Shift-select in the Structure tree, and copy a whole range at once.**
+  The tab's tree takes extended selections, and Copy, Cut and Delete act
+  on all of it — the context menu says "Copy 6 nodes" so it is clear
+  which it means. Everything else stays per-node, since there is no
+  sensible reading of "rename these six".
+
+  The whole batch is **one entry in the changes list and one Ctrl+Z**,
+  not one per node. Selecting a group and one of its children copies the
+  group once rather than pasting the child twice. A node whose name
+  clashes still asks, and backing out of that one leaves the rest of the
+  batch to land.
+
+- **Find takes a path, and can be told to respect case.** A query with
+  a slash is read as a place and then a term: `sample/material` finds a
+  match for *material* under a group matching *sample*, and the parts do
+  not have to be adjacent. Searching for a slash still works —
+  `1/Angstrom` is a unit — because both readings run over the same walk.
+  The new **Aa** button matches upper and lower case exactly; it is off
+  by default, and flipping it re-runs what is in the box. Between them,
+  a two-letter term like `Si` is usable in a file that also contains
+  *signal* and *silicon*.
+
+  Find now also searches **small dataset values**, which is where NeXus
+  keeps most of its metadata — a sample name, a chemical formula, a
+  start time. Large datasets are skipped by their declared size, so a
+  detector stack is never read to answer a search.
+
+- **Rename a node where its name is printed.** The Structure tab's
+  header splits at the last `/`: where the node lives stays muted and
+  read-only, and its own name can be typed over. Double-click it (or
+  press F2), Enter commits, Escape puts the old name back, and so does
+  clicking away — the same rename as the context menu's, with the same
+  undo entry and the same warning on a protected node, minus the
+  dialog. The panel now follows a renamed node instead of going on
+  naming a path the rename emptied, which also fixes the header after
+  the older dialog routes, and after undo and redo.
+
+- **A crash log.** A hard crash — a segfault out of Qt, h5py or a
+  driver — used to take the window with it and leave nothing behind.
+  Every run now appends to `mlgidlab_crash.log` in the system temp
+  directory, and a crash writes the Python stack of every thread into
+  it. Nothing is written while the app is healthy beyond one line per
+  start.
+
+- **Correct a detected peak's score.** The *Score* row showed the
+  model's confidence and nothing more, so fixing a wrong call meant
+  re-labelling the peak from scratch. It is now an editor: **High**,
+  **Medium** and **Low** buttons (the same 1.0 / 0.5 / 0.1 an added
+  peak has always got) plus a box for any value in between.
+
+  It applies to everything you have selected, so Ctrl-click a handful
+  of peaks and one press relabels all of them — and one Ctrl+Z puts
+  them all back. Changing a score only changes the score: the box does
+  not move.
+
+- **Show another peak table from your file.** If a file has a peak
+  table mlgidLAB does not know about — say `Br_peaks` in the analysis
+  group — you can now put it on screen. In **Settings → Extra peak
+  lists**, add it (the dataset is picked from what the open file
+  actually has), give it a name, and say whether it should read and
+  look like detected or fitted peaks. It then appears in the Display
+  dock as its own layer, with its own show/hide box and its own
+  colour, line style and width.
+
+  It is a display layer and stays one. You can click a box to see its
+  numbers and drag it, which writes back to that table and only that
+  table. Everything else — the Peaks table, CSV export, fitting,
+  matching, peak tracking, Add to fitted, Delete — carries on as if it
+  were not there.
+
+- **Every overlay's colour, line style and width can be set.** The
+  swatch beside a matched structure used to open a colour grid; it now
+  opens a small editor with the grid, a row of line-style buttons and a
+  width box. The same editor is behind the **Detected peaks** and
+  **Fitted peaks** swatches in the Display dock, which were previously
+  just pictures.
+
+  Nothing looks different until you change something: every layer keeps
+  the style it has always had, and **Automatic** puts it back.
+
+  The editor stays open while you work, so you can set a colour and a
+  width without reopening it, and the image follows each change as you
+  make it. Only what you actually touch is remembered — widen one
+  structure's line and it still picks up a fresh colour from the
+  palette when the structures in the file change. Your choices are kept
+  per structure and per overlay, across files and restarts, and colours
+  you had already picked carry over.
+
+- **A different incidence angle for every frame.** Conversion's
+  *Angle of incidence* took one number, so a scan measured at a varying
+  angle came out with every frame labelled — and converted — at the
+  same one. It now takes any of three things:
+
+  - `0.2` — one angle for the whole scan, as before;
+  - `0.1, 0.3, 0.5, 0.7` — an angle per frame, written out;
+  - `(0.1, 1.5, 13)` — a ramp from 0.1° to 1.5°.
+
+  **A ramp gives one more angle than its step count**: 13 steps is 14
+  angles. That is the same convention pygid uses, so the three numbers
+  mean the same thing here as they do there — but because it reads
+  backwards, the line under the field always tells you what your text
+  came to ("14 angles, 0.1° to 1.5°"), goes red the moment that
+  disagrees with what you have selected, and the count is repeated in
+  the log when the run starts. Three numbers are a ramp unless you have
+  exactly three frames selected, in which case they are three angles.
+
+  The array has one value per frame of the files you ticked, in order —
+  so converting frames 3 and 7 of a fourteen-image stack still wants
+  fourteen angles, and uses the fourth and eighth. Scans over 32 frames
+  keep the single-value field for now; the reason is upstream and
+  reported.
+
+  The import dialog for already-converted images takes the same thing.
+
+- **Transpose sits with the flips.** It was buried in Conversion's
+  collapsed *Manual overrides*, which read as a rarely-needed
+  correction, and unlike *Flip horizontally* and *Flip vertically* it
+  did nothing to the picture in front of you. It is now the third
+  checkbox in the **Orientation** row and reorients the live raw
+  preview the moment you tick it, in the order pygid applies them, so
+  what you see is what the conversion writes. Flipping keeps your zoom;
+  transposing refits, because it swaps the frame's width and height.
+
+  While there: the pixel readout under the cursor was reading the
+  *unflipped* frame, so with a flip on it named and measured the wrong
+  pixel. It now follows whatever orientation is showing.
+
+- **Run the pipeline into a table of your own.** Detection and Fitting
+  always overwrote `detected_peaks` and `fitted_peaks`, so trying a
+  second model or a second parameter set meant destroying the first
+  result. Register an extra peak list in **Settings** and tick
+  **Pipeline primary**, and Detection and Fitting read and write that
+  table instead of the standard one for its flavour, letting a second
+  analysis sit beside the first. One table per flavour.
+
+  Niche on purpose, and narrow on purpose: nothing else changes. The
+  Peaks table, CSV export, peak tracking and matching all keep using
+  the standard tables, so with a primary Fitted table matching goes on
+  matching a table the pipeline is no longer updating. The Settings
+  hint says so.
+
+  A run interrupted partway (a crash, or the GPU taking the process
+  with it) is repaired automatically the next time the file is opened
+  or run, and never at the cost of the interrupted run's output.
+
+### Changed
+
+- **The mouse wheel no longer changes a value.** Scrolling a dock used
+  to step whatever field the cursor happened to be over — a `dq`, a
+  range, a frame count — which is easy to do without noticing and
+  produces a wrong result rather than an error. Comboboxes were already
+  protected; spin boxes now are too. The wheel scrolls the panel
+  instead, so a long form is no more awkward to move through than
+  before. Sliders are unchanged, and so is an open dropdown's list.
+
+- **A registered extra peak list treated as detected can now have its
+  scores edited**, the same way the built-in detected layer can, since
+  relabelling is usually why such a table is registered in the first
+  place. The write goes to that list's own dataset and nothing else. A
+  list treated as fitted is unaffected, and a table with no score column
+  at all now shows no Score row instead of a synthesised `0.000`.
+
+### Fixed
+
+- **Deleting from a file now frees the space when you save.** HDF5
+  unlinks an object without shrinking the file -- the blocks become
+  reusable inside that file and its size on disk does not move -- and
+  saving was a byte copy of the working copy, so the holes were
+  reproduced faithfully and deleting a large stack freed nothing, ever.
+  Saving now rewrites the file without them when there is enough to
+  reclaim to be worth it, measured by comparing the file's size against
+  what its datasets actually occupy. A file with nothing to reclaim
+  takes the same byte copy it always did. Chunking, compression,
+  attributes and links are all carried across; a link stays a link
+  rather than being expanded into a copy of its target. Saving is also
+  atomic now: both paths write beside the target and rename into place,
+  so an interrupted save cannot leave half a file. The working copy
+  still carries the holes until you save, because repacking after every
+  delete would rewrite the whole file each time.
+
+- **The app icon now shows in the Linux dash, switcher and top bar.**
+  The window carried the right icon, but GNOME resolves a window to an
+  *application* before it draws any of those surfaces and takes the icon
+  from that application's `.desktop` file. mlgidLAB shipped none, so
+  there was nothing to resolve to, and on Wayland there is no fallback
+  at all because `app_id` is all the compositor gets. The app now
+  advertises a desktop file name to Qt and installs a validated
+  `mlgidlab.desktop` plus the seven PNG sizes into the user's XDG data
+  directory on first run. `Exec` is written as an absolute path, since
+  the console script usually lives in a conda env the desktop session's
+  `PATH` never sees, and it is refreshed if that environment moves.
+  Best-effort throughout: a read-only home costs the dash icon, not the
+  launch. Windows already had its counterpart of this fix; this is the
+  Linux half.
+
+- **The Display dock now reports a saved fitted peak, not a refit of
+  it.** Selecting a peak that the pipeline had already fitted showed
+  numbers in the Selected-peak panel that did not match the same peak's
+  row in the Peaks dock. The panel's Fitted block was fed by the profile
+  viewer's live 1D Gaussian for every kind of selection, so the widths
+  were FWHM against the dock's stored `2σ` (a fixed 1.177×), the centre
+  and width came from a fresh fit of the current profile rather than
+  from the file, and the amplitude was a 1D height on an axis-averaged
+  profile instead of the stored 2D Gaussian height. A `fitted`,
+  `matched` or fitted-flavoured extra-list selection now reads its own
+  stored row, in the same quantities and formats the Peaks dock prints,
+  and the block is labelled `r / Δr / a / Δa` to match. A **manual**
+  peak is unchanged and still previews what Add-to-fitted would write,
+  now under a heading that says so. The profile plot's fit curve is
+  unchanged in every case: it still follows the data on screen.
+
+- **A registered extra peak list now keeps rendering after an entry
+  switch.** The layer appeared on the entry it was registered on and
+  then stayed blank for the rest of the session — the only way back was
+  to remove and re-add it in Settings. The peaks for the frame an entry
+  lands on are read on a worker thread, and that read was not asking for
+  the registered lists; the window nevertheless recorded the frame as
+  loaded, so nothing ever read them. Both worker paths now carry the
+  registered dataset names, and an overlay read that predates a
+  registration is refetched rather than trusted.
+
+- **Every Browse button now starts where you left off.** Opening a
+  scan, then picking a mask, then saving a PONI used to drop you in
+  three unrelated directories, and several buttons opened at the
+  filesystem root every time. There is now one browsing directory for
+  the whole app: a dialog opens where the last one finished, whatever
+  it was for, and the choice is kept until you change it — across a
+  restart as well as within a session. A button that suggests a file
+  name still suggests it; only the folder is shared. The calibration
+  window's own pickers follow the same directory, including the *Save
+  as PONI* button inside it.
+
+  Every dialog now uses Qt's own file picker rather than the
+  platform's, which was already true of Open: any of them can now land
+  in a folder of thousands of detector images, and the platform picker
+  makes a thumbnail of every one before the listing can be scrolled.
+
+- **Opening a second file while editing the first could kill the
+  window.** Not an error dialog — the process died outright. After any
+  rebuild of the File browser the app puts the user's selection back,
+  and that selection was being delivered to the click handler as though
+  the user had made it. The handler promotes the selected file to the
+  active session, which — with the Structure tab in front — tears the
+  browser down again mid-restore, leaving the next line holding an index
+  into a model that no longer had one. Qt's sort proxy then walked it.
+  Rare, because it needed the restored selection to sit in a file that
+  was not already active, which is exactly what opening a second file
+  arranges. A restore is now marked as a restore, and the handler
+  ignores it.
+
+- **The view controls above the image could be dead on a single-frame
+  file.** With one frame the whole frame transport is hidden, and the
+  layout skips a cluster with nothing visible in it — but a skipped
+  widget keeps its default size, so the emptied cluster sat on top of
+  the Cartesian / Polar buttons and the colormap picker and swallowed
+  every click. Loading a second, multi-frame file appeared to fix it,
+  because that gave the cluster real content.
+
+- **Flipping the detector image now moves the beam center with it.**
+  Ticking *Flip LR* or *Flip UD* on its own flipped the image but left
+  the beam center where it was, so the converted frame came out with its
+  missing wedge mirrored relative to the data. The cause was the PONI
+  autofill: it pre-fills the Manual-override boxes as a readout, and
+  those values were being sent back as overrides, which put pygid in the
+  one state where it applies the flips to the image but not to the
+  center. An untouched override field is no longer treated as an
+  override, and a center you *do* type in now genuinely wins over the
+  PONI (it never reached the q maps before).
+- **Peaks can be added before the pipeline has ever run.** Drawing a box
+  and pressing *Add to detected* / *Add to fitted* — or committing one
+  with quick select — failed on any frame that had never been through a
+  detection or fitting run, with a warning telling you to run the
+  pipeline first. That is every frame of a freshly converted file, so
+  labelling from scratch, which is the whole point of quick select, was
+  the one case that could not work. The frame's peaks table (and any
+  missing analysis group above it) is now created on demand, exactly as
+  pygid would have created it.
+
 ## 0.1.0a17 — seventeenth alpha (2026-08-19)
 
 ### Added

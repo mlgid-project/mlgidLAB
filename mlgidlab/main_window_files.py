@@ -11,17 +11,15 @@ import time
 from PySide6.QtCore import (
     QEventLoop,
     QMetaObject,
-    QSettings,
     QThread,
     Qt,
 )
 from PySide6.QtWidgets import (
     QApplication,
-    QFileDialog,
     QMessageBox,
 )
 from contextlib import contextmanager
-from mlgidlab import file_model
+from mlgidlab import file_dialogs, file_model
 from mlgidlab.browser_widgets import _MlgidHdf5TreeModel
 from mlgidlab.main_window_constants import (
     APP_NAME,
@@ -67,9 +65,9 @@ class FilesMixin:
         beamtime directory holding thousands of detector TIFFs takes
         ages to even become scrollable. The widget dialog with the
         constant-time ``_FastFileIconProvider`` lists such directories
-        instantly (and follows the app theme). The last-visited
-        directory persists across sessions via QSettings — the static
-        native dialog used to remember it only per-run.
+        instantly (and follows the app theme). Both that and the
+        remembered starting directory now come from ``file_dialogs``,
+        which every picker in the app shares.
         """
         paths = self._pick_files("Open file(s)", OPEN_FILTER)
         if paths:
@@ -79,26 +77,12 @@ class FilesMixin:
         """Multi-select file picker shared by Open and Import.
 
         Uses Qt's widget dialog instead of the platform-native one ON
-        PURPOSE (see ``_action_open``); the last-visited directory
-        persists across sessions via QSettings.
+        PURPOSE (see ``_action_open``); the starting directory is the
+        one every other picker in the app uses.
         """
-        dlg = QFileDialog(self, title)
-        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
-        dlg.setFileMode(QFileDialog.FileMode.ExistingFiles)
-        dlg.setNameFilter(name_filter)
-        dlg.setIconProvider(self._file_dialog_icons)
-        last_dir = str(QSettings().value("open/last_dir", "") or "")
-        if last_dir:
-            dlg.setDirectory(last_dir)
-        if not dlg.exec():
-            return []
-        paths = [Path(p) for p in dlg.selectedFiles()]
-        if not paths:
-            return []
-        QSettings().setValue(
-            "open/last_dir", dlg.directory().absolutePath()
-        )
-        return paths
+        return [
+            Path(p) for p in file_dialogs.open_files(self, title, name_filter)
+        ]
 
     def _action_import_converted(self) -> None:
         """File → Import images as converted scan… — explicit entry
@@ -123,9 +107,7 @@ class FilesMixin:
         from mlgidlab.import_dialog import ImportConvertedDialog
 
         paths = sorted(paths, key=_natural_key)
-        dialog = ImportConvertedDialog(
-            paths, parent=self, icon_provider=self._file_dialog_icons
-        )
+        dialog = ImportConvertedDialog(paths, parent=self)
         if not dialog.exec():
             return
         values = dialog.values()
@@ -436,11 +418,12 @@ class FilesMixin:
         if self.session is None or self.session.kind != "nexus":
             return
         assert isinstance(self.session, NexusSession)
-        path, _ = QFileDialog.getSaveFileName(
+        path, _ = file_dialogs.save_file(
             self,
             "Save As",
-            str(self.session.original_path),
             NEXUS_FILTER,
+            suggested_name=self.session.original_path.name,
+            default_suffix="h5",
         )
         if not path:
             return
@@ -486,7 +469,7 @@ class FilesMixin:
         # Additive: never tear down existing sessions. The new file simply
         # gets appended to the file browser when the copy completes.
         self._thread = QThread(self)
-        self._worker = CopyWorker(path)
+        self._worker = CopyWorker(path, self._extra_peak_datasets())
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._on_open_finished)
@@ -567,6 +550,18 @@ class FilesMixin:
             # lazily for one entry just before its first pipeline run (see
             # ``_ensure_entry_normalized``), so opening never touches every
             # linked scan.
+            #
+            # A file whose last pipeline run died mid-swap (see
+            # ``peak_lists`` / ``pipeline.recover_swaps``) still has a
+            # primary table sitting under a standard name. Put it back
+            # before anything reads the file, so the viewer never shows
+            # the wrong table as "detected peaks". A no-op, and no
+            # write at all, on the overwhelmingly normal file.
+            try:
+                from mlgidlab.pipeline import recover_swaps
+                recover_swaps(session.temp_path)
+            except Exception:
+                logger.debug("suppressed swap recovery on open", exc_info=True)
             self._sessions.append(session)
             self.tree.findHdf5TreeModel().insertFile(str(session.temp_path))
             # Re-opening a path that's already open REPLACES the old
@@ -677,6 +672,10 @@ class FilesMixin:
                 self.viewer.clear_history()
                 self.profile_viewer.clear()
                 self.peaks_table_panel.clear()
+                # The Structure panel describes a node in the file we are
+                # about to delete the working copy of; empty it before the
+                # path goes away.
+                self._clear_structure_panel()
                 self.entry_combo.blockSignals(True)
                 self.entry_combo.clear()
                 self.entry_combo.blockSignals(False)
@@ -951,6 +950,11 @@ class FilesMixin:
             if kind_menu is not None:
                 kind_menu.menuAction().setEnabled(not is_raw)
         self._refresh_workflow_rail()
+        # A mode change decides dock visibility from scratch, which would
+        # pop the side and bottom docks back up while the Structure tab
+        # is in front. Re-apply that tab's own rule afterwards.
+        self._refresh_structure_tree_roots()
+        self._sync_structure_docks()
         self._hide_stale_dock_tab_bars()
         # Re-tabifying above rebuilds the tab entries, and a fresh tab
         # comes up without an icon (Qt reads the dock's windowIcon only
@@ -1105,6 +1109,12 @@ class FilesMixin:
         # closed silx item.
         self._pending_data_node = None
         self.viewer.release_frame_source()
+        # The Structure editor's r+ handle is the third long-lived handle
+        # on the working copy. It is released here for the same reason as
+        # the other two: whatever runs next opens the file itself, and
+        # HDF5 refuses r+ behind any open handle. The editor re-acquires
+        # on the user's next edit.
+        self._release_edit_handle()
         # Tell the background prefetch worker to drop its own h5py
         # handle too. mlgidbase opens the same file r+ in the worker
         # we're about to spawn; an outstanding read handle from the

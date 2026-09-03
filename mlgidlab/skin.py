@@ -52,6 +52,34 @@ TABLE_SELECTOR = 'QTableView[mlgid="table"]'
 #: Progress bars this application owns (``widgets.skin_progress``).
 PROGRESS_SELECTOR = 'QProgressBar[mlgid="progress"]'
 
+#: objectName for a bordered box around one region of a split workspace
+#: (``widgets.boxed``). A ``Card``'s only chrome is a hairline under its
+#: title, which reads correctly stacked inside a dock and reads as a
+#: line stopping in mid-air when the section is a pane of its own.
+#:
+#: An objectName rather than the usual dynamic property, because
+#: qdarkstyle ships ``.QFrame[frameShape="0"] { border: 1px transparent }``
+#: — a class selector plus an attribute, which outranks a type selector
+#: plus an attribute, so ``QFrame[mlgid="region"]`` loses and the border
+#: silently paints transparent. An id selector outranks both.
+REGION_NAME = "MlgidRegion"
+REGION_SELECTOR = f'QFrame#{REGION_NAME}'
+
+#: objectName for the Structure header's inline-rename field
+#: (``structure_panel._NameEdit``). A ``QLineEdit`` that has to read as
+#: part of the title until it is being edited, so it borrows the
+#: card-title weight and loses every bit of chrome a line edit normally
+#: has. An objectName again, for the reason above: qdarkstyle styles
+#: ``QLineEdit`` heavily, and a plain property selector on the same type
+#: would be a coin toss.
+NODE_NAME = "MlgidNodeName"
+NODE_NAME_SELECTOR = f'QLineEdit#{NODE_NAME}'
+
+#: ``role`` on the muted half of that header — where the node lives, as
+#: opposed to what it is called. Muted and upright: it is a path, and
+#: the italics the other muted labels use read as prose.
+NODE_PATH = "node-path"
+
 
 def marker(theme: str) -> str:
     """The comment stamped at the top of the sheet, so a test (or a bug
@@ -248,6 +276,48 @@ QLabel[status="error"] {{ color: {t['status_error']}; font-style: italic; }}
 QLabel[status="info"] {{ color: {t['status_info']}; font-style: italic; }}
 QLabel[role="section"] {{ color: {t['text']}; font-weight: bold; }}
 QLabel[role="hint"] {{ color: {t['text_muted']}; font-style: italic; }}
+
+/* --- a region of a split workspace ----------------------------------
+   The Structure tab divides into five panes, and a pane needs an edge:
+   without one the cards' title hairlines run out into open space and
+   the splitter handles are the only thing suggesting where one section
+   ends. Ground stays `surface` so the tab's overall tone is unchanged —
+   this adds an edge, not a second background. */
+{REGION_SELECTOR} {{
+    background: {t['surface']};
+    border: 1px solid {t['border']};
+    border-radius: 6px;
+}}
+
+/* --- where the node lives, beside what it is called -------------------
+   Muted, so the eye lands on the name, which is the half that can be
+   typed over. The padding matches the field beside it so the two sit on
+   one baseline. */
+QLabel[role="{NODE_PATH}"] {{
+    color: {t['text_muted']};
+    padding: 6px 0px 5px 2px;
+}}
+
+/* --- the node's own name, editable in place --------------------------
+   Read-only it is the title: same weight, same padding, no chrome, so
+   the eye reads one line of "where am I". Editing it gives it a real
+   box, because at that point it is a field and has to look like one. */
+{NODE_NAME_SELECTOR} {{
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    padding: 6px 2px 5px 2px;
+    font-weight: bold;
+    color: {t['text']};
+}}
+{NODE_NAME_SELECTOR}:hover:read-only {{
+    border: 1px solid {t['border']};
+}}
+{NODE_NAME_SELECTOR}:!read-only {{
+    background: {t['surface']};
+    border: 1px solid {t['accent']};
+    padding: 6px 4px 5px 4px;
+}}
 
 /* --- item views this application owns -------------------------------
    qdarkstyle ships no QTableView rules at all, so alternating rows fall

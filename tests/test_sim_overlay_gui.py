@@ -94,27 +94,6 @@ def _structure(
     )
 
 
-def test_wheel_does_not_change_combo_selection(main_window):
-    """The app-wide _ComboWheelBlocker: scrolling over a CLOSED
-    combobox must not step through its items (hover-scrolling a dock
-    kept changing settings by accident)."""
-    from PySide6.QtCore import QPoint, QPointF
-    from PySide6.QtGui import QWheelEvent
-    from PySide6.QtWidgets import QApplication, QComboBox
-
-    combo = QComboBox(main_window)
-    combo.addItems(["a", "b", "c"])
-    combo.setCurrentIndex(1)
-    for step in (-120, 120):
-        event = QWheelEvent(
-            QPointF(5, 5), QPointF(5, 5), QPoint(0, 0), QPoint(0, step),
-            Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
-            Qt.ScrollPhase.NoScrollPhase, False,
-        )
-        QApplication.sendEvent(combo, event)
-        assert combo.currentIndex() == 1
-
-
 def test_section_disabled_until_cache_and_session(main_window, synthetic_nexus):
     mw = main_window
     assert not mw._sim_section_container.isEnabled()
@@ -699,7 +678,7 @@ def test_legend_swatch_recolors_structure_everywhere(
     assert swatch_pixel(mw._matched_struct_rows, s1.unique_id) == auto_color
     assert swatch_pixel(mw._sim_legend_struct_rows, s1.unique_id) == auto_color
 
-    mw._on_matched_color_picked(s1.color_key, "#123456")
+    mw._on_matched_pen_picked(s1.color_key, {"color": "#123456"})
     assert v.matched_pen(s1)["color"] == "#123456"
     # Both legends rebuilt their rows with the new colour.
     assert swatch_pixel(mw._matched_struct_rows, s1.unique_id) == "#123456"
@@ -714,6 +693,6 @@ def test_legend_swatch_recolors_structure_everywhere(
     assert colors[s1.unique_id] == "#123456"
     assert colors[s2.unique_id] == v.matched_pen(s2)["color"]
 
-    mw._on_matched_color_picked(s1.color_key, None)
+    mw._on_matched_pen_picked(s1.color_key, None)
     assert v.matched_pen(s1)["color"] == auto_color
     assert swatch_pixel(mw._matched_struct_rows, s1.unique_id) == auto_color

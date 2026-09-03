@@ -16,15 +16,49 @@ os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 from PySide6.QtWidgets import QApplication
 
-__version__ = "0.1.0a17"
+__version__ = "0.1.0a18"
+
+
+def _enable_crash_log() -> None:
+    """Dump the Python stack of every thread on a hard crash.
+
+    A segfault out of Qt, h5py or a GPU driver takes the window with it
+    and leaves nothing behind — which is the difference between a bug
+    that can be fixed and one that can only be waited for. ``faulthandler``
+    costs nothing until the process dies and then names the exact frame.
+
+    The dump goes to a file rather than stderr because the app is
+    launched from a desktop entry (and, on Windows, from ``pythonw``)
+    more often than from a terminal, and in both cases stderr goes
+    nowhere. The file is kept open for the life of the process on
+    purpose: the handler runs in a broken process and cannot open one.
+    """
+    try:
+        import faulthandler
+        import tempfile
+        from pathlib import Path
+
+        path = Path(tempfile.gettempdir()) / "mlgidlab_crash.log"
+        # Deliberately not closed, and deliberately not a context
+        # manager: the file has to still be open when the process dies.
+        stream = open(path, "a", buffering=1)
+        stream.write(f"--- mlgidLAB started, pid {os.getpid()} ---\n")
+        faulthandler.enable(file=stream, all_threads=True)
+    except Exception:
+        # A missing crash log must never be what stops the app starting.
+        pass
 
 
 def main() -> int:
     from PySide6.QtCore import QSettings, QTimer
     from pathlib import Path
+    from mlgidlab import desktop_entry
     from mlgidlab.main_window import MainWindow
     from mlgidlab.theme import apply_dark_theme, apply_light_theme
 
+    # Before the QApplication, so a crash inside Qt's own start-up is
+    # caught too.
+    _enable_crash_log()
     app = QApplication(sys.argv)
     # Reclaim working-copy temp dirs leaked by a previous run that was killed
     # before its graceful close ran (see mlgidlab.session). Only removes dirs
@@ -44,6 +78,14 @@ def main() -> int:
     # persisted preferences over time).
     app.setOrganizationName("mlgidLAB")
     app.setApplicationName("mlgidLAB")
+    # The name the shell matches a window to an *application* by: Qt
+    # advertises it as the Wayland ``app_id`` and the X11 ``WM_CLASS``
+    # instance name. Both are stamped when a window is created and never
+    # re-read, so this has to happen before ``MainWindow()`` below.
+    # Without it there is nothing for GNOME to match a ``.desktop`` file
+    # against, and the dash / switcher / top bar fall back to a generic
+    # icon no matter what ``setWindowIcon`` says.
+    app.setDesktopFileName(desktop_entry.DESKTOP_NAME)
     # Window, taskbar and Alt-Tab icon. Set on the application so every
     # window inherits it (main window, figure export, phase views, the
     # dialogs). Guarded: a packaging slip should cost an icon, not a
@@ -54,6 +96,18 @@ def main() -> int:
     except Exception:
         logging.getLogger("mlgidlab").debug(
             "could not set the application icon", exc_info=True)
+    if desktop_entry.is_supported():
+        # The Linux counterpart of the AppUserModelID below. GNOME takes
+        # an app's icon from its ``.desktop`` file, and pip installs no
+        # such file, so one is written to the user's XDG data dir on
+        # first run (and refreshed if the environment moved). Guarded
+        # for the same reason as the icon above: a read-only $HOME
+        # should cost the dash icon, not the startup.
+        try:
+            desktop_entry.install()
+        except Exception:
+            logging.getLogger("mlgidlab").debug(
+                "could not install the desktop entry", exc_info=True)
     if sys.platform == "win32":
         # Without an explicit AppUserModelID, Windows groups the app
         # under python.exe's icon in the taskbar no matter what

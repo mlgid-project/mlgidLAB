@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
-    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -29,6 +28,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from mlgidlab import ai_values, file_dialogs
 
 import logging
 
@@ -47,18 +48,15 @@ class ImportConvertedDialog(QDialog):
     """Collects the parameters for a converted-image import.
 
     ``values()`` is valid only after ``exec()`` returned Accepted.
-    ``icon_provider`` (optional) is installed on the output-path save
-    dialog so browsing a directory full of detector images stays
-    instant (same reasoning as the main Open dialog).
+    The output-path picker runs through ``file_dialogs``, which owns
+    both the shared browsing directory and the constant-time icon
+    provider that keeps a detector-image folder listing instantly.
     """
 
-    def __init__(
-        self, paths: list[Path], parent=None, icon_provider=None
-    ) -> None:
+    def __init__(self, paths: list[Path], parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Import images as converted scan")
         self._paths = list(paths)
-        self._icon_provider = icon_provider
 
         layout = QVBoxLayout(self)
         summary = QLabel(self._summary_text())
@@ -131,11 +129,27 @@ class ImportConvertedDialog(QDialog):
         form.addRow("Wavelength:", self.wavelength_input)
         self._on_use_q_toggled(False)
 
-        self.ai_input = _range_spin(0.0, 90.0, 0.0)
-        self.ai_input.setToolTip(
-            "Recorded as instrument/angle_of_incidence for every frame."
+        # Same grammar as the Conversion panel's field: one angle for
+        # every frame, or one per image. See ``ai_values``.
+        self.ai_input = QLineEdit("0")
+        self.ai_input.setPlaceholderText(
+            "0.2   or   0.1,0.3,0.5   or   (0.1,1.5,13)"
         )
+        self.ai_input.setToolTip(
+            "Recorded as instrument/angle_of_incidence.\n"
+            "  0.2                 the same angle for every frame\n"
+            "  0.1,0.3,0.5         an explicit angle per image\n"
+            "  (0.1,1.5,13)        a ramp: start, end, STEPS\n"
+            "A ramp gives one more angle than its step count (13 steps "
+            "= 14 angles), matching pygid's own scan convention."
+        )
+        self.ai_input.textChanged.connect(self._refresh_ai_hint)
         form.addRow("Incidence angle (deg):", self.ai_input)
+        self.ai_hint = QLabel("")
+        self.ai_hint.setProperty("status", "muted")
+        self.ai_hint.setWordWrap(True)
+        form.addRow("", self.ai_hint)
+        self._refresh_ai_hint()
 
         self.flip_vertical = QCheckBox(
             "Flip images vertically (q_z direction reversed in source)"
@@ -187,21 +201,53 @@ class ImportConvertedDialog(QDialog):
             w.setEnabled(checked)
 
     def _browse_output(self) -> None:
-        dlg = QFileDialog(self, "Save imported scan as")
-        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
-        dlg.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
-        dlg.setNameFilter("NeXus / HDF5 (*.h5 *.hdf5 *.nxs)")
-        dlg.setDefaultSuffix("h5")
-        if self._icon_provider is not None:
-            dlg.setIconProvider(self._icon_provider)
-        current = self.out_path.text().strip()
-        if current:
-            dlg.setDirectory(str(Path(current).parent))
-            dlg.selectFile(Path(current).name)
-        if dlg.exec():
-            files = dlg.selectedFiles()
-            if files:
-                self.out_path.setText(files[0])
+        # The field's *name* carries over; the directory is the
+        # app-wide browsing one (``file_dialogs``), same as every
+        # other picker.
+        path, _ = file_dialogs.save_file(
+            self, "Save imported scan as",
+            "NeXus / HDF5 (*.h5 *.hdf5 *.nxs)",
+            suggested_name=self.out_path.text().strip(),
+            default_suffix="h5",
+        )
+        if path:
+            self.out_path.setText(path)
+
+    def _refresh_ai_hint(self, *_args) -> None:
+        """Echo what the angle text resolved to, so the ramp's +1 shows."""
+        text = self.ai_input.text().strip()
+        if not text:
+            self.ai_hint.setText("")
+            self.ai_hint.setVisible(False)
+            return
+        try:
+            value = ai_values.parse_ai(text, n_frames=len(self._paths))
+        except ValueError as exc:
+            self._set_ai_hint(str(exc), error=True)
+            return
+        if isinstance(value, list) and len(value) != len(self._paths):
+            self._set_ai_hint(
+                f"{ai_values.describe(value)} — but {len(self._paths)} "
+                f"image(s) are being imported",
+                error=True,
+            )
+            return
+        self._set_ai_hint(ai_values.describe(value), error=False)
+
+    def _set_ai_hint(self, text: str, error: bool) -> None:
+        self.ai_hint.setText(text)
+        self.ai_hint.setProperty("status", "error" if error else "muted")
+        style = self.ai_hint.style()
+        style.unpolish(self.ai_hint)
+        style.polish(self.ai_hint)
+        self.ai_hint.setVisible(bool(text))
+
+    def _ai_value(self) -> float | list[float]:
+        """The parsed angle, or 0.0 when the field is empty."""
+        text = self.ai_input.text().strip()
+        if not text:
+            return 0.0
+        return ai_values.parse_ai(text, n_frames=len(self._paths))
 
     def _validate_and_accept(self) -> None:
         if not self.out_path.text().strip():
@@ -223,6 +269,19 @@ class ImportConvertedDialog(QDialog):
                     "Each q range needs min < max.",
                 )
                 return
+        try:
+            ai = self._ai_value()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Import", str(exc))
+            return
+        if isinstance(ai, list) and len(ai) != len(self._paths):
+            QMessageBox.warning(
+                self, "Import",
+                f"{len(ai)} angles of incidence were given for "
+                f"{len(self._paths)} image(s). A ramp gives one more "
+                f"angle than its step count.",
+            )
+            return
         self.accept()
 
     def values(self) -> dict:
@@ -238,7 +297,7 @@ class ImportConvertedDialog(QDialog):
             "qz_range": (
                 (self.qz_min.value(), self.qz_max.value()) if use_q else None
             ),
-            "ai": self.ai_input.value(),
+            "ai": self._ai_value(),
             "flip_vertical": self.flip_vertical.isChecked(),
             "wavelength_A": (
                 wavelength if use_q and wavelength > 0 else None

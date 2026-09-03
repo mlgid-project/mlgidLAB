@@ -43,15 +43,23 @@ class RawScan:
     - ``None`` → all frames in the dataset
     - ``int`` → a single frame index
     - ``list[int]`` → an explicit subset
+
+    ``frame_offset`` is where this scan's frame 0 sits on the whole
+    selection's frame axis. It only matters for a per-frame angle of
+    incidence: pygid looks the angle up as ``ai[frame + offset]``, so a
+    batch of single-frame scans needs each one to say which frame of the
+    scan it actually is. Defaults to 0, which is correct for every
+    single-scan run and for a scalar angle.
     """
 
     file_path: Path
     entry: str
     frame_num: int | list[int] | None = None
+    frame_offset: int = 0
 
 
 def _expand_fabio_scans(
-    entry: RawEntry, frame_num: int | list[int] | None
+    entry: RawEntry, frame_num: int | list[int] | None, base: int = 0,
 ) -> list[RawScan]:
     """Turn a selected fabio stack entry into one ``RawScan`` per frame-file.
 
@@ -61,6 +69,11 @@ def _expand_fabio_scans(
     Here ``frame_num`` selects WHICH stack frames to convert (and therefore
     which files), following the panel's frame mode: ``None`` → every file,
     ``int`` → one, ``list`` → a subset. Out-of-range indices are dropped.
+
+    ``frame_offset`` is ``base`` plus the file's **original** index in the
+    stack, not its position in the filtered result: converting frames 3
+    and 7 of a fourteen-image stack must read angles 3 and 7, not 0 and
+    1. ``base`` is where this entry starts on the selection's frame axis.
     """
     fmap = entry.frame_map or []
     n = len(fmap)
@@ -71,7 +84,11 @@ def _expand_fabio_scans(
     else:
         idxs = [i for i in frame_num if 0 <= i < n]
     return [
-        RawScan(file_path=fmap[i][0], entry="", frame_num=None) for i in idxs
+        RawScan(
+            file_path=fmap[i][0], entry="", frame_num=None,
+            frame_offset=base + i,
+        )
+        for i in idxs
     ]
 
 
@@ -102,7 +119,9 @@ class ConversionConfig:
     # Experimental params.
     poni_path: Path | None = None
     mask_path: Path | None = None
-    ai: float | None = None
+    # One angle for every frame, or one per frame of the selection's
+    # frame axis (see ``ai_values`` and ``RawScan.frame_offset``).
+    ai: float | list[float] | None = None
     # Per-field manual overrides (centerX, centerY, SDD, wavelength,
     # fliplr, flipud, transp). Filled by the panel when the user changes
     # the corresponding field; otherwise pygid reads the value from the

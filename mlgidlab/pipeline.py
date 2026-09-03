@@ -22,6 +22,241 @@ class PipelineCommand:
 
     op_name: str  # "run_detection" | "run_fitting" | "run_matching"
     kwargs: dict[str, Any] = field(default_factory=dict)
+    #: Optional table-swap plan (``peak_lists.swap_plan``) making the
+    #: run read and write a registered "primary" list instead of the
+    #: standard tables. Plain data, stamped by the GUI at
+    #: ``MainWindow._enqueue_pipeline`` -- the worker has no business
+    #: reading QSettings, which is also why the plan travels here
+    #: rather than being recomputed on this side.
+    table_swap: dict | None = None
+
+
+# --- Primary-table swapping ------------------------------------------------
+#
+# mlgidbase writes fixed dataset names (``detected_peaks``,
+# ``fitted_peaks`` + ``fitted_peaks_errors``, resolved deep inside
+# pygid's ``_save_img_container_*``) and takes no output-name argument,
+# so redirecting a run has to happen around the call: park the standard
+# tables, move the user's primary tables into their place, run, then
+# put everything back. Every step is an HDF5 link rename, so the cost
+# is independent of how many peaks or frames are involved.
+#
+# Own copy of the prefix rather than importing ``peak_lists``: that
+# module needs QSettings, and this one stays Qt-free so it can be
+# tested (and CI-run) without a GUI. ``test_pipeline_primary_table``
+# pins the two equal.
+
+_STASH_PREFIX = "__mlgidlab_stash__"
+#: Where the swapped-in data goes when a stash is found with no marker
+#: to say what it belongs to. Never overwritten, never deleted: the
+#: sweep's job is to make the standard tables right again without
+#: destroying whatever the interrupted run had put in their place.
+_ORPHAN_PREFIX = "__mlgidlab_orphan__"
+#: In-entry, NOT top-level: ``pygid.NexusFile`` opens ``/<name>/data``
+#: for every root key, so a stray top-level group is exactly the
+#: failure ``execute``'s first pre-flight exists to catch.
+_SWAP_MARKER_REL = "process/mlgidlab"
+_SWAP_MARKER_NAME = "pipeline_swap"
+
+
+def _frame_group_names(f, entry: str, frame: Any) -> list[str]:
+    """The analysis frame groups a run covers.
+
+    ``frame is None`` means the whole entry, matching mlgidbase's own
+    ``frame_num=None``. Listed live rather than cached because
+    detection CREATES frame groups: the post-run pass must see groups
+    that did not exist when the pre-run pass looked.
+    """
+    import h5py
+
+    from mlgidlab.file_model import ANALYSIS_REL, FRAME_KEY_FMT
+
+    ana_path = f"{entry}/{ANALYSIS_REL}"
+    if ana_path not in f:
+        return []
+    ana = f[ana_path]
+    if frame is None:
+        return [
+            name for name in ana.keys()
+            if isinstance(ana.get(name), h5py.Group)
+        ]
+    key = FRAME_KEY_FMT.format(int(frame))
+    return [key] if key in ana else []
+
+
+def _move(group, src: str, dst: str) -> bool:
+    """Rename ``src`` to ``dst`` inside ``group``; True when it moved.
+
+    A missing source is normal, not an error: a primary table need not
+    exist before its first run, and an entry need not have been
+    detected or fitted yet either.
+    """
+    if src not in group:
+        return False
+    if dst in group:
+        del group[dst]
+    group.move(src, dst)
+    return True
+
+
+def _swap_in(file_path: Path, entry: str, frame: Any, plan: dict) -> None:
+    """Park the standard tables and move the primary ones into place.
+
+    The marker is written FIRST, in the same open: if the process dies
+    between here and the restore (a detection run can take the GPU down
+    with it), the marker is the only thing that says which name the
+    swapped-in data belongs back under.
+    """
+    import json
+
+    import h5py
+
+    from mlgidlab.file_model import ANALYSIS_REL
+
+    with h5py.File(file_path, "r+") as f:
+        marker_group = f.require_group(f"{entry}/{_SWAP_MARKER_REL}")
+        if _SWAP_MARKER_NAME in marker_group:
+            del marker_group[_SWAP_MARKER_NAME]
+        marker_group.create_dataset(
+            _SWAP_MARKER_NAME,
+            data=json.dumps({"entry": entry, "frame": frame, "plan": plan}),
+        )
+        for name in _frame_group_names(f, entry, frame):
+            group = f[f"{entry}/{ANALYSIS_REL}/{name}"]
+            for standard in plan.get("stash", ()):
+                _move(group, standard, f"{_STASH_PREFIX}{standard}")
+            for own, standard in plan.get("swap_in", ()):
+                _move(group, own, standard)
+
+
+def _swap_out(file_path: Path, entry: str, frame: Any, plan: dict) -> None:
+    """Capture the run's output under the primary names, then restore.
+
+    Order matters: capture first, unstash second. The standard name
+    holds the run's result at this point, and the stash holds what was
+    there before; doing it the other way round would overwrite the
+    result with the old table.
+    """
+    import h5py
+
+    from mlgidlab.file_model import ANALYSIS_REL
+
+    with h5py.File(file_path, "r+") as f:
+        for name in _frame_group_names(f, entry, frame):
+            group = f[f"{entry}/{ANALYSIS_REL}/{name}"]
+            for standard, own in plan.get("capture", ()):
+                _move(group, standard, own)
+            for standard in plan.get("stash", ()):
+                _move(group, f"{_STASH_PREFIX}{standard}", standard)
+        marker_path = f"{entry}/{_SWAP_MARKER_REL}/{_SWAP_MARKER_NAME}"
+        if marker_path in f:
+            del f[marker_path]
+
+
+@contextlib.contextmanager
+def _swapped_tables(file_path: Path, entry: Any, frame: Any, plan: dict | None):
+    """Run the body with the primary tables standing in for the standard ones.
+
+    A no-op without a plan, so the ordinary pipeline path does not even
+    open the file. ``finally`` covers an exception; a hard kill is what
+    the marker and ``recover_swaps`` are for.
+    """
+    if not plan or not isinstance(entry, str) or not entry:
+        yield
+        return
+    _swap_in(Path(file_path), entry, frame, plan)
+    try:
+        yield
+    finally:
+        _swap_out(Path(file_path), entry, frame, plan)
+
+
+def recover_swaps(file_path: Path) -> int:
+    """Undo any table swap a previous run left behind. Returns entries fixed.
+
+    Two levels, because the two failure shapes differ:
+
+    * A **marker** says exactly what was swapped, so the restore is the
+      same ``_swap_out`` the successful path runs.
+    * A **stash with no marker** (hand-edited file, marker lost) still
+      identifies the standard table unambiguously by name. The
+      swapped-in data sitting under that name is moved aside to
+      ``__mlgidlab_orphan__`` rather than deleted -- the sweep's job is
+      to make the standard tables right, never to destroy whatever the
+      interrupted run had in their place.
+    """
+    import json
+
+    import h5py
+
+    from mlgidlab.file_model import ANALYSIS_REL
+
+    fixed = 0
+    try:
+        with h5py.File(file_path, "r+") as f:
+            entries = list(f.keys())
+    except Exception:
+        logger.debug("suppressed open in recover_swaps", exc_info=True)
+        return 0
+
+    for entry in entries:
+        plan = None
+        frame = None
+        try:
+            with h5py.File(file_path, "r") as f:
+                marker_path = f"{entry}/{_SWAP_MARKER_REL}/{_SWAP_MARKER_NAME}"
+                if marker_path in f:
+                    raw = f[marker_path][()]
+                    payload = json.loads(
+                        raw.decode() if isinstance(raw, bytes) else str(raw)
+                    )
+                    plan = payload.get("plan")
+                    frame = payload.get("frame")
+        except Exception:
+            logger.debug("suppressed marker read in recover_swaps", exc_info=True)
+        if plan:
+            try:
+                _swap_out(Path(file_path), entry, frame, plan)
+                logger.warning(
+                    "recovered an interrupted pipeline table swap in %s/%s "
+                    "— the standard peak tables have been restored.",
+                    Path(file_path).name, entry,
+                )
+                fixed += 1
+                continue
+            except Exception:
+                logger.debug("suppressed marker restore", exc_info=True)
+
+        # No usable marker: fall back to the stash names themselves.
+        try:
+            with h5py.File(file_path, "r+") as f:
+                ana_path = f"{entry}/{ANALYSIS_REL}"
+                if ana_path not in f:
+                    continue
+                ana = f[ana_path]
+                touched = False
+                for name in list(ana.keys()):
+                    group = ana.get(name)
+                    if not isinstance(group, h5py.Group):
+                        continue
+                    for key in list(group.keys()):
+                        if not key.startswith(_STASH_PREFIX):
+                            continue
+                        standard = key[len(_STASH_PREFIX):]
+                        _move(group, standard, f"{_ORPHAN_PREFIX}{standard}")
+                        _move(group, key, standard)
+                        touched = True
+                if touched:
+                    logger.warning(
+                        "found parked peak tables with no swap marker in "
+                        "%s/%s — restored the standard tables; the "
+                        "interrupted run's output is under %s.",
+                        Path(file_path).name, entry, _ORPHAN_PREFIX,
+                    )
+                    fixed += 1
+        except Exception:
+            logger.debug("suppressed stash sweep in recover_swaps", exc_info=True)
+    return fixed
 
 
 def is_mlgidbase_available() -> bool:
@@ -412,6 +647,14 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
     # error instead — naming the offending groups — so the user can
     # remove / rename them rather than chasing the h5py stack.
     from mlgidlab.file_model import list_entries, list_pygid_incompatible_top_level
+
+    # An earlier run that died mid-swap (a hard kill, or the GPU taking
+    # the process with it) leaves the primary tables sitting under the
+    # standard names. Put them back before doing anything else: running
+    # on top of a swapped file would compound the damage, and every
+    # later read would show the wrong table as "detected_peaks".
+    recover_swaps(file_path)
+
     bad = list_pygid_incompatible_top_level(file_path)
     if bad:
         raise RuntimeError(
@@ -493,7 +736,18 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
     # Clearing matches before the run gives the user a clean slate
     # and forces a deliberate re-match. The clear lands in the same
     # write window as the silx detach the caller has already done.
-    if command.op_name == "run_fitting":
+    # ...unless the run is redirected: a primary fitted table means
+    # ``fitted_peaks`` is parked untouched for the whole run, so the
+    # matched rows still index exactly the peaks they were matched
+    # against and clearing them would destroy good solutions. The skip
+    # is keyed on ``fitted_peaks`` specifically -- a primary DETECTED
+    # table alone still leaves fitting rewriting the standard fitted
+    # table, and the F-04 reasoning applies unchanged.
+    _fitted_redirected = bool(
+        command.table_swap
+        and "fitted_peaks" in command.table_swap.get("stash", ())
+    )
+    if command.op_name == "run_fitting" and not _fitted_redirected:
         try:
             from mlgidlab.file_model import clear_peaks
             entry_arg = command.kwargs.get("entry")
@@ -637,13 +891,20 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
             "mlgidLAB/docs/backend_compatibility.md."
         )
     method = getattr(analysis, command.op_name)
+    # Only detection and fitting ever carry a plan (``swap_plan``
+    # returns None for every other op, and the GUI only stamps those
+    # two), so this is a no-op everywhere else.
+    swap_entry = kwargs.get("entry")
+    swap_frame = kwargs.get("frame_num")
     if command.op_name == "run_detection":
         # ``safe_console`` stays on for the call itself: the pre-flight
         # above covers the model mlgidbase resolves, but any other
         # ``sys.stdout.write`` deeper in mlgidDETECT (e.g. a download we
         # did not anticipate) would otherwise still crash a GUI process
         # that has no console.
-        with detection_on_gpu(), safe_console():
+        with _swapped_tables(
+            file_path, swap_entry, swap_frame, command.table_swap
+        ), detection_on_gpu(), safe_console():
             result = method(**kwargs)
     elif command.op_name == "track_peaks":
         # The member-level tracking data is recovered through the
@@ -681,7 +942,10 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
             amplitudes=amplitudes_from_track_result(ret, rec),
         )
     else:
-        result = method(**kwargs)
+        with _swapped_tables(
+            file_path, swap_entry, swap_frame, command.table_swap
+        ):
+            result = method(**kwargs)
 
     # Consolidate matched_<type>_NNNN groups produced by mlgidmatch.
     # mlgidmatch returns one "solution" per consistent combination of

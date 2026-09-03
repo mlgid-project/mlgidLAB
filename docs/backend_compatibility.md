@@ -20,7 +20,7 @@ tests un-skip and run, not just the pure-h5py ones):
 |-|-|-|
 | `mlgidbase` | 0.1.5 | declared in `[pipeline]` |
 | `pygid` | 0.2.13 | declared in `[pipeline]` |
-| `pygidfit` | 0.1.3 | declared in `[pipeline]` (GUI imports it directly) |
+| `pygidfit` | 0.1.3 | declared in `[pipeline]` (GUI imports it directly) — **a bump to 0.1.4 is pending and blocked upstream, see below** |
 | `mlgidmatch` | 0.1.3 | declared in `[pipeline]` (GUI imports it directly) |
 | `pygidsim` | 0.1.4 | declared in `[pipeline]` (GUI imports it directly) |
 | `mlgiddetect` | 0.2.8 | transitive via `mlgidbase` (GUI never imports it) |
@@ -44,6 +44,40 @@ Python 3.11+) carry the GPU runtime, so the GUI no longer pins
 onnxruntime itself. **To move the baseline up:** bump the pins here
 and in `pyproject.toml`, re-run the full suite + the end-to-end demo
 loop, then commit.
+
+### Pending: `pygidfit` 0.1.3 -> 0.1.4 (blocked on mlgidbase)
+
+**Why it matters.** pygidfit 0.1.4 (PyPI, 2026-08-19) fixes the
+critical-angle units bug. `process_scans.calc_smpl_hor` carried a stray
+`/ 10` — its docstring claimed the wavelength was in metres while every
+caller passes Angstrom — so the sample-horizon mask applied by the
+fitting step was **10x too thin**. Confirmed fixed by reading 0.1.4's
+own `calc_smpl_hor`: the `/ 10` is gone and the docstring now says
+Angstrom. The GUI-side wiring was checked when the bug was found and is
+correct, so moving this pin is the entire fix on our side.
+
+**Why the pin has not moved.** `mlgidbase` pins `pygidfit==0.1.3`
+itself, in **both** 0.1.5 (our baseline) and the current 0.1.6.
+Declaring `pygidfit==0.1.4` in `[pipeline]` while `mlgidbase==0.1.5`
+is also declared makes `mlgidlab[pipeline]` unresolvable, so the pin
+stays at 0.1.3 and the intent is recorded here and in `pyproject.toml`
+instead of shipping an extra that cannot be installed.
+
+**What to do when an mlgidbase release allows 0.1.4:**
+
+1. Bump `pygidfit` to 0.1.4 in `[pipeline]` and in the baseline table
+   above.
+2. Bump `mlgidbase` to that release. Re-check its other pins in the
+   same pass: 0.1.6 already requires `pygid>=0.2.14`, above our
+   `pygid==0.2.13`, so that pin moves too.
+3. Fix the **"Critical angle:"** tooltip in `mlgidlab/pipeline_panel.py`
+   (`fit_crit_angle`). It currently reads "Maximum allowed
+   misorientation angle between peaks within a cluster", which
+   describes a clustering parameter. The value is the sample's critical
+   angle in degrees, combined with the incidence angle and the
+   wavelength to place the sample-horizon `q_z` cut.
+4. Re-run the full suite and the end-to-end demo loop, then record the
+   result under "Recorded bumps" below.
 
 **Runtime (non-pipeline) deps stay on `>=` floors on purpose.** The GUI
 stack — PySide6, pyqtgraph, silx, numpy, etc. — is *not* pinned exact,

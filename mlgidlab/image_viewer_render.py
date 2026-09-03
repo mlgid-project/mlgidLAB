@@ -17,6 +17,7 @@ from mlgidlab.viewer_items import (
     _apply_raw_flips,
     _bin_index,
     _peaks_from_manual,
+    _raw_pixel_index,
     _peaks_subset,
     _robust_levels,
 )
@@ -218,7 +219,7 @@ class ViewerRenderMixin:
                     return
                 frame = _apply_raw_flips(
                     np.asarray(self._raw_image_stack[idx]),
-                    self._raw_flip_lr, self._raw_flip_ud,
+                    self._raw_flip_lr, self._raw_flip_ud, self._raw_transp,
                 ).T
             elif self._mode == MODE_POLAR:
                 if self._frame_source is None or not self._frame_source.is_open:
@@ -511,6 +512,8 @@ class ViewerRenderMixin:
             self._detected.set_polar(det, extent=extent)
             self._fitted.set_polar(fit, extent=extent)
             self._manual.set_polar(manual_table, extent=extent)
+            for kind, item in self._list_items.items():
+                item.set_polar(peaks.get(kind), extent=extent)
             if sel_table is not None:
                 self._selection.set_polar(sel_table, extent=extent)
             else:
@@ -523,6 +526,8 @@ class ViewerRenderMixin:
             self._detected.set_cartesian(det, extent=extent)
             self._fitted.set_cartesian(fit, extent=extent)
             self._manual.set_cartesian(manual_table, extent=extent)
+            for kind, item in self._list_items.items():
+                item.set_cartesian(peaks.get(kind), extent=extent)
             if sel_table is not None:
                 self._selection.set_cartesian(sel_table, extent=extent)
             else:
@@ -535,6 +540,8 @@ class ViewerRenderMixin:
         self._detected.setVisible(self._visibility["detected"])
         self._fitted.setVisible(self._visibility["fitted"])
         self._manual.setVisible(self._visibility["manual"])
+        for kind, item in self._list_items.items():
+            item.setVisible(self._visibility.get(kind, True))
 
         # Matched overlays: rebuild items for whatever the current frame has.
         self._render_matched_overlays(frame)
@@ -692,13 +699,18 @@ class ViewerRenderMixin:
         if self._mode == MODE_RAW and self._raw_image_stack is not None:
             stack = self._raw_image_stack
             n_fr, n_rows, n_cols = stack.shape
-            col = int(round(x))
-            row = int(round(y))
-            if (
-                0 <= frame < n_fr
-                and 0 <= row < n_rows
-                and 0 <= col < n_cols
-            ):
+            # The cursor is over the *oriented* preview, so its indices
+            # have to be mapped back before reading the stack, which is
+            # in file order. Reported row/col are the file-order ones:
+            # they name the detector pixel, which is what a readout is
+            # for. Without this the intensity was simply the wrong pixel
+            # whenever a flip was on, and a transpose on a non-square
+            # detector would have read out of bounds.
+            row, col = _raw_pixel_index(
+                int(round(y)), int(round(x)), (n_rows, n_cols),
+                self._raw_flip_lr, self._raw_flip_ud, self._raw_transp,
+            )
+            if 0 <= frame < n_fr and row >= 0:
                 intensity = float(stack[frame, row, col])
             else:
                 intensity = float("nan")

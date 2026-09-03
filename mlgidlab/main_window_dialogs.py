@@ -3,20 +3,34 @@ Moved out of ``main_window`` in the 2026 source split.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
     QRadioButton,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
 )
+from mlgidlab import file_model, peak_lists
+from mlgidlab.widgets import skin_item_view
+
+import logging
+
+logger = logging.getLogger(__name__)
+
 from mlgidlab.main_window_constants import (
     PEAK_LINK_KEY,
     PEAK_LINK_REVERSE_KEY,
@@ -217,13 +231,67 @@ class _SettingsDialog(QDialog):
         peaks_layout.addWidget(self._chk_peak_link_reverse)
         outer.addWidget(peaks_box)
 
+        # --- Extra peak lists -------------------------------------------------
+        lists_box = QGroupBox("Extra peak lists")
+        lists_layout = QVBoxLayout(lists_box)
+        lists_hint = QLabel(
+            "<i>Show another peak table from a file's analysis group as "
+            "its own layer in the Display dock. A display layer only: "
+            "you can see it, pick a box and nudge it, and nothing else "
+            "in the app reads it.<br><br>"
+            "<b>Pipeline primary</b> is the one exception, and it is "
+            "niche. Tick it and Detection and Fitting read and write "
+            "that table instead of the standard one for its flavour, so "
+            "you can build a second analysis without touching the first. "
+            "One table per flavour. Everything else still uses the "
+            "standard tables: the Peaks table, CSV export, peak "
+            "tracking, and matching — so with a primary Fitted "
+            "table, matching keeps matching a table the pipeline is no "
+            "longer updating.</i>"
+        )
+        lists_hint.setWordWrap(True)
+        lists_layout.addWidget(lists_hint)
+
+        self._lists_table = QTableWidget(0, 4)
+        self._lists_table.setHorizontalHeaderLabels(
+            ["Dataset", "Shown as", "Treat as", "Pipeline primary"]
+        )
+        self._lists_table.verticalHeader().setVisible(False)
+        self._lists_table.horizontalHeader().setStretchLastSection(True)
+        self._lists_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        skin_item_view(self._lists_table)
+        self._lists_table.setMinimumHeight(90)
+        lists_layout.addWidget(self._lists_table)
+
+        # What the OPEN FILE actually has, so the dataset is picked
+        # rather than typed -- a name that does not exist would register
+        # a layer that never appears, with nothing to say why.
+        self._available_datasets = self._scan_available_datasets(parent)
+        lists_btns = QHBoxLayout()
+        self._btn_add_list = QPushButton("Add\u2026")
+        self._btn_add_list.clicked.connect(self._add_list_row)
+        self._btn_remove_list = QPushButton("Remove")
+        self._btn_remove_list.clicked.connect(self._remove_list_row)
+        lists_btns.addWidget(self._btn_add_list)
+        lists_btns.addWidget(self._btn_remove_list)
+        lists_btns.addStretch(1)
+        lists_layout.addLayout(lists_btns)
+
+        self._lists_empty_hint = QLabel("")
+        self._lists_empty_hint.setProperty("status", "muted")
+        self._lists_empty_hint.setWordWrap(True)
+        lists_layout.addWidget(self._lists_empty_hint)
+        outer.addWidget(lists_box)
+
         # --- Buttons + outer wiring -------------------------------------------
         outer.addStretch(1)
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
         )
-        btns.accepted.connect(self.accept)
+        btns.accepted.connect(self._on_accept)
         btns.rejected.connect(self.reject)
         outer.addWidget(btns)
 
@@ -267,7 +335,272 @@ class _SettingsDialog(QDialog):
         self._chk_peak_link_reverse.setChecked(
             read_bool(PEAK_LINK_REVERSE_KEY, False)
         )
+        self._load_list_rows()
         self._refresh_enabled()
+
+    # --- Extra peak lists ---
+
+    def _scan_available_datasets(self, parent) -> list[str]:
+        """Peak-shaped tables in the open file's current frame.
+
+        Read once when the dialog opens: it is a handful of names from
+        an already-open handle, and re-scanning per keystroke would put
+        file I/O behind a combo box. Any failure yields an empty list --
+        the section then explains itself and Add stays disabled, which
+        is better than a dialog that will not open.
+        """
+        try:
+            session = getattr(parent, "session", None)
+            if session is None:
+                return []
+            entry = parent.entry_combo.currentText()
+            if not entry:
+                return []
+            frame = int(parent.viewer.current_frame)
+            source = parent.viewer._frame_source
+            if source is not None and source.is_open and source.entry == entry:
+                return file_model.list_peak_tables(
+                    source._file, entry, frame
+                )
+            import h5py
+
+            with h5py.File(session.temp_path, "r") as f:
+                return file_model.list_peak_tables(f, entry, frame)
+        except Exception:
+            logger.debug("could not list this frame's peak tables",
+                         exc_info=True)
+            return []
+
+    def _load_list_rows(self) -> None:
+        self._lists_table.setRowCount(0)
+        for spec in peak_lists.load_specs():
+            self._append_list_row(
+                spec.dataset, spec.label, spec.treat_as, spec.primary,
+            )
+        self._refresh_lists_hint()
+
+    def _primary_box(self, row: int):
+        """The Pipeline-primary checkbox on ``row`` (None if absent)."""
+        widget = self._lists_table.cellWidget(row, 3)
+        return widget if isinstance(widget, QCheckBox) else None
+
+    def _treat_of_row(self, row: int) -> str:
+        widget = self._lists_table.cellWidget(row, 2)
+        if isinstance(widget, QComboBox):
+            return widget.currentData() or peak_lists.TREAT_DETECTED
+        return peak_lists.TREAT_DETECTED
+
+    def _enforce_single_primary(self, row: int) -> None:
+        """Keep at most one primary per flavour.
+
+        Ticking a row unticks every other row of the same flavour: two
+        primaries for one standard table would make the swap ambiguous,
+        and a radio-like tick says that better than a validation error
+        on OK would.
+        """
+        box = self._primary_box(row)
+        if box is None or not box.isChecked():
+            return
+        flavour = self._treat_of_row(row)
+        for other in range(self._lists_table.rowCount()):
+            if other == row:
+                continue
+            other_box = self._primary_box(other)
+            if (
+                other_box is not None
+                and other_box.isChecked()
+                and self._treat_of_row(other) == flavour
+            ):
+                other_box.setChecked(False)
+
+    def _on_treat_changed(self, row: int) -> None:
+        """Changing a row's flavour drops its tick.
+
+        The tick means "primary for THIS flavour"; carrying it across a
+        flavour change could silently produce a second primary for the
+        new one. Clearing is the rule with no surprising case.
+        """
+        box = self._primary_box(row)
+        if box is not None and box.isChecked():
+            box.setChecked(False)
+
+    def _refresh_lists_hint(self) -> None:
+        """Explain an empty Add rather than just greying it out."""
+        registered = {
+            self._dataset_of_row(r) for r in range(self._lists_table.rowCount())
+        }
+        remaining = [
+            name for name in self._available_datasets
+            if name not in registered
+        ]
+        self._btn_add_list.setEnabled(bool(remaining))
+        if not self._available_datasets:
+            self._lists_empty_hint.setText(
+                "Open a file whose current frame has an extra peak table "
+                "to add one."
+            )
+        elif not remaining:
+            self._lists_empty_hint.setText(
+                "Every extra table in this frame is already listed."
+            )
+        else:
+            self._lists_empty_hint.setText("")
+
+    def _dataset_of_row(self, row: int) -> str:
+        widget = self._lists_table.cellWidget(row, 0)
+        if isinstance(widget, QComboBox):
+            return widget.currentText()
+        item = self._lists_table.item(row, 0)
+        return item.text() if item is not None else ""
+
+    def _append_list_row(
+        self, dataset: str, label: str, treat_as: str, primary: bool = False,
+    ) -> None:
+        row = self._lists_table.rowCount()
+        self._lists_table.insertRow(row)
+        # A dataset already registered keeps a plain (read-only) cell:
+        # the file it came from may not be the one open now, and turning
+        # it into a combo would offer to silently repoint the layer.
+        item = QTableWidgetItem(dataset)
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self._lists_table.setItem(row, 0, item)
+        self._lists_table.setCellWidget(row, 1, QLineEdit(label))
+        combo = QComboBox()
+        for value in peak_lists.TREAT_AS:
+            combo.addItem(value.capitalize(), value)
+        index = combo.findData(treat_as)
+        combo.setCurrentIndex(max(index, 0))
+        self._lists_table.setCellWidget(row, 2, combo)
+        self._install_primary_cell(row, combo, primary)
+
+    def _install_primary_cell(self, row: int, treat_combo, primary: bool) -> None:
+        """The Pipeline-primary tick, plus the two rules that keep it sane.
+
+        Both connections resolve the row through the widget rather than
+        capturing ``row``: rows shift when one above is removed, and a
+        captured index would then point at the wrong table.
+        """
+        box = QCheckBox()
+        box.setChecked(bool(primary))
+        box.setToolTip(
+            "Detection and Fitting read and write this table instead of "
+            "the standard one for its flavour. Nothing else in the app "
+            "changes."
+        )
+        box.toggled.connect(
+            lambda _on, w=box: self._enforce_single_primary(
+                self._row_of_widget(w, 3)
+            )
+        )
+        treat_combo.currentIndexChanged.connect(
+            lambda _i, w=treat_combo: self._on_treat_changed(
+                self._row_of_widget(w, 2)
+            )
+        )
+        self._lists_table.setCellWidget(row, 3, box)
+
+    def _row_of_widget(self, widget, column: int) -> int:
+        for row in range(self._lists_table.rowCount()):
+            if self._lists_table.cellWidget(row, column) is widget:
+                return row
+        return -1
+
+    def _add_list_row(self) -> None:
+        registered = {
+            self._dataset_of_row(r) for r in range(self._lists_table.rowCount())
+        }
+        remaining = [
+            name for name in self._available_datasets
+            if name not in registered
+        ]
+        if not remaining:
+            return
+        row = self._lists_table.rowCount()
+        self._lists_table.insertRow(row)
+        combo = QComboBox()
+        combo.addItems(remaining)
+        combo.currentTextChanged.connect(
+            lambda _t: self._refresh_lists_hint()
+        )
+        self._lists_table.setCellWidget(row, 0, combo)
+        self._lists_table.setCellWidget(row, 1, QLineEdit(remaining[0]))
+        treat = QComboBox()
+        for value in peak_lists.TREAT_AS:
+            treat.addItem(value.capitalize(), value)
+        self._lists_table.setCellWidget(row, 2, treat)
+        self._install_primary_cell(row, treat, False)
+        self._refresh_lists_hint()
+
+    def _remove_list_row(self) -> None:
+        rows = sorted(
+            {i.row() for i in self._lists_table.selectedIndexes()},
+            reverse=True,
+        )
+        for row in rows:
+            self._lists_table.removeRow(row)
+        self._refresh_lists_hint()
+
+    def peak_list_specs(self) -> list:
+        """The registry as the dialog currently shows it."""
+        out = []
+        seen: set[str] = set()
+        for row in range(self._lists_table.rowCount()):
+            dataset = self._dataset_of_row(row).strip()
+            if not dataset or dataset in seen:
+                continue
+            label_widget = self._lists_table.cellWidget(row, 1)
+            treat_widget = self._lists_table.cellWidget(row, 2)
+            primary_box = self._primary_box(row)
+            out.append(peak_lists.PeakListSpec(
+                dataset=dataset,
+                label=(
+                    label_widget.text().strip()
+                    if isinstance(label_widget, QLineEdit) else ""
+                ),
+                treat_as=(
+                    treat_widget.currentData()
+                    if isinstance(treat_widget, QComboBox)
+                    else peak_lists.TREAT_DETECTED
+                ),
+                primary=(
+                    primary_box.isChecked() if primary_box is not None
+                    else False
+                ),
+            ))
+            seen.add(dataset)
+        return out
+
+    def primary_name_conflict(self) -> str:
+        """A registered list a fitted primary's errors table would eat.
+
+        A fitted run writes two datasets, so a primary ``trial2`` also
+        claims ``trial2_errors``. If some other row registers exactly
+        that name, the first fitting run would silently overwrite it.
+        Returns the offending name, or "" when there is no clash.
+        """
+        specs = self.peak_list_specs()
+        primary = peak_lists.primary_for(specs, peak_lists.TREAT_FITTED)
+        if primary is None:
+            return ""
+        errors = peak_lists.errors_name(primary.dataset)
+        for spec in specs:
+            if spec.dataset == errors:
+                return errors
+        return ""
+
+    def _on_accept(self) -> None:
+        """Refuse the one combination that would eat a registered table."""
+        clash = self.primary_name_conflict()
+        if clash:
+            QMessageBox.warning(
+                self, "Extra peak lists",
+                f"A fitted primary table also writes its errors table, "
+                f"so it needs the name {clash!r} — which is registered "
+                f"as a list of its own. Rename or remove that list, or "
+                f"pick a different primary.",
+            )
+            return
+        self.accept()
 
     def _refresh_enabled(self) -> None:
         frame_active = self._rb_frame.isChecked()
@@ -295,6 +628,7 @@ class _SettingsDialog(QDialog):
         settings.setValue(
             PLAYBACK_TOTAL_S_KEY, float(self._spin_total_s.value())
         )
+        peak_lists.save_specs(self.peak_list_specs())
         settings.setValue(PEAK_LINK_KEY, bool(self._chk_peak_link.isChecked()))
         settings.setValue(
             PEAK_LINK_REVERSE_KEY,

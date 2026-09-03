@@ -17,6 +17,7 @@ from mlgidlab.viewer_items import (
     _clip_angle,
     _peaks_subset,
 )
+from mlgidlab import peak_lists
 from mlgidlab.viewer_styles import (
     MATCHED_MARKER_SIZE,
     MODE_CARTESIAN,
@@ -26,7 +27,10 @@ from mlgidlab.viewer_styles import (
     UNMATCHED_UID,
     _SIM_STATE_COLORS,
     sim_state_colors,
-    _save_matched_color_overrides,
+    OVERLAY_KINDS,
+    OVERLAY_STYLE,
+    _save_matched_pen_overrides,
+    save_overlay_pen_overrides,
     _sim_intensity_scale,
     _sim_marker_size,
     matched_pen_for,
@@ -90,13 +94,15 @@ class ViewerOverlaysMixin:
             self._color_index_for_key(tuple(key))
 
     def _pen_for_key(self, key: tuple) -> dict:
-        """Palette pen for an identity, with the user's colour override
-        (if any) layered on top. Line style/width stay palette-driven so
-        an overridden structure keeps its dash pattern."""
+        """Palette pen for an identity, with the user's pen layered on top.
+
+        The override is PARTIAL: whatever the user did not set stays
+        palette-driven, so a structure whose width was raised still
+        picks up a distinguishable colour and dash pattern when the
+        file's structure list changes.
+        """
         pen = matched_pen_for(self._color_index_for_key(key))
-        override = self._matched_color_overrides.get(key)
-        if override:
-            pen["color"] = override
+        pen.update(self._matched_pen_overrides.get(key) or {})
         return pen
 
     def matched_pen(self, structure: MatchedStructure) -> dict:
@@ -107,30 +113,91 @@ class ViewerOverlaysMixin:
         """
         return self._pen_for_key(structure.color_key)
 
-    def set_matched_color(self, key: tuple, color: str | None) -> None:
-        """Set (hex string) or clear (``None`` = back to the automatic
-        palette) the user's colour for a structure identity. Persisted
-        app-wide; re-renders the current frame's overlays and re-emits
-        ``matchedStructuresChanged`` so both legends redraw their
-        swatches."""
+    def set_matched_pen(self, key: tuple, pen: dict | None) -> None:
+        """Set or clear the user's pen for a structure identity.
+
+        ``pen`` is a partial ``{color, style, width}``; ``None`` (or an
+        empty dict) puts the identity back on the automatic palette
+        entirely. Persisted app-wide; re-renders the current frame's
+        overlays and re-emits ``matchedStructuresChanged`` so both
+        legends redraw their swatches.
+        """
         key = tuple(key)
-        if color:
-            self._matched_color_overrides[key] = str(color)
+        if pen:
+            self._matched_pen_overrides[key] = dict(pen)
         else:
-            self._matched_color_overrides.pop(key, None)
-        _save_matched_color_overrides(self._matched_color_overrides)
+            self._matched_pen_overrides.pop(key, None)
+        _save_matched_pen_overrides(self._matched_pen_overrides)
         self._render_overlays(self.current_frame)
         self.matchedStructuresChanged.emit(
             self.current_frame, self.matched_structures(self.current_frame)
         )
+
+    def set_matched_color(self, key: tuple, color: str | None) -> None:
+        """Colour-only shorthand for ``set_matched_pen``.
+
+        ``None`` clears the whole pen, matching what it meant before
+        line style and width were editable.
+        """
+        self.set_matched_pen(key, {"color": str(color)} if color else None)
+
+    def matched_pen_override(self, key: tuple) -> dict:
+        """The user's partial pen for an identity ({} when untouched)."""
+        return dict(self._matched_pen_overrides.get(tuple(key)) or {})
+
+    # --- detected / fitted overlay pens ---
+
+    def overlay_pen(self, kind: str) -> dict:
+        """The effective ``{color, style, width}`` for an overlay kind.
+
+        A registered extra list starts from the preset of the kind it is
+        treated as, so a detected-flavoured list looks like detected
+        until the user says otherwise -- and the pen editor then
+        overrides it exactly as it does for the built-in layers.
+        """
+        base = kind
+        if peak_lists.is_list_kind(kind):
+            spec = self.peak_list_spec(kind)
+            base = spec.treat_as if spec is not None else "detected"
+        pen = dict(OVERLAY_STYLE[base])
+        pen.update(self._overlay_pen_overrides.get(kind) or {})
+        return pen
+
+    def overlay_pen_override(self, kind: str) -> dict:
+        """The user's partial pen for an overlay kind ({} when untouched)."""
+        return dict(self._overlay_pen_overrides.get(kind) or {})
+
+    def set_overlay_pen(self, kind: str, pen: dict | None) -> None:
+        """Set or clear the user's pen for the detected / fitted overlay.
+
+        ``pen`` is a partial ``{color, style, width}``; ``None`` puts the
+        kind back on its ``OVERLAY_STYLE`` preset. Persisted app-wide
+        and applied to the live item, so the image follows the moment
+        the user moves a control.
+        """
+        if kind not in OVERLAY_KINDS and self._overlay_item(kind) is None:
+            raise ValueError(f"Unknown overlay kind: {kind!r}")
+        if pen:
+            self._overlay_pen_overrides[kind] = dict(pen)
+        else:
+            self._overlay_pen_overrides.pop(kind, None)
+        save_overlay_pen_overrides(self._overlay_pen_overrides)
+        item = self._overlay_item(kind)
+        if item is not None:
+            item.set_pen(**self.overlay_pen(kind))
+        self.overlayPenChanged.emit(kind)
 
     def cif_color_overrides(self) -> dict[str, str]:
         """CIF-level view of the colour overrides, for consumers keyed by
         CIF name only (the phase views). When several hkl rows of one CIF
         are overridden, the smallest sorted ``(h, k, l)`` wins."""
         out: dict[str, str] = {}
-        for key in sorted(self._matched_color_overrides):
-            out.setdefault(str(key[0]), self._matched_color_overrides[key])
+        for key in sorted(self._matched_pen_overrides):
+            color = self._matched_pen_overrides[key].get("color")
+            if color:
+                # A width-only or style-only override is not a colour
+                # choice; the CIF keeps its palette hue.
+                out.setdefault(str(key[0]), str(color))
         return out
 
     def cif_effective_colors(self) -> dict[str, str]:
@@ -741,11 +808,66 @@ class ViewerOverlaysMixin:
         return True
 
     def _overlay_item(self, kind: str) -> _PeakShapeItem | None:
+        if peak_lists.is_list_kind(kind):
+            return self._list_items.get(kind)
         return {
             "detected": self._detected,
             "fitted":   self._fitted,
             "manual":   self._manual,
         }.get(kind)
+
+    # --- registered extra peak lists ---
+
+    def peak_list_specs(self) -> list:
+        """The extra peak lists this viewer is currently drawing."""
+        return list(self._peak_list_specs)
+
+    def peak_list_spec(self, kind: str):
+        """The spec behind a list kind, or None when it is not registered."""
+        return peak_lists.spec_for_kind(self._peak_list_specs, kind)
+
+    def set_peak_list_specs(self, specs) -> None:
+        """Rebuild the extra-list overlay items from the registry.
+
+        Called at construction and again whenever Settings changes. Items
+        for lists that went away are removed from the viewbox; the ones
+        that stay keep their item (and so their pen) rather than being
+        rebuilt, so a Settings visit that only renames a list does not
+        make the image flicker.
+
+        A list's item is added AFTER the fixed three, so a custom layer
+        paints above detected and fitted -- it is the thing the user
+        went out of their way to see.
+        """
+        specs = list(specs)
+        self._peak_list_specs = specs
+        wanted = {spec.kind: spec for spec in specs}
+        vb = self._plot.getViewBox()
+        for kind in list(self._list_items):
+            if kind not in wanted:
+                item = self._list_items.pop(kind)
+                try:
+                    vb.removeItem(item)
+                except Exception:
+                    logger.debug("removing a peak-list item failed",
+                                 exc_info=True)
+                self._visibility.pop(kind, None)
+                if (
+                    self._selected is not None
+                    and self._selected.kind == kind
+                ):
+                    self.clear_selection()
+        for kind, spec in wanted.items():
+            if kind in self._list_items:
+                continue
+            item = _PeakShapeItem(**self.overlay_pen(kind))
+            item.setZValue(35)
+            vb.addItem(item, ignoreBounds=True)
+            self._list_items[kind] = item
+            self._visibility.setdefault(kind, True)
+            item.setVisible(self._visibility[kind])
+        if self._mode in (MODE_CARTESIAN, MODE_POLAR):
+            self._render_overlays(self.current_frame)
 
     def set_mode(self, mode: str) -> None:
         if mode not in (MODE_CARTESIAN, MODE_POLAR) or mode == self._mode:

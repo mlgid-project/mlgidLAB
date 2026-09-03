@@ -358,7 +358,131 @@ def test_custom_matched_color_survives_clear_and_restart(
     v2.set_matched_color(key, None)
     v3 = GIWAXSImageViewer()
     qtbot.addWidget(v3)
-    assert v3._matched_color_overrides == {}
+    assert v3._matched_pen_overrides == {}
+
+
+def test_a_matched_pen_can_set_style_and_width_too(
+    viewer, clean_matched_colors,
+):
+    """Colour was the only editable property; now all three are."""
+    from PySide6.QtCore import Qt
+
+    v = viewer
+    key = ("Aaa", 1, 1, 0)
+    auto = dict(v._pen_for_key(key))
+
+    v.set_matched_pen(key, {"style": Qt.PenStyle.DotLine, "width": 3.0})
+    pen = v._pen_for_key(key)
+    assert pen["style"] == Qt.PenStyle.DotLine
+    assert pen["width"] == pytest.approx(3.0)
+    # Untouched properties stay palette-driven, which is what keeps a
+    # widened structure re-cycling to a distinguishable hue.
+    assert pen["color"] == auto["color"]
+
+    v.set_matched_pen(key, None)
+    assert v._pen_for_key(key) == auto
+
+
+def test_a_width_only_override_is_not_a_colour_choice(
+    viewer, clean_matched_colors,
+):
+    """The phase views key off colour; a width must not claim a CIF."""
+    v = viewer
+    v.set_matched_pen(("Aaa", 1, 1, 0), {"width": 3.0})
+    assert v.cif_color_overrides() == {}
+    v.set_matched_pen(("Aaa", 1, 1, 0), {"width": 3.0, "color": "#123456"})
+    assert v.cif_color_overrides() == {"Aaa": "#123456"}
+
+
+def test_a_matched_pen_survives_a_restart(viewer, qtbot, clean_matched_colors):
+    from PySide6.QtCore import Qt
+    from mlgidlab.image_viewer import GIWAXSImageViewer
+
+    key = ("Aaa", 1, 1, 0)
+    viewer.set_matched_pen(
+        key, {"color": "#123456", "style": Qt.PenStyle.DashDotLine,
+              "width": 2.5},
+    )
+    fresh = GIWAXSImageViewer()
+    qtbot.addWidget(fresh)
+    pen = fresh._pen_for_key(key)
+    assert pen["color"] == "#123456"
+    assert pen["style"] == Qt.PenStyle.DashDotLine
+    assert pen["width"] == pytest.approx(2.5)
+
+
+def test_colours_stored_before_pens_are_still_honoured(
+    viewer, qtbot, clean_matched_colors,
+):
+    """An upgrading user keeps the colours they picked.
+
+    The pre-pen key held ``[[key, "#hex"], ...]``; it is read as a
+    colour-only pen when the new key is absent.
+    """
+    import json
+
+    from PySide6.QtCore import QSettings
+    from mlgidlab.image_viewer import GIWAXSImageViewer
+
+    QSettings().setValue(
+        "matchedColors", json.dumps([[["Aaa", 1, 1, 0], "#abcdef"]]),
+    )
+    fresh = GIWAXSImageViewer()
+    qtbot.addWidget(fresh)
+    assert fresh._pen_for_key(("Aaa", 1, 1, 0))["color"] == "#abcdef"
+    # ...and only the colour: style and width stay automatic.
+    assert fresh.matched_pen_override(("Aaa", 1, 1, 0)) == {"color": "#abcdef"}
+
+
+def test_the_detected_and_fitted_overlays_take_a_pen(
+    viewer, clean_matched_colors,
+):
+    """The peaks overlays are customisable now, and default to the preset."""
+    from PySide6.QtCore import Qt
+    from mlgidlab.viewer_styles import OVERLAY_STYLE
+
+    v = viewer
+    assert v.overlay_pen("detected") == OVERLAY_STYLE["detected"]
+    assert v.overlay_pen_override("detected") == {}
+
+    seen: list[str] = []
+    v.overlayPenChanged.connect(seen.append)
+    v.set_overlay_pen(
+        "fitted", {"color": "#ff00ff", "style": Qt.PenStyle.DotLine,
+                   "width": 2.5},
+    )
+    assert seen == ["fitted"]
+    pen = v.overlay_pen("fitted")
+    assert pen["color"] == "#ff00ff"
+    assert pen["width"] == pytest.approx(2.5)
+    # The live item follows, not just the bookkeeping.
+    assert v._fitted._pen.color().name() == "#ff00ff"
+    assert v._fitted._pen.style() == Qt.PenStyle.DotLine
+    # Detected is untouched by a change to fitted.
+    assert v.overlay_pen("detected") == OVERLAY_STYLE["detected"]
+
+    v.set_overlay_pen("fitted", None)
+    assert v.overlay_pen("fitted") == OVERLAY_STYLE["fitted"]
+    assert v._fitted._pen.color().name() == OVERLAY_STYLE["fitted"]["color"]
+    assert seen == ["fitted", "fitted"]
+
+
+def test_an_overlay_pen_survives_a_restart(viewer, qtbot, clean_matched_colors):
+    from mlgidlab.image_viewer import GIWAXSImageViewer
+
+    viewer.set_overlay_pen("detected", {"color": "#00ff00", "width": 3.0})
+    fresh = GIWAXSImageViewer()
+    qtbot.addWidget(fresh)
+    assert fresh.overlay_pen("detected")["color"] == "#00ff00"
+    # Built from the effective pen, so it is right from the FIRST render
+    # rather than flicking to it after the first change.
+    assert fresh._detected._pen.color().name() == "#00ff00"
+    assert fresh._detected._pen.widthF() == pytest.approx(3.0)
+
+
+def test_an_unknown_overlay_kind_is_refused(viewer, clean_matched_colors):
+    with pytest.raises(ValueError, match="Unknown overlay kind"):
+        viewer.set_overlay_pen("nonsense", {"color": "#ffffff"})
 
 
 def test_cif_color_overrides_smallest_hkl_wins(

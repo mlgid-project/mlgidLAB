@@ -28,7 +28,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
-    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -128,6 +127,7 @@ _MARKERS = ["o", "s", "^", "v", "D", "x", "+", "*"]
 # Canonical homes moved to widgets.py in the 2026 source split; the
 # underscore aliases keep this file's internals working unchanged.
 
+from mlgidlab import file_dialogs
 from mlgidlab.widgets import CollapsibleSection as _CollapsibleSection
 from mlgidlab.widgets import row_wrap as _row_wrap
 from mlgidlab.widgets import spin_double as _spin_double
@@ -849,10 +849,13 @@ class FigureExportWindow(QMainWindow):
         self._mark_stale()
 
     def _browse_save_path(self) -> None:
-        start = self.path_edit.text() or str(Path.home() / "figure.png")
-        path, selected = QFileDialog.getSaveFileName(
-            self, "Save figure", start,
+        # Only the *name* of the current text carries over; the
+        # directory is the app-wide browsing one (``file_dialogs``).
+        start = self.path_edit.text() or "figure.png"
+        path, selected = file_dialogs.save_file(
+            self, "Save figure",
             "PNG image (*.png);;SVG image (*.svg)",
+            suggested_name=start,
         )
         if path:
             # Honour an explicit .png/.svg the user typed; otherwise

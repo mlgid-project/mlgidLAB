@@ -23,8 +23,11 @@ from mlgidlab.peak_picking import (
     RING_EDGE_TOL_PX,
 )
 from mlgidlab.polar import polar_to_qxyz
+from mlgidlab import peak_lists
 from mlgidlab.viewer_items import (
+    BatchAction,
     FileGeomAction,
+    FileScoreAction,
     ManualAddAction,
     ManualGeomAction,
     ManualPeak,
@@ -646,6 +649,77 @@ class ViewerInteractMixin:
         ):
             self.peakGeometryChanged.emit(self._selected)
 
+    def _apply_file_score(
+        self, frame: int, kind: str, peak_id: int, score: float,
+    ) -> None:
+        """Set one file-backed peak's confidence score, in memory and on disk.
+
+        The geometry twin of this is ``_apply_file_geom``; kept separate
+        because a score edit must NOT touch the polar fields or the
+        derived ``q_xy`` / ``q_z`` -- moving a peak because its label
+        changed would be a silent data loss while labelling.
+
+        Patching the cached table matters as much as the file write: the
+        Display dock's min-score filter and the Peaks table both read it,
+        so without this the peak keeps its old score on screen until the
+        frame is reloaded.
+        """
+        peaks_for_frame = self._frame_peaks.get(frame) or {}
+        table = peaks_for_frame.get(kind)
+        if table is not None and len(table) > 0:
+            matches = np.where(table.ids == peak_id)[0]
+            if matches.size > 0:
+                table.score[int(matches[0])] = float(score)
+        for sel in self.selected_peaks():
+            if sel.frame == frame and sel.peak_id == peak_id:
+                sel.score = float(score)
+        if frame == self.current_frame:
+            self._render_overlays(frame)
+        self.peakRowWriteRequested.emit(
+            frame, kind, int(peak_id), {"score": float(score)},
+        )
+        if (
+            self._selected is not None
+            and self._selected.peak_id == peak_id
+            and self._selected.frame == frame
+        ):
+            self.selectionChanged.emit(self._selected)
+
+    def set_peak_scores(self, targets: list[tuple[int, str, int, float]]) -> None:
+        """Set the score of several peaks as ONE undoable gesture.
+
+        ``targets`` is ``(frame, kind, peak_id, new_score)`` per peak.
+        Relabelling a frame means picking a dozen boxes and pressing one
+        button, so a dozen history entries would make the mistake that
+        follows it a dozen presses of Ctrl+Z to fix.
+        """
+        actions = []
+        for frame, kind, peak_id, new_score in targets:
+            before = self._peak_score(frame, kind, peak_id)
+            if before is None or float(before) == float(new_score):
+                continue
+            actions.append(FileScoreAction(
+                frame=frame, kind=kind, peak_id=int(peak_id),
+                before=float(before), after=float(new_score),
+            ))
+        if not actions:
+            return
+        for action in actions:
+            action.redo(self)
+        self._push_undo(
+            actions[0] if len(actions) == 1 else BatchAction(actions=actions)
+        )
+
+    def _peak_score(self, frame: int, kind: str, peak_id: int):
+        """The cached score of one peak, or None when it is not there."""
+        table = (self._frame_peaks.get(frame) or {}).get(kind)
+        if table is None or len(table) == 0:
+            return None
+        matches = np.where(table.ids == peak_id)[0]
+        if matches.size == 0:
+            return None
+        return float(table.score[int(matches[0])])
+
     def _refresh_matched_for(self, frame: int) -> None:
         """Re-slice the frame's fitted PeakTable into each MatchedStructure
         using its cached ``peak_list`` indices. Cheap (numpy fancy index).
@@ -828,22 +902,48 @@ class ViewerInteractMixin:
             radius_width=float(table.radius_width[i]),
             angle_width=float(table.angle_width[i]),
             is_ring=bool(table.is_ring[i]),
-            score=float(table.score[i]),
+            # ``None`` when the table has no score column at all -- only
+            # a registered extra list can be in that state, and the
+            # panel already reads None as "no score to show", which is
+            # the truth rather than a synthesised 0.000.
+            score=float(table.score[i]) if table.has_score else None,
             amplitude=float(table.amplitude[i]),
         )
 
+    def _default_hit_kinds(self) -> tuple[str, ...]:
+        """Click priority, with the registered extra lists slotted in.
+
+        A list sits just BELOW the built-in layer it is treated as, so a
+        custom layer never steals a click from the layer it imitates --
+        a `Br_peaks` box drawn over a detected one still lets the
+        detected peak be picked first, which matters because that is the
+        one every other feature works on.
+        """
+        order: list[str] = ["manual", "fitted"]
+        order += [
+            s.kind for s in self._peak_list_specs if s.treat_as == "fitted"
+        ]
+        order.append("detected")
+        order += [
+            s.kind for s in self._peak_list_specs if s.treat_as != "fitted"
+        ]
+        order.append("matched")
+        return tuple(order)
+
     def _hit_candidates(
         self, x: float, y: float,
-        kinds: tuple[str, ...] = ("manual", "fitted", "detected", "matched"),
+        kinds: tuple[str, ...] | None = None,
     ) -> list[SelectedPeak]:
         """Every overlay box under ``(x, y)``, best candidate first.
 
         ``kinds`` is both the filter and the priority order, so the
         Ctrl+click path can ask for just detected/fitted in the order it
-        wants. Within one kind the smallest box comes first; equal-sized
-        boxes keep reverse table order, which is what the code did
-        before candidates existed.
+        wants. Defaults to ``_default_hit_kinds()``. Within one kind the
+        smallest box comes first; equal-sized boxes keep reverse table
+        order, which is what the code did before candidates existed.
         """
+        if kinds is None:
+            kinds = self._default_hit_kinds()
         if self._mode not in (MODE_POLAR, MODE_CARTESIAN):
             return []
         if self._mode == MODE_CARTESIAN:
@@ -871,7 +971,10 @@ class ViewerInteractMixin:
                         hits.append(
                             (SelectedPeak.from_manual(peak, frame), box))
 
-            elif kind in ("fitted", "detected"):
+            elif kind in ("fitted", "detected") or peak_lists.is_list_kind(kind):
+                # A registered extra list is table-backed exactly like
+                # detected and fitted, so it hit-tests through the same
+                # branch with no special casing.
                 if not self._visibility.get(kind, True):
                     continue
                 table = peaks_for_frame.get(kind)
@@ -1656,7 +1759,9 @@ class ViewerInteractMixin:
                 frame=sel.frame, peak=sel.manual_ref,
                 before=before, after=after,
             ))
-        elif sel.kind in ("detected", "fitted"):
+        elif sel.kind in ("detected", "fitted") or peak_lists.is_list_kind(
+            sel.kind
+        ):
             self._push_undo(FileGeomAction(
                 frame=sel.frame, kind=sel.kind, peak_id=sel.peak_id,
                 before=before, after=after,

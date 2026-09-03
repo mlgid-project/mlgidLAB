@@ -186,6 +186,29 @@ class FlowLayout(QLayout):
             return True
         return item.sizeHint().isEmpty()
 
+    @staticmethod
+    def _collapse(item, area: QRect) -> None:
+        """Shrink a skipped item to nothing instead of leaving it be.
+
+        A layout never calls ``setGeometry`` on an item it skips, so the
+        widget keeps whatever geometry it had — for one that has never
+        been laid out, Qt's default 640x480 at the parent's origin. It is
+        still visible and still hit-tested, so an empty cluster sat on
+        top of the strip and swallowed every click on the controls
+        underneath it: on a single-frame stack the whole frame transport
+        is hidden, and its cluster then covered Cartesian, Polar and the
+        colormap picker. Opening a second, multi-frame file appeared to
+        fix it, because that gave the cluster real content and a real
+        place to be.
+
+        Collapsing rather than hiding: this touches geometry only, so a
+        cluster that fills up again is laid out normally on the next
+        pass, with no visibility state to get stuck in.
+        """
+        widget = item.widget()
+        if widget is not None and not widget.geometry().isEmpty():
+            widget.setGeometry(QRect(area.x(), area.y(), 0, 0))
+
     def _do_layout(self, rect: QRect, test_only: bool) -> int:
         margins = self.contentsMargins()
         area = rect.adjusted(
@@ -198,6 +221,8 @@ class FlowLayout(QLayout):
 
         for item in self._items:
             if self._is_empty(item):
+                if not test_only:
+                    self._collapse(item, area)
                 continue
             hint = item.sizeHint()
             if row and x + hint.width() > area.right() + 1:

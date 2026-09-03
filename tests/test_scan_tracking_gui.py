@@ -1254,13 +1254,13 @@ def test_matched_color_pick_reaches_phase_views(
     _run_result(main_window, synthetic_fitted_scan)
 
     # Picked before the window exists -> honoured on open.
-    main_window._on_matched_color_picked(("PbI2", 0, 0, 1), "#123456")
+    main_window._on_matched_pen_picked(("PbI2", 0, 0, 1), {"color": "#123456"})
     main_window._on_show_phase_views()
     w = main_window._phase_views_window
     assert w._phase_colors["PbI2"].name() == "#123456"
 
     # Picked while the window is open -> re-rendered live.
-    main_window._on_matched_color_picked(("PbI2", 0, 0, 1), "#654321")
+    main_window._on_matched_pen_picked(("PbI2", 0, 0, 1), {"color": "#654321"})
     assert w._phase_colors["PbI2"].name() == "#654321"
     assert w._qmap_track_color(0, 1, phase_mode=True).name() == "#654321"
 

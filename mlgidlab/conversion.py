@@ -30,10 +30,76 @@ from mlgidlab.conversion_config import (
     OUTPUT_SINGLE_ENTRY,
     ConversionConfig,
     RawScan,
+    parse_poni_overrides,
 )
 
 import logging
 logger = logging.getLogger(__name__)
+
+
+#: pygid's ``DataLoader.batch_size`` default. A scan with MORE frames
+#: than this is processed in batches, and the batch loop resets
+#: ``global_frame_offset`` and recomputes it per batch while
+#: ``_build_ai_list`` still adds the frame index on top — so
+#: ``ai[frame + offset]`` double-counts and walks off the end of the
+#: list. Upstream issue; per-frame angles are refused above it rather
+#: than left to fail as an IndexError deep inside pygid.
+PYGID_BATCH_THRESHOLD = 32
+
+
+def _scan_frame_spans(
+    ai: list[float], scans: list[RawScan],
+) -> list[tuple[RawScan, int]]:
+    """Pair each scan with how many frames of the ai axis it covers.
+
+    The scans' ``frame_offset``s partition the axis in order, so a
+    scan's span is the distance to the next offset (and the last one
+    runs to the end of the list).
+    """
+    spans: list[tuple[RawScan, int]] = []
+    for i, scan in enumerate(scans):
+        start = scan.frame_offset
+        end = scans[i + 1].frame_offset if i + 1 < len(scans) else len(ai)
+        spans.append((scan, max(end - start, 0)))
+    return spans
+
+
+def _check_per_frame_ai(ai: list[float], scans: list[RawScan]) -> None:
+    """Refuse a per-frame angle list the run cannot honour.
+
+    Two ways it can go wrong, both caught here so the message names the
+    cause instead of surfacing as an IndexError from inside pygid:
+
+    - a scan reads past the end of the list (offsets and length
+      disagree — the panel checks this too, but the engine is also
+      called from the pipeline and from tests);
+    - a scan spans more than ``PYGID_BATCH_THRESHOLD`` frames, where
+      pygid's batch loop mis-indexes the angle list (see the constant).
+    """
+    if not ai:
+        raise ValueError("The angle-of-incidence list is empty")
+    for scan, span in _scan_frame_spans(ai, scans):
+        if span > PYGID_BATCH_THRESHOLD:
+            raise ValueError(
+                f"{scan.file_path.name} has {span} frames, and a "
+                f"per-frame angle of incidence only works up to "
+                f"{PYGID_BATCH_THRESHOLD} frames per scan (pygid "
+                f"switches to batch processing above that and "
+                f"mis-indexes the angle list). Use one angle for the "
+                f"whole scan, or convert it in smaller frame ranges."
+            )
+        if isinstance(scan.frame_num, list):
+            top = (max(scan.frame_num) + 1) if scan.frame_num else 0
+        elif isinstance(scan.frame_num, int):
+            top = scan.frame_num + 1
+        else:
+            top = span
+        if scan.frame_offset + top > len(ai):
+            raise ValueError(
+                f"{scan.file_path.name} reaches frame "
+                f"{scan.frame_offset + top - 1} but only {len(ai)} "
+                f"angles were given"
+            )
 
 
 def execute(
@@ -54,8 +120,6 @@ def execute(
     ``OUTPUT_SINGLE_ENTRY`` mode it's a single path holding one fresh
     ``entry_NNNN`` whose image stack grows by one frame per scan.
     """
-    import pygid  # lazy
-
     if not scans:
         raise ValueError("No scans selected for conversion")
     if cfg.poni_path is None:
@@ -69,6 +133,16 @@ def execute(
         raise ValueError(
             "Angle of incidence (ai) is required for GID geometry"
         )
+    if isinstance(cfg.ai, list):
+        _check_per_frame_ai(cfg.ai, scans)
+
+    # Imported here, below the checks above and not at the top of
+    # ``execute``: every one of them is a pure config check that needs
+    # no backend, and a user whose config is wrong should be told which
+    # field is wrong rather than that ``pygid`` is missing. It also lets
+    # the refusals be tested on a box without the ``[pipeline]`` extra,
+    # which is what CI installs.
+    import pygid  # lazy
 
     output_dir = Path(cfg.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -81,7 +155,9 @@ def execute(
     )
     if cfg.mask_path is not None:
         expparam_kwargs["mask_path"] = str(cfg.mask_path)
+    _complete_center_override(expparam_kwargs, cfg.poni_path)
     params = pygid.ExpParams(**expparam_kwargs)
+    _prefer_center_over_poni(params, expparam_kwargs)
 
     coordmap_kwargs: dict[str, Any] = dict(
         hor_positive=cfg.hor_positive,
@@ -198,6 +274,13 @@ def execute(
             path=str(scan.file_path),
             dataset=scan.entry,
             frame_num=scan.frame_num,
+            # Where this scan starts on the selection's frame axis. With
+            # a per-frame ai, pygid reads angle ``ai[frame + offset]``
+            # and picks coordinate map ``matrix[frame + offset]``, so a
+            # batch of single-frame scans is only per-frame correct
+            # because each one says which frame it is. Zero (the
+            # default) for a single scan and for a scalar ai.
+            global_frame_offset=scan.frame_offset,
         )
         method_name = cfg.conv_type
         method = getattr(analysis, method_name, None)
@@ -229,13 +312,27 @@ def execute(
     return written
 
 
+def _ai_per_frame(ai: float | list[float], n: int):
+    """One angle per frame, from either a single value or a list."""
+    import numpy as np
+
+    if isinstance(ai, (list, tuple)):
+        if len(ai) != n:
+            raise ValueError(
+                f"{len(ai)} angles of incidence were given for "
+                f"{n} image(s)"
+            )
+        return np.asarray(ai, dtype=np.float64)
+    return np.full(n, float(ai))
+
+
 def import_converted_stack(
     paths: list[Path],
     out_path: Path,
     entry_name: str = "entry_0000",
     qxy_range: tuple[float, float] | None = None,
     qz_range: tuple[float, float] | None = None,
-    ai: float = 0.0,
+    ai: float | list[float] = 0.0,
     flip_vertical: bool = False,
     wavelength_A: float | None = None,
     progress=None,
@@ -253,9 +350,10 @@ def import_converted_stack(
     ramps over the image width/height (1/Angstrom); without them the
     axes fall back to pixel indices so the entry still classifies as a
     converted mlgid scan and renders. ``ai`` fills
-    ``instrument/angle_of_incidence`` (one global value, repeated per
-    frame). ``flip_vertical`` flips each frame's rows for sources whose
-    q_z runs opposite to pygid's convention.
+    ``instrument/angle_of_incidence`` — one value repeated for every
+    frame, or a list with one value per image (in the same order as
+    ``paths``, length checked). ``flip_vertical`` flips each frame's
+    rows for sources whose q_z runs opposite to pygid's convention.
 
     The written schema mirrors pygid's DataSaver layout for the pieces
     the GUI reads (resizable ``img_gid_q`` + ``frame_ind``, per-frame
@@ -352,7 +450,7 @@ def import_converted_stack(
 
         instrument = entry.create_group("instrument")
         instrument.attrs["NX_class"] = "NXinstrument"
-        instrument["angle_of_incidence"] = np.full(n, float(ai))
+        instrument["angle_of_incidence"] = _ai_per_frame(ai, n)
 
         with_geometry = (
             wavelength_A is not None
@@ -634,6 +732,71 @@ def _method_kwargs_for(
         if cfg.dang is not None:
             kwargs["dang"] = cfg.dang
     return kwargs
+
+
+def _complete_center_override(kwargs: dict, poni_path: Path) -> None:
+    """Fill in the partner of a half-given beam-center override.
+
+    ``centerX`` and ``centerY`` only mean anything as a pair — pygid
+    derives poni1 *and* poni2 from them together, and a lone one would
+    hit a ``None`` mid-calculation. The panel's boxes can be unset
+    individually, so a user who dials one back to "(unset)" would send
+    half a center. Take the missing half from the PONI, which is where
+    it would have come from anyway.
+
+    Mutates ``kwargs`` in place; a no-op when neither or both are given,
+    or when the PONI cannot supply the missing half (pygid then reports
+    the inconsistency itself).
+    """
+    have = {k for k in ("centerX", "centerY") if k in kwargs}
+    if len(have) != 1:
+        return
+    missing = ({"centerX", "centerY"} - have).pop()
+    try:
+        value = parse_poni_overrides(poni_path).get(missing)
+    except OSError:
+        logger.debug("suppressed PONI re-parse for center completion", exc_info=True)
+        return
+    if value is not None:
+        kwargs[missing] = value
+
+
+def _prefer_center_over_poni(params, kwargs: dict) -> None:
+    """Make a beam-center override actually win over the PONI's poni1/poni2.
+
+    ``ExpParams.__post_init__`` reads the PONI file last, so poni1/poni2
+    are always set when a PONI is loaded. Two things follow from that,
+    and both are wrong for a user who typed a center:
+
+    1. ``CoordMaps`` reads **poni1/poni2 only** — the center override
+       never reaches the q maps, so it is silently ignored.
+    2. ``ExpParams._exp_params_update_`` applies ``fliplr`` / ``flipud`` /
+       ``transp`` to the beam center only in the branch it takes, and it
+       takes *neither* when poni and center are both set. The image gets
+       flipped by ``process_image`` and the center does not, so the
+       missing wedge lands on the wrong side.
+
+    Clearing poni1/poni2 puts pygid on the ``_calc_poni_`` branch, which
+    flips the center and derives poni from it. With no flips set this is
+    an exact round-trip (``_calc_poni_from_center`` inverts
+    ``_calc_center_``), so a conversion without flips is unchanged.
+
+    Only reached when the user edited a center field: the panel drops
+    override values still equal to what the PONI autofill wrote
+    (``ConversionPanel._unedited_autofill``), so the ordinary
+    load-a-PONI-and-tick-a-flip path keeps letting pygid derive the
+    center from poni1/poni2, which is its more accurate branch.
+
+    **Upstream note.** ``_calc_poni_`` mirrors flipud as
+    ``img_dim[0] - centerY`` where ``_calc_center_`` uses
+    ``(img_dim[0] - 1) * px - poni1``, so the two branches disagree by
+    one pixel on flipud. A hand-typed center with flipud on is therefore
+    1 px off. Reported, not worked around here.
+    """
+    if "centerX" not in kwargs or "centerY" not in kwargs:
+        return
+    params.poni1 = None
+    params.poni2 = None
 
 
 def _build_sample_metadata(pygid_mod: Any, yaml_text: str) -> Any:

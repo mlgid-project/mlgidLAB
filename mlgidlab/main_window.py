@@ -86,12 +86,13 @@ from silx.gui.hdf5 import Hdf5TreeModel, Hdf5TreeView
 from silx.gui.hdf5.Hdf5Node import Hdf5Node
 from silx.gui.hdf5.NexusSortFilterProxyModel import NexusSortFilterProxyModel
 
+from mlgidlab import file_dialogs
 from mlgidlab import file_model
 from mlgidlab import frame_range
 from mlgidlab import peak_clipboard
 from mlgidlab import pipeline
 from mlgidlab import update_check
-from mlgidlab.color_picker import ColorGridPopup
+from mlgidlab.pen_picker import PenPopup
 from mlgidlab.controls_help import ControlsDialog
 from mlgidlab.image_viewer import (
     GIWAXSImageViewer,
@@ -126,6 +127,7 @@ from mlgidlab.main_window_peaks import PeaksMixin, _CallbackAction
 from mlgidlab.main_window_frames import FramesMixin
 from mlgidlab.main_window_files import FilesMixin, _natural_key
 from mlgidlab.main_window_build import BuildMixin
+from mlgidlab.main_window_structure import StructureMixin
 from mlgidlab.main_window_update import UpdateMixin
 from mlgidlab.main_window_menus import MenusMixin
 from mlgidlab.workers import (
@@ -172,7 +174,7 @@ from mlgidlab.update_ui import (
     _UpdateCheckWorker,
     _UpdateInstallWorker,
 )
-from mlgidlab.widgets import ComboWheelBlocker as _ComboWheelBlocker
+from mlgidlab.widgets import ValueWheelBlocker as _ValueWheelBlocker
 from mlgidlab.widgets import make_pen_swatch as _make_pen_swatch
 
 
@@ -187,6 +189,7 @@ class MainWindow(
     PeaksMixin,
     FramesMixin,
     FilesMixin,
+    StructureMixin,
     BuildMixin,
     UpdateMixin,
     MenusMixin,
@@ -201,10 +204,12 @@ class MainWindow(
     _prefetchUpdate = Signal(int, bool, int)
     _prefetchRelease = Signal()
     # Queued request to the persistent EntryLoadWorker: (file_path, entry,
-    # request_id). The worker opens + warms that entry's first frame off
-    # the GUI thread and emits ``loaded`` back; stale request_ids (rapid
-    # switching) are dropped on arrival. See ``_load_entry_async``.
-    _entryLoadRequest = Signal(str, str, int)
+    # request_id, extra_peak_datasets). The worker opens + warms that
+    # entry's first frame off the GUI thread and emits ``loaded`` back;
+    # stale request_ids (rapid switching) are dropped on arrival. The
+    # trailing tuple carries the user's registered extra peak lists so the
+    # worker's overlay read covers them too. See ``_load_entry_async``.
+    _entryLoadRequest = Signal(str, str, int, object)
     # Raw-mode counterpart: (RawEntry, request_id) → ``raw_loaded`` with a
     # ready LazyRawStack. Shares the same request-id counter so raw and
     # NeXus switches supersede each other. See ``_load_raw_entry_into_viewer``.
@@ -227,13 +232,14 @@ class MainWindow(
 
     def __init__(self) -> None:
         super().__init__()
-        # Kill wheel-scrolling through closed comboboxes everywhere
-        # (kept as an attribute — installEventFilter does not own the
-        # filter, so it must not be garbage-collected).
-        self._combo_wheel_blocker = _ComboWheelBlocker(self)
+        # Kill wheel-scrolling through closed comboboxes and spin boxes
+        # everywhere — the wheel scrolls the page instead of moving the
+        # value (kept as an attribute: installEventFilter does not own
+        # the filter, so it must not be garbage-collected).
+        self._value_wheel_blocker = _ValueWheelBlocker(self)
         app = QApplication.instance()
         if app is not None:
-            app.installEventFilter(self._combo_wheel_blocker)
+            app.installEventFilter(self._value_wheel_blocker)
         # Multiple files can be open at once — each as its own Session in the
         # file browser. The "active" one drives entry_combo, the image viewer,
         # and per-file actions (save, save-as, close, pipeline). Switching is
@@ -280,9 +286,10 @@ class MainWindow(
         # select its image without any scan. Rebuilt by
         # ``_populate_raw_entries``.
         self._raw_entry_label_by_path: dict[str, str] = {}
-        # Shared by every Open dialog; ``setIconProvider`` does not take
-        # ownership, so the provider must outlive the dialog.
-        self._file_dialog_icons = _FastFileIconProvider()
+        # Shared by every file dialog in the app; ``setIconProvider``
+        # does not take ownership, so the provider must outlive the
+        # dialog. ``file_dialogs`` owns the single instance.
+        self._file_dialog_icons = file_dialogs.icon_provider()
         self._thread: QThread | None = None
         self._worker: CopyWorker | None = None
         self._pipe_thread: QThread | None = None
@@ -355,6 +362,47 @@ class MainWindow(
         # keeps a single Image-tab click from eagerly resolving a huge
         # external-linked dataset into a widget the user can't see.
         self._pending_data_node = None
+        # The same bargain for the Structure tab, and the file whose
+        # layout check is currently displayed (None re-runs it).
+        self._pending_structure_node = None
+        # The node the Structure panel is currently showing, whoever
+        # selected it — its own tree, the browser, or a search hit.
+        self._structure_node = None
+        self._structure_checked_file: str | None = None
+        # (file, h5 path) the Structure tab is showing and may write to;
+        # None whenever it is showing something read-only.
+        self._structure_target: tuple | None = None
+        # The editor's r+ handle on the active working copy, and one undo
+        # history per file. The handle is acquired lazily on the first
+        # edit and released by ``_detach_silx_tree``.
+        self._h5_edit_handle = None
+        self._structure_histories: dict = {}
+        # Docks folded away because the Structure tab is in front, to be
+        # restored on the way back to Image or Data.
+        self._structure_folded_docks: set[str] = set()
+        # Set when a structural edit landed while the File browser was
+        # folded away: rebuilding a tree nobody can see is a teardown for
+        # nothing, so it is paid once, on the way out.
+        self._browser_needs_rebuild = False
+        # The last node clicked in the Structure tab's own tree. Its
+        # entry is applied when the tab is left, so browsing a file to
+        # edit it never reloads the image behind the tab.
+        self._structure_pending_activation = None
+        # The entry the combo was moved to while the tab was in front.
+        # The read is async but the install is not, and installing a
+        # frame into a viewer nobody can see is the whole cost for none
+        # of the benefit. Reconciled from the combo on the way out.
+        self._structure_pending_entry = None
+        # Raised while the File browser's selection is being put back
+        # after a rebuild, so the selection handler can tell that apart
+        # from a click. See ``_restore_tree_state``.
+        self._restoring_tree_selection = False
+        # What the Structure tab holds between a Copy and a Paste. Kept
+        # apart from the peak clipboard: Ctrl+C means a different thing
+        # on each tab.
+        # A list, because the tab's tree is multi-select: one gesture can
+        # put six nodes on it. Empty when nothing has been copied.
+        self._structure_clip: list = []
         # Tools → Export figure window. Built lazily on first open
         # (see ``_action_export_figure``); kept alive across re-opens
         # so settings persist. None until the user invokes Tools →

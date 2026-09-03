@@ -40,7 +40,6 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
-    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -57,6 +56,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mlgidlab import file_dialogs
 from mlgidlab import roi_intensity
 from mlgidlab.phase_tracking import (
     AXIS_LABELS,
@@ -2041,9 +2041,9 @@ class PhaseViewsWindow(QMainWindow):
         keys = dlg.selected_views()
         if not keys:
             return
-        path, _filter = QFileDialog.getSaveFileName(
-            self, "Export plot data (CSV)", "tracking_data.csv",
-            "CSV files (*.csv)",
+        path, _filter = file_dialogs.save_file(
+            self, "Export plot data (CSV)", "CSV files (*.csv)",
+            suggested_name="tracking_data.csv",
         )
         if not path:
             return
@@ -2070,9 +2070,10 @@ class PhaseViewsWindow(QMainWindow):
         keys = dlg.selected_views()
         if not keys:
             return
-        path, chosen_filter = QFileDialog.getSaveFileName(
-            self, "Export plot images", "tracking_plots.png",
+        path, chosen_filter = file_dialogs.save_file(
+            self, "Export plot images",
             "PNG image (*.png);;SVG image (*.svg)",
+            suggested_name="tracking_plots.png",
         )
         if not path:
             return
@@ -2106,11 +2107,11 @@ class PhaseViewsWindow(QMainWindow):
                 "Run \"Track peaks (mlgidBASE)\" first.",
             )
             return
-        path, _filter = QFileDialog.getSaveFileName(
+        path, _filter = file_dialogs.save_file(
             self,
             "Save official mlgidBASE tracking figures",
-            "peak_tracking.png",
             "PNG image (*.png);;SVG image (*.svg);;PDF (*.pdf)",
+            suggested_name="peak_tracking.png",
         )
         if not path:
             return

@@ -9,11 +9,12 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QSettings, QTimer, Qt
 from PySide6.QtGui import (
     QAction,
     QColor,
     QFont,
+    QIcon,
     QKeySequence,
     QPainter,
     QPixmap,
@@ -59,11 +60,14 @@ from mlgidlab.pipeline import is_mlgidbase_available
 from mlgidlab.pipeline_panel import PipelinePanel
 from mlgidlab.profile_viewer import ProfileViewer
 from mlgidlab.scan_tracking_panel import ScanTrackingPanel
+from mlgidlab.structure_panel import StructurePanel
 from mlgidlab.update_ui import _UpdateBanner
+from mlgidlab.pen_picker import PenPopup
 from mlgidlab.welcome_view import WelcomeView
 from mlgidlab.workflow_rail import WorkflowRail
-from mlgidlab import file_model, theme_tokens
+from mlgidlab import file_model, peak_lists, theme_tokens
 from mlgidlab.widgets import (
+    GAP,
     PRIMARY,
     Card,
     make_debounced_timer,
@@ -78,6 +82,10 @@ from mlgidlab import icons
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+#: QSettings key for whether the workflow strip is open or folded.
+RAIL_EXPANDED_KEY = "view/workflow_rail_expanded"
 
 
 def _dirty_dot(diameter: int = 8) -> QPixmap:
@@ -97,6 +105,42 @@ class BuildMixin:
     def _build_central(self) -> None:
         self.viewer = GIWAXSImageViewer(self)
         self.data_viewer = DataViewerFrame(self)
+        self.structure_panel = StructurePanel(self)
+        self.structure_panel.recheckRequested.connect(self._on_structure_recheck)
+        self.structure_panel.attributeEdited.connect(
+            self._on_structure_attribute_edited)
+        self.structure_panel.attributeRenamed.connect(
+            self._on_structure_attribute_renamed)
+        self.structure_panel.attributeAdded.connect(
+            self._on_structure_attribute_added)
+        self.structure_panel.attributeRemoved.connect(
+            self._on_structure_attribute_removed)
+        self.structure_panel.scalarValueEdited.connect(
+            self._on_structure_value_edited)
+        self.structure_panel.copyChangesRequested.connect(
+            self._on_structure_copy_changes)
+        self.structure_panel.retargetLinkRequested.connect(
+            self._on_structure_retarget_link)
+        self.structure_panel.followLinkRequested.connect(
+            self._on_structure_follow_link)
+        self.structure_panel.editValuesRequested.connect(
+            self._on_structure_edit_values)
+        self.structure_panel.searchRequested.connect(
+            self._on_structure_search)
+        self.structure_panel.searchResultActivated.connect(
+            self._on_structure_search_result)
+        # The tab's own tree. It reads nothing itself — the lister goes
+        # through MainWindow's handle-aware accessor — so the panel keeps
+        # its no-I/O rule and the tree never holds a file open.
+        self.structure_panel.node_tree.set_lister(self._structure_list_children)
+        self.structure_panel.node_tree.nodeSelected.connect(
+            self._on_structure_tree_selected)
+        self.structure_panel.node_tree.contextRequested.connect(
+            self._on_structure_tree_context)
+        self.structure_panel.nodeActionRequested.connect(
+            self._on_structure_action)
+        self.structure_panel.renameRequested.connect(
+            self._on_structure_header_rename)
 
         self.tabs = QTabWidget(self)
         # documentMode flattens the tab-pane border so the image fills
@@ -112,8 +156,13 @@ class BuildMixin:
         )
         self.tabs.addTab(self.viewer, "Image")
         self.tabs.addTab(self.data_viewer, "Data")
+        # The structure editor. Deliberately last: Image is what the app
+        # opens on, and inserting a tab before Data would move a tab the
+        # user's muscle memory already knows.
+        self.tabs.addTab(self.structure_panel, "Structure")
         # Render a deferred (clicked-while-hidden) tree node when the user
-        # switches to the Data tab — see ``_set_or_defer_data_node``.
+        # switches to the Data or Structure tab — see
+        # ``_set_or_defer_data_node`` / ``_set_or_defer_structure_node``.
         self.tabs.currentChanged.connect(self._on_main_tab_changed)
 
         # Central column: a hidden "update available" banner above the tabs
@@ -133,6 +182,16 @@ class BuildMixin:
         self.workflow_rail = WorkflowRail(central)
         self.workflow_rail.stageActivated.connect(self._on_rail_stage_activated)
         self.workflow_rail.stageRunRequested.connect(self._on_rail_stage_run)
+        # Folded or open is a per-user preference, like the playback
+        # settings: someone who works from the docks wants the height
+        # back and should not have to reclaim it every launch.
+        self.workflow_rail.set_expanded(
+            str(QSettings().value(RAIL_EXPANDED_KEY, "true")).lower() != "false"
+        )
+        self.workflow_rail.expandedChanged.connect(
+            lambda expanded: QSettings().setValue(
+                RAIL_EXPANDED_KEY, bool(expanded))
+        )
         self.workflow_rail.hide()
         col.addWidget(self.workflow_rail)
         # The tabs share the column with a welcome page, shown whenever
@@ -214,6 +273,15 @@ class BuildMixin:
         self._tree_dock.setWidget(tree_box)
         self._tree_dock.setObjectName("FileBrowserDock")
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._tree_dock)
+        # Edits made while the browser is folded away defer its rebuild
+        # (see ``_ensure_browser_current``). Re-opening it by hand is the
+        # one route back that does not pass through a tab switch.
+        self._tree_dock.visibilityChanged.connect(
+            self._on_browser_visibility_changed)
+        # Edit actions on the browser's own context menu. silx's
+        # addContextMenuCallback is the supported hook, so the tree's
+        # policy, model and click handling stay exactly as they were.
+        self._install_structure_context_menu()
         refresh_action = QAction("Refresh file browser", self)
         refresh_action.setShortcut(QKeySequence("F5"))
         refresh_action.triggered.connect(self._refresh_file_tree)
@@ -327,6 +395,10 @@ class BuildMixin:
         # to do. The viewer's internal _visibility["manual"] stays True
         # by default — see GIWAXSImageViewer.__init__.
         self._overlay_checks: dict[str, QCheckBox] = {}
+        # The swatch is a button, like the matched-structure rows': it
+        # opens the same pen editor, so the colour, line style and width
+        # of every overlay are set where that overlay is named.
+        self._overlay_swatches: dict[str, QToolButton] = {}
         for kind, label in (
             ("detected", "Detected peaks"),
             ("fitted", "Fitted peaks"),
@@ -334,8 +406,18 @@ class BuildMixin:
             row = QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(6)
-            swatch = QLabel()
-            swatch.setPixmap(_make_pen_swatch(OVERLAY_STYLE[kind]))
+            swatch = QToolButton()
+            swatch.setAutoRaise(True)
+            swatch.setCursor(Qt.CursorShape.PointingHandCursor)
+            swatch.setToolTip(
+                f"Click to set the {label.lower()} colour, line style "
+                f"and width"
+            )
+            swatch.clicked.connect(
+                lambda _=False, k=kind: self._open_overlay_pen_popup(k)
+            )
+            self._overlay_swatches[kind] = swatch
+            self._refresh_overlay_swatch(kind)
             row.addWidget(swatch)
             chk = QCheckBox(label)
             chk.setChecked(True)
@@ -382,6 +464,18 @@ class BuildMixin:
                 score_row_widget.setLayout(score_row)
                 layout.addWidget(score_row_widget)
 
+        # Rows for the user's registered extra peak lists, below the two
+        # built-in layers. Its own container so a Settings visit rebuilds
+        # only these rows -- the Detected row owns the min-score slider,
+        # and tearing that down to add an unrelated layer would be a good
+        # way to lose the user's cutoff.
+        self._peak_list_rows_widget = QWidget()
+        self._peak_list_rows_layout = QVBoxLayout(self._peak_list_rows_widget)
+        self._peak_list_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._peak_list_rows_layout.setSpacing(GAP)
+        layout.addWidget(self._peak_list_rows_widget)
+        self._refresh_peak_list_rows()
+
         # Matched peaks: master toggle + per-structure rows. The per-structure
         # rows are rebuilt on every frame change because different frames can
         # have different matching solutions.
@@ -396,7 +490,7 @@ class BuildMixin:
         # spacer a transparent pixmap of the same dimensions so its
         # sizing semantics line up byte-for-byte with the real
         # swatches above.
-        _ref_swatch = _make_pen_swatch(OVERLAY_STYLE["detected"])
+        _ref_swatch = _make_pen_swatch(self.viewer.overlay_pen("detected"))
         _spacer_pixmap = QPixmap(_ref_swatch.size())
         _spacer_pixmap.fill(Qt.GlobalColor.transparent)
         _matched_swatch_spacer = QLabel()
@@ -551,6 +645,9 @@ class BuildMixin:
 
         self._refresh_matched_panel(0, [])
         self.viewer.matchedStructuresChanged.connect(self._refresh_matched_panel)
+        # The legend swatch has to follow the image, including
+        # after "Automatic" puts the preset back.
+        self.viewer.overlayPenChanged.connect(self._refresh_overlay_swatch)
 
         # "Expected pattern": forward-simulated reflections of a parsed
         # CIF, rendered as a display-only overlay. Fed by the Pipeline
@@ -789,6 +886,11 @@ class BuildMixin:
         layout.addSpacing(6)
 
         self.parameter_panel = ParameterPanel(self)
+        # So a list registered in a previous session reads through its
+        # treat-as flavour before Settings is ever opened.
+        self.parameter_panel.set_peak_list_specs(
+            self.viewer.peak_list_specs()
+        )
         layout.addWidget(self.parameter_panel)
 
         # Note: the long polar-mode hint that used to live here has
@@ -1182,6 +1284,13 @@ class BuildMixin:
         self.parameter_panel.deletePeakRequested.connect(
             lambda: self._on_delete_peak_requested(self.viewer.selected_peak)
         )
+        # Relabelling: the Score row's editor writes the whole selection.
+        self.parameter_panel.scoreEditRequested.connect(
+            self._on_score_edit_requested
+        )
+        self.viewer.selectionsChanged.connect(
+            lambda sels: self.parameter_panel.set_selection_count(len(sels))
+        )
 
         # Direct-h5py geometry writes for detected/fitted ROI edits.
         self.viewer.peakRowWriteRequested.connect(self._on_peak_row_write_requested)
@@ -1197,6 +1306,117 @@ class BuildMixin:
         # goes stale and must be invalidated.
         self.viewer.manualPeakRemoved.connect(self._on_manual_peak_removed)
         self.viewer.manualPeakAdded.connect(self._on_manual_peak_added)
+
+    # --- Registered extra peak lists (Display dock) ---
+
+    def _refresh_peak_list_rows(self) -> None:
+        """Rebuild the Display dock's rows for the registered peak lists.
+
+        One row per list: the same pen-editor swatch and visibility
+        checkbox the built-in layers get, labelled with the name the
+        user gave it. Called at construction and after Settings changes.
+        """
+        layout = getattr(self, "_peak_list_rows_layout", None)
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        for spec in self.viewer.peak_list_specs():
+            kind = spec.kind
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            swatch = QToolButton()
+            swatch.setAutoRaise(True)
+            swatch.setCursor(Qt.CursorShape.PointingHandCursor)
+            swatch.setToolTip(
+                f"Click to set the {spec.display_label} colour, line "
+                f"style and width"
+            )
+            swatch.clicked.connect(
+                lambda _=False, k=kind: self._open_overlay_pen_popup(k)
+            )
+            self._overlay_swatches[kind] = swatch
+            self._refresh_overlay_swatch(kind)
+            row.addWidget(swatch)
+            chk = QCheckBox(spec.display_label)
+            chk.setToolTip(
+                f"Show the {spec.dataset} table from this file's analysis "
+                f"group, drawn like {spec.treat_as} peaks. A display "
+                f"layer: nothing else in the app reads it."
+            )
+            chk.setChecked(self.viewer._visibility.get(kind, True))
+            chk.toggled.connect(
+                lambda v, k=kind: self.viewer.set_overlay_visible(k, v)
+            )
+            row.addWidget(chk)
+            row.addStretch(1)
+            row_widget = QWidget()
+            row_widget.setLayout(row)
+            layout.addWidget(row_widget)
+            self._overlay_checks[kind] = chk
+
+    def _apply_peak_list_specs(self) -> None:
+        """Re-read the registry after Settings and put it into effect.
+
+        Three things have to move together: the viewer's overlay items,
+        the dock's rows, and the frame's peak tables -- a newly
+        registered list has never been read from the file.
+        """
+        specs = peak_lists.load_specs()
+        stale = set(self._overlay_swatches) - {"detected", "fitted"}
+        for kind in stale:
+            self._overlay_swatches.pop(kind, None)
+            self._overlay_checks.pop(kind, None)
+        self.viewer.set_peak_list_specs(specs)
+        self.parameter_panel.set_peak_list_specs(specs)
+        self._refresh_peak_list_rows()
+        # Force the frame's peaks to be re-read: the cached tables were
+        # loaded without the newly registered dataset in them.
+        self._loaded_peak_frames = set()
+        entry = self.entry_combo.currentText()
+        if entry:
+            self._load_frame_peaks(entry, int(self.viewer.current_frame))
+
+    # --- Overlay pens (Display dock) ---
+
+    def _refresh_overlay_swatch(self, kind: str) -> None:
+        """Redraw one overlay row's swatch from the pen in effect.
+
+        The legend has to follow the image, including after "Automatic"
+        puts the preset back, so this is driven by the viewer's
+        ``overlayPenChanged`` rather than by the popup.
+        """
+        swatch = self._overlay_swatches.get(kind)
+        if swatch is None:
+            return
+        pix = _make_pen_swatch(self.viewer.overlay_pen(kind))
+        swatch.setIcon(QIcon(pix))
+        swatch.setIconSize(pix.size())
+        swatch.setFixedSize(pix.width() + 4, pix.height() + 4)
+
+    def _open_overlay_pen_popup(self, kind: str) -> None:
+        """Pen editor under a Detected / Fitted swatch."""
+        swatch = self._overlay_swatches.get(kind)
+        if swatch is None:
+            return
+        popup = PenPopup(
+            self,
+            current=self.viewer.overlay_pen(kind),
+            override=self.viewer.overlay_pen_override(kind),
+            title=f"{kind.capitalize()} peak colour",
+        )
+        popup.penChanged.connect(
+            lambda pen, k=kind: self.viewer.set_overlay_pen(k, pen)
+        )
+        popup.resetPicked.connect(
+            lambda k=kind: self.viewer.set_overlay_pen(k, None)
+        )
+        popup.show_under(swatch)
 
     def _hide_stale_dock_tab_bars(self) -> None:
         """Hide ghost dock tab bars.

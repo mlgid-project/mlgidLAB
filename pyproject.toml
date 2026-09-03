@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlgidlab"
-version = "0.1.0a17"
+version = "0.1.0a18"
 description = "mlgidLAB: graphical interface for the mlgidBASE GIWAXS analysis pipeline"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -87,6 +87,33 @@ pipeline = [
     "mlgidbase==0.1.5",
     "mlgiddetect==0.2.8",
     "pygid==0.2.13",
+    # ---------------------------------------------------------------
+    # PENDING BUMP (do not ship a release without re-reading this):
+    #   pygidfit==0.1.3  ->  pygidfit==0.1.4
+    #
+    # 0.1.4 (PyPI, 2026-08-19) fixes the critical-angle units bug:
+    # ``process_scans.calc_smpl_hor`` had a stray ``/ 10`` (its
+    # docstring said the wavelength was in metres while every caller
+    # passes Angstrom), so the sample-horizon mask the fitting step
+    # applies was 10x too thin. Verified fixed by reading 0.1.4's
+    # ``calc_smpl_hor``: the ``/ 10`` is gone and the docstring now
+    # says Angstrom. The GUI wiring was checked and is correct, so
+    # this pin is the whole fix on our side.
+    #
+    # BLOCKED, not forgotten: ``mlgidbase`` itself pins
+    # ``pygidfit==0.1.3``, in BOTH 0.1.5 (our pin) and the current
+    # 0.1.6. Writing ``pygidfit==0.1.4`` here today makes
+    # ``mlgidlab[pipeline]`` unresolvable, so the pin stays at 0.1.3
+    # until an mlgidbase release allows 0.1.4. When it does, this is
+    # a three-line change:
+    #   1. bump the pin below,
+    #   2. bump ``mlgidbase`` to that release (and re-check its other
+    #      pins -- 0.1.6 already wants ``pygid>=0.2.14``, above ours),
+    #   3. fix the "Critical angle:" tooltip in ``pipeline_panel.py``,
+    #      which describes a clustering parameter this is not.
+    # Then re-run the full suite + the demo loop per
+    # ``docs/backend_compatibility.md``.
+    # ---------------------------------------------------------------
     "pygidfit==0.1.3",
     "mlgidmatch==0.1.3",
     "pygidsim==0.1.4",

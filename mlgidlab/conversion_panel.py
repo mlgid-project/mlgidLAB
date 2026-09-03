@@ -20,7 +20,6 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
-    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -41,6 +40,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mlgidlab import ai_values
+from mlgidlab import file_dialogs
 from mlgidlab.file_model import RawEntry, list_entry_names
 
 import logging
@@ -381,9 +382,10 @@ class ConversionPanel(QWidget):
     # preserved so existing call sites keep working.
     logMessage = Signal(str)
     logCleared = Signal()
-    # Emitted (fliplr, flipud) when the orientation flip checkboxes toggle, so
-    # the host can flip the live raw preview to match the conversion output.
-    rawFlipsChanged = Signal(bool, bool)
+    # Emitted (fliplr, flipud, transp) when any Orientation checkbox
+    # toggles, so the host can reorient the live raw preview to match
+    # the conversion output.
+    rawFlipsChanged = Signal(bool, bool, bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -397,6 +399,11 @@ class ConversionPanel(QWidget):
         # to the same image they're already looking at. Wired in
         # ``set_active_raw_frame_resolver``.
         self._get_active_raw_frame: Callable[[], object] | None = None
+        # {field: value} last written into the override spinboxes by
+        # ``_autofill_overrides_from_poni``. A field still holding its
+        # autofilled value is a readout of the PONI, not a user override,
+        # and ``_build_config`` drops it — see ``_unedited_autofill``.
+        self._poni_autofill: dict[str, float] = {}
         self._build_ui()
 
     # ---------------- Public surface ----------------
@@ -631,6 +638,9 @@ class ConversionPanel(QWidget):
             self._refresh_parent_check_state(item.parent())
         self._sync_select_all_state()
         self._refresh_runnable()
+        # The frame axis just changed, and it decides both how three
+        # angles are read and whether a list is the right length.
+        self._refresh_ai_hint()
 
     def _refresh_parent_check_state(self, parent: QTreeWidgetItem) -> None:
         """Set parent to checked / unchecked / partial based on children."""
@@ -735,33 +745,54 @@ class ConversionPanel(QWidget):
             self.mask_path, mask_browse, mask_create, mask_clear,
         ))
 
-        # Angle of incidence — single global value; per-frame ai is
-        # deferred per the plan's Outlook section. Uses the auto-
-        # select subclass so clicking the field selects the
-        # "(none)" placeholder and the user can immediately type a
-        # real angle without first deleting the placeholder text.
-        self.ai_input = _AutoSelectDoubleSpinBox()
-        self.ai_input.setRange(0.0, 90.0)
-        self.ai_input.setDecimals(4)
-        self.ai_input.setSingleStep(0.01)
-        self.ai_input.setSpecialValueText("(none)")
-        self.ai_input.setValue(0.0)
-        self.ai_input.setSuffix(" °")
+        # Angle of incidence — one value for the whole scan, or one per
+        # frame. A line edit rather than a spinbox because a spinbox
+        # cannot hold a list; the grammar lives in ``ai_values`` and the
+        # hint below spells out what the typed text resolved to, which
+        # is how the ramp form's off-by-one stays visible. Empty means
+        # "not set" — the old spinbox used 0.0 for that, which is also
+        # a legal angle.
+        self.ai_input = QLineEdit()
+        self.ai_input.setPlaceholderText(
+            "0.2   or   0.1,0.3,0.5   or   (0.1,1.5,13)"
+        )
+        self.ai_input.setToolTip(
+            "One angle in degrees for every frame, or one per frame:\n"
+            "  0.2                 the same angle for all frames\n"
+            "  0.1,0.3,0.5         an explicit angle per frame\n"
+            "  (0.1,1.5,13)        a ramp: start, end, STEPS\n"
+            "A ramp gives one more angle than its step count (13 steps "
+            "= 14 angles), matching pygid's own scan convention. The "
+            "line below always shows what your text resolved to."
+        )
+        self.ai_input.textChanged.connect(self._refresh_ai_hint)
         form.addRow("Angle of incidence:", self.ai_input)
+        self.ai_hint = QLabel("")
+        self.ai_hint.setProperty("status", "muted")
+        self.ai_hint.setWordWrap(True)
+        form.addRow("", self.ai_hint)
 
-        # Detector-orientation flips. These live in the main form (not the
-        # Manual-overrides subsection) because they're routine per-beamline
-        # settings used on most conversions; they're always honoured when
-        # checked.
+        # Detector orientation. These live in the main form (not the
+        # Manual-overrides subsection) because they're routine
+        # per-beamline settings used on most conversions; they're always
+        # honoured when checked. Transpose sits with the flips because it
+        # is the same kind of decision and the same three end up in the
+        # same ExpParams -- it used to be buried under Manual overrides,
+        # where it read as a rarely-needed correction and did nothing to
+        # the preview.
         self.flip_lr = QCheckBox("Flip horizontally (fliplr)")
         self.flip_ud = QCheckBox("Flip vertically (flipud)")
-        # Re-emit the combined flip state so the host can flip the raw preview.
+        self.transp = QCheckBox("Transpose (transp)")
+        # Re-emit the combined orientation so the host can reorient the
+        # raw preview.
         self.flip_lr.toggled.connect(self._emit_raw_flips)
         self.flip_ud.toggled.connect(self._emit_raw_flips)
+        self.transp.toggled.connect(self._emit_raw_flips)
         flips = QHBoxLayout()
         flips.setContentsMargins(0, 0, 0, 0)
         flips.addWidget(self.flip_lr)
         flips.addWidget(self.flip_ud)
+        flips.addWidget(self.transp)
         flips.addStretch(1)
         flips_widget = QWidget()
         flips_widget.setLayout(flips)
@@ -783,31 +814,51 @@ class ConversionPanel(QWidget):
         self.over_centerY = _opt_spin(decimals=2, max_v=1e9)
         self.over_SDD = _opt_spin(decimals=4, max_v=1e6, suffix=" m")
         self.over_wavelength = _opt_spin(decimals=6, max_v=1e3, suffix=" Å")
-        self.over_transp = QCheckBox("Transpose")
         ovl.addRow("centerX (px):", self.over_centerX)
         ovl.addRow("centerY (px):", self.over_centerY)
         ovl.addRow("SDD:", self.over_SDD)
         ovl.addRow("Wavelength:", self.over_wavelength)
-        ovl.addRow("", self.over_transp)
         override_section.body_layout.addLayout(ovl)
         section.body_layout.addWidget(override_section)
 
         return section
 
     def _emit_raw_flips(self, _checked: bool = False) -> None:
-        """Broadcast the current (fliplr, flipud) checkbox state."""
+        """Broadcast the current (fliplr, flipud, transp) checkbox state."""
         self.rawFlipsChanged.emit(
-            self.flip_lr.isChecked(), self.flip_ud.isChecked()
+            self.flip_lr.isChecked(),
+            self.flip_ud.isChecked(),
+            self.transp.isChecked(),
         )
 
     def _browse_poni(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select PONI file", "",
+        path = file_dialogs.open_file(
+            self, "Select PONI file",
             "PONI calibration (*.poni);;All files (*)",
         )
         if path:
             self.poni_path.setText(path)
             self._autofill_overrides_from_poni()
+
+    def _unedited_autofill(self, key: str, value: float) -> bool:
+        """Whether ``value`` is still exactly what the PONI autofill wrote.
+
+        Loading a PONI pre-fills the override boxes so they double as a
+        readout. Sending an untouched one back looks like a no-op but is
+        not: pygid only applies ``fliplr`` / ``flipud`` / ``transp`` to
+        the beam center when *one* of (poni1/poni2, centerX/centerY) is
+        given — ``ExpParams._exp_params_update_`` takes neither branch
+        when both are set. Handing back the PONI's own centre alongside
+        the PONI therefore left the centre unflipped while the image was
+        flipped, putting the missing wedge on the wrong side of the
+        converted frame.
+
+        So an untouched field is not an override. A field the user
+        actually changed still is, and ``conversion.run_conversion``
+        makes it win (see the poni1/poni2 reset there).
+        """
+        prev = self._poni_autofill.get(key)
+        return prev is not None and float(value) == float(prev)
 
     def _autofill_overrides_from_poni(self) -> None:
         """Pre-fill the override fields with the loaded PONI's values.
@@ -818,6 +869,7 @@ class ConversionPanel(QWidget):
         is a no-op — pygid computes the same numbers from the file.
         Best-effort: an unreadable/foreign file leaves the fields alone.
         """
+        self._poni_autofill = {}
         text = self.poni_path.text().strip()
         if not text:
             return
@@ -829,6 +881,7 @@ class ConversionPanel(QWidget):
         except Exception:
             logger.debug("suppressed PONI parse in autofill", exc_info=True)
             self.append_log(f"Could not parse {path.name} for override pre-fill.")
+            self._poni_autofill = {}
             return
         if not values:
             return
@@ -840,14 +893,22 @@ class ConversionPanel(QWidget):
         }
         for key, value in values.items():
             fields[key].setValue(value)
+        # Snapshot what the autofill put there, read back through the
+        # spinbox so the comparison in ``_build_config`` is against the
+        # rounded value the widget actually holds. A field still showing
+        # this is a readout, not an override, and must not be sent — see
+        # ``_unedited_autofill``.
+        self._poni_autofill = {
+            key: _spin_or_none(fields[key]) for key in values
+        }
         self.append_log(
             f"Override fields pre-filled from {path.name}: "
             + ", ".join(f"{k}={v:.6g}" for k, v in sorted(values.items()))
         )
 
     def _browse_mask(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select mask file", "",
+        path = file_dialogs.open_file(
+            self, "Select mask file",
             "Mask images (*.npy *.tif *.tiff *.edf);;All files (*)",
         )
         if path:
@@ -1044,8 +1105,8 @@ class ConversionPanel(QWidget):
         return section
 
     def _load_smpl_yaml(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load sample metadata", "",
+        path = file_dialogs.open_file(
+            self, "Load sample metadata",
             "YAML (*.yaml *.yml);;All files (*)",
         )
         if not path:
@@ -1058,9 +1119,11 @@ class ConversionPanel(QWidget):
         self.smpl_yaml.setPlainText(text)
 
     def _save_smpl_yaml(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save sample metadata", "",
+        path, _ = file_dialogs.save_file(
+            self, "Save sample metadata",
             "YAML (*.yaml *.yml);;All files (*)",
+            suggested_name="sample.yaml",
+            default_suffix="yaml",
         )
         if not path:
             return
@@ -1369,8 +1432,8 @@ class ConversionPanel(QWidget):
             self.append_entry_combo.setCurrentIndex(len(names) - 1)
 
     def _browse_output_dir(self) -> None:
-        path = QFileDialog.getExistingDirectory(
-            self, "Select output directory", str(Path.home())
+        path = file_dialogs.existing_directory(
+            self, "Select output directory"
         )
         if path:
             self.output_dir.setText(path)
@@ -1450,11 +1513,45 @@ class ConversionPanel(QWidget):
         if not scans:
             raise ValueError("No entries selected — tick at least one in the Selection tree.")
         cfg = self._collect_config()
+        if isinstance(cfg.ai, list):
+            axis = self._selection_frame_axis()
+            if len(cfg.ai) != axis:
+                # Name both numbers: with the ramp form the count is one
+                # more than what was typed, so "wrong length" alone
+                # sends the user looking in the wrong place.
+                raise ValueError(
+                    f"{len(cfg.ai)} angles of incidence were given, but "
+                    f"{axis} frames are selected. A ramp gives one more "
+                    f"angle than its step count."
+                )
+            self.append_log(
+                f"Angle of incidence: {ai_values.describe(cfg.ai)}"
+            )
         return scans, cfg
 
     def _collect_scans(self) -> list[RawScan]:
         frame_num = self._resolve_frame_num()
         scans: list[RawScan] = []
+        base = 0
+        for re in self._checked_entries():
+            if getattr(re, "frame_map", None) is not None:
+                # Fabio stack: one per-file scan per selected frame.
+                scans.extend(_expand_fabio_scans(re, frame_num, base))
+            else:
+                scans.append(
+                    RawScan(
+                        file_path=re.file_path,
+                        entry=re.dataset_path,
+                        frame_num=frame_num,
+                        frame_offset=base,
+                    )
+                )
+            base += int(re.shape[0])
+        return scans
+
+    def _checked_entries(self) -> list[RawEntry]:
+        """Every ticked entry, in tree order."""
+        found: list[RawEntry] = []
         for i in range(self.selection_tree.topLevelItemCount()):
             file_item = self.selection_tree.topLevelItem(i)
             for j in range(file_item.childCount()):
@@ -1462,20 +1559,54 @@ class ConversionPanel(QWidget):
                 if child.checkState(0) != Qt.CheckState.Checked:
                     continue
                 re: RawEntry | None = child.data(0, Qt.ItemDataRole.UserRole)
-                if re is None:
-                    continue
-                if getattr(re, "frame_map", None) is not None:
-                    # Fabio stack: one per-file scan per selected frame.
-                    scans.extend(_expand_fabio_scans(re, frame_num))
-                else:
-                    scans.append(
-                        RawScan(
-                            file_path=re.file_path,
-                            entry=re.dataset_path,
-                            frame_num=frame_num,
-                        )
-                    )
-        return scans
+                if re is not None:
+                    found.append(re)
+        return found
+
+    def _selection_frame_axis(self) -> int:
+        """How many frames the ticked entries hold, all told.
+
+        This is the axis a per-frame angle list is indexed against --
+        the frames of the *data*, not of the current frame-mode subset,
+        because that is how pygid looks an angle up (``ai[frame +
+        offset]``). Converting frames 3 and 7 of a fourteen-image stack
+        still wants fourteen angles.
+        """
+        return sum(int(re.shape[0]) for re in self._checked_entries())
+
+    def _refresh_ai_hint(self, *_args) -> None:
+        """Echo what the angle field's text resolved to, or why it didn't.
+
+        Worth a line of its own because the ramp form gives one MORE
+        angle than its step count, and finding that out from a converted
+        file is far too late.
+        """
+        text = self.ai_input.text().strip()
+        n_frames = self._selection_frame_axis()
+        if not text:
+            self._set_ai_hint("", error=False)
+            return
+        try:
+            value = ai_values.parse_ai(text, n_frames=n_frames)
+        except ValueError as exc:
+            self._set_ai_hint(str(exc), error=True)
+            return
+        described = ai_values.describe(value)
+        if isinstance(value, list) and n_frames and len(value) != n_frames:
+            self._set_ai_hint(
+                f"{described} — but {n_frames} frames are selected",
+                error=True,
+            )
+            return
+        self._set_ai_hint(described, error=False)
+
+    def _set_ai_hint(self, text: str, error: bool) -> None:
+        self.ai_hint.setText(text)
+        self.ai_hint.setProperty("status", "error" if error else "muted")
+        style = self.ai_hint.style()
+        style.unpolish(self.ai_hint)
+        style.polish(self.ai_hint)
+        self.ai_hint.setVisible(bool(text))
 
     def _resolve_frame_num(self) -> int | list[int] | None:
         mode = self.frame_mode.currentText()
@@ -1535,8 +1666,14 @@ class ConversionPanel(QWidget):
         cfg.poni_path = Path(poni_text) if poni_text else None
         mask_text = self.mask_path.text().strip()
         cfg.mask_path = Path(mask_text) if mask_text else None
-        ai_value = self.ai_input.value()
-        cfg.ai = float(ai_value) if ai_value > 0 else None
+        ai_text = self.ai_input.text().strip()
+        cfg.ai = (
+            ai_values.parse_ai(
+                ai_text, n_frames=self._selection_frame_axis()
+            )
+            if ai_text
+            else None
+        )
 
         # Manual overrides — value-driven: any field left at "(unset)" is
         # skipped (pygid reads it from the PONI); a set field is forwarded
@@ -1551,9 +1688,9 @@ class ConversionPanel(QWidget):
             ("over_wavelength", "wavelength"),
         ):
             v = _spin_or_none(getattr(self, attr))
-            if v is not None:
+            if v is not None and not self._unedited_autofill(key, v):
                 overrides[key] = v
-        if self.over_transp.isChecked():
+        if self.transp.isChecked():
             overrides["transp"] = True
         if self.flip_lr.isChecked():
             overrides["fliplr"] = True
