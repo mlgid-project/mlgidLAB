@@ -230,6 +230,21 @@ pre-releases.
 
 ### Fixed
 
+- **The app icon now shows in the Linux dash, switcher and top bar.**
+  The window carried the right icon, but GNOME resolves a window to an
+  *application* before it draws any of those surfaces and takes the icon
+  from that application's `.desktop` file. mlgidLAB shipped none, so
+  there was nothing to resolve to, and on Wayland there is no fallback
+  at all because `app_id` is all the compositor gets. The app now
+  advertises a desktop file name to Qt and installs a validated
+  `mlgidlab.desktop` plus the seven PNG sizes into the user's XDG data
+  directory on first run. `Exec` is written as an absolute path, since
+  the console script usually lives in a conda env the desktop session's
+  `PATH` never sees, and it is refreshed if that environment moves.
+  Best-effort throughout: a read-only home costs the dash icon, not the
+  launch. Windows already had its counterpart of this fix; this is the
+  Linux half.
+
 - **The Display dock now reports a saved fitted peak, not a refit of
   it.** Selecting a peak that the pipeline had already fitted showed
   numbers in the Selected-peak panel that did not match the same peak's

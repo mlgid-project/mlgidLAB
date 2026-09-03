@@ -52,6 +52,7 @@ def _enable_crash_log() -> None:
 def main() -> int:
     from PySide6.QtCore import QSettings, QTimer
     from pathlib import Path
+    from mlgidlab import desktop_entry
     from mlgidlab.main_window import MainWindow
     from mlgidlab.theme import apply_dark_theme, apply_light_theme
 
@@ -77,6 +78,14 @@ def main() -> int:
     # persisted preferences over time).
     app.setOrganizationName("mlgidLAB")
     app.setApplicationName("mlgidLAB")
+    # The name the shell matches a window to an *application* by: Qt
+    # advertises it as the Wayland ``app_id`` and the X11 ``WM_CLASS``
+    # instance name. Both are stamped when a window is created and never
+    # re-read, so this has to happen before ``MainWindow()`` below.
+    # Without it there is nothing for GNOME to match a ``.desktop`` file
+    # against, and the dash / switcher / top bar fall back to a generic
+    # icon no matter what ``setWindowIcon`` says.
+    app.setDesktopFileName(desktop_entry.DESKTOP_NAME)
     # Window, taskbar and Alt-Tab icon. Set on the application so every
     # window inherits it (main window, figure export, phase views, the
     # dialogs). Guarded: a packaging slip should cost an icon, not a
@@ -87,6 +96,18 @@ def main() -> int:
     except Exception:
         logging.getLogger("mlgidlab").debug(
             "could not set the application icon", exc_info=True)
+    if desktop_entry.is_supported():
+        # The Linux counterpart of the AppUserModelID below. GNOME takes
+        # an app's icon from its ``.desktop`` file, and pip installs no
+        # such file, so one is written to the user's XDG data dir on
+        # first run (and refreshed if the environment moved). Guarded
+        # for the same reason as the icon above: a read-only $HOME
+        # should cost the dash icon, not the startup.
+        try:
+            desktop_entry.install()
+        except Exception:
+            logging.getLogger("mlgidlab").debug(
+                "could not install the desktop entry", exc_info=True)
     if sys.platform == "win32":
         # Without an explicit AppUserModelID, Windows groups the app
         # under python.exe's icon in the taskbar no matter what
