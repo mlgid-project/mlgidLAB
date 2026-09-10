@@ -249,11 +249,17 @@ def resolve_model_key(
     """Which ``MODEL_URLS`` entry this detection run will load.
 
     Mirrors ``mlgidbase.mlgiddetect_functions.load_config`` followed by
-    ``path_utils.get_model_path``. Note the asymmetry that costs a
-    surprise otherwise: when a *config file path* is supplied,
-    mlgidbase's ``model_type`` argument is silently dropped (its
-    assignment there is a ``==`` comparison, not an assignment), so the
-    file's own ``MODEL_TYPE`` is what actually runs.
+    ``path_utils.get_model_path``. An explicit ``model_type`` wins over
+    everything else: since mlgidbase 0.1.8 ``load_config`` ends with a
+    plain ``config.MODEL_TYPE = model_type`` that runs on every branch,
+    so the combo overrides a config file rather than the other way
+    round. Up to 0.1.6 the str-config branch dropped the argument (the
+    assignment there was a ``==`` comparison), which is why this used
+    to read the file first.
+
+    A ``dict`` config is the 0.1.8 addition: mlgidbase flattens
+    ``{SECTION: {KEY: value}}`` onto ``SECTION_KEY`` attributes, so
+    ``{"MODEL": {"TYPE": ...}}`` is where a dict keeps its model type.
 
     ``MODEL_ONNX_BASE`` is deliberately ignored — it is only consulted
     by ``inference.load_sessions``, which mlgidbase never calls; its
@@ -264,12 +270,19 @@ def resolve_model_key(
     the download to mlgidDETECT (safe, because ``safe_console`` is
     active by then).
     """
-    if isinstance(config_detect, str) and config_detect.strip():
+    if model_type:
+        resolved = model_type
+    elif isinstance(config_detect, str) and config_detect.strip():
         resolved = _model_type_from_yaml(config_detect.strip()) or "dino"
+    elif isinstance(config_detect, dict):
+        section = config_detect.get("MODEL")
+        resolved = (
+            section.get("TYPE") if isinstance(section, dict) else None
+        ) or "dino"
     elif config_detect is not None:
         resolved = getattr(config_detect, "MODEL_TYPE", None) or "dino"
     else:
-        resolved = model_type or "dino"
+        resolved = "dino"
     return _MODEL_TYPE_TO_KEY.get(str(resolved).strip())
 
 

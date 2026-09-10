@@ -18,9 +18,9 @@ tests un-skip and run, not just the pure-h5py ones):
 
 | Package | Baseline version | Reached how |
 |-|-|-|
-| `mlgidbase` | 0.1.5 | declared in `[pipeline]` |
-| `pygid` | 0.2.13 | declared in `[pipeline]` |
-| `pygidfit` | 0.1.3 | declared in `[pipeline]` (GUI imports it directly) — **a bump to 0.1.4 is pending and blocked upstream, see below** |
+| `mlgidbase` | 0.1.8 | declared in `[pipeline]` |
+| `pygid` | 0.2.17 | declared in `[pipeline]` |
+| `pygidfit` | 0.1.4 | declared in `[pipeline]` (GUI imports it directly) |
 | `mlgidmatch` | 0.1.3 | declared in `[pipeline]` (GUI imports it directly) |
 | `pygidsim` | 0.1.4 | declared in `[pipeline]` (GUI imports it directly) |
 | `mlgiddetect` | 0.2.8 | transitive via `mlgidbase` (GUI never imports it) |
@@ -31,10 +31,12 @@ release can shift the detection/fitting/matching numerics or the
 on-disk schema, so a bump must be a deliberate, test-rechecked change
 rather than something pip picks up silently. The `[pipeline]` extra
 therefore pins every directly-imported backend to an exact version
-(the baseline above). `mlgidbase 0.1.5` itself pins its own backends
-with `==` too (`pygid==0.2.13`, `mlgiddetect==0.2.8`, `pygidfit==0.1.3`,
-`mlgidmatch==0.1.3`); `pygidsim==0.1.4` arrives via `mlgidmatch` and
-`pygid`. The GUI still declares `pygidfit`/`mlgidmatch`/`pygidsim`
+(the baseline above). `mlgidbase 0.1.8` pins `mlgiddetect==0.2.8`,
+`pygidfit==0.1.4` and `mlgidmatch==0.1.3` with `==` too, but takes
+`pygid` on a floor (`pygid>=0.2.17`) rather than an exact pin, which is
+why the GUI's own exact `pygid==0.2.17` matters: without it pip would
+follow that floor forward on its own. `pygidsim==0.1.4` arrives via
+`mlgidmatch` and `pygid`. The GUI still declares `pygidfit`/`mlgidmatch`/`pygidsim`
 explicitly — rather than leaning on `mlgidbase`'s transitive closure —
 because it imports those three *directly*, so a future `mlgidbase`
 dropping one must surface as a clear resolver error, not a runtime
@@ -44,40 +46,6 @@ Python 3.11+) carry the GPU runtime, so the GUI no longer pins
 onnxruntime itself. **To move the baseline up:** bump the pins here
 and in `pyproject.toml`, re-run the full suite + the end-to-end demo
 loop, then commit.
-
-### Pending: `pygidfit` 0.1.3 -> 0.1.4 (blocked on mlgidbase)
-
-**Why it matters.** pygidfit 0.1.4 (PyPI, 2026-08-19) fixes the
-critical-angle units bug. `process_scans.calc_smpl_hor` carried a stray
-`/ 10` — its docstring claimed the wavelength was in metres while every
-caller passes Angstrom — so the sample-horizon mask applied by the
-fitting step was **10x too thin**. Confirmed fixed by reading 0.1.4's
-own `calc_smpl_hor`: the `/ 10` is gone and the docstring now says
-Angstrom. The GUI-side wiring was checked when the bug was found and is
-correct, so moving this pin is the entire fix on our side.
-
-**Why the pin has not moved.** `mlgidbase` pins `pygidfit==0.1.3`
-itself, in **both** 0.1.5 (our baseline) and the current 0.1.6.
-Declaring `pygidfit==0.1.4` in `[pipeline]` while `mlgidbase==0.1.5`
-is also declared makes `mlgidlab[pipeline]` unresolvable, so the pin
-stays at 0.1.3 and the intent is recorded here and in `pyproject.toml`
-instead of shipping an extra that cannot be installed.
-
-**What to do when an mlgidbase release allows 0.1.4:**
-
-1. Bump `pygidfit` to 0.1.4 in `[pipeline]` and in the baseline table
-   above.
-2. Bump `mlgidbase` to that release. Re-check its other pins in the
-   same pass: 0.1.6 already requires `pygid>=0.2.14`, above our
-   `pygid==0.2.13`, so that pin moves too.
-3. Fix the **"Critical angle:"** tooltip in `mlgidlab/pipeline_panel.py`
-   (`fit_crit_angle`). It currently reads "Maximum allowed
-   misorientation angle between peaks within a cluster", which
-   describes a clustering parameter. The value is the sample's critical
-   angle in degrees, combined with the incidence angle and the
-   wavelength to place the sample-horizon `q_z` cut.
-4. Re-run the full suite and the end-to-end demo loop, then record the
-   result under "Recorded bumps" below.
 
 **Runtime (non-pipeline) deps stay on `>=` floors on purpose.** The GUI
 stack — PySide6, pyqtgraph, silx, numpy, etc. — is *not* pinned exact,
@@ -169,7 +137,7 @@ these. Verbatim call sites are in the code; this is the contract.
 - Imported image scans carry a REAL `monochromator/wavelength` +
   `angle_of_incidence` and ZERO placeholders for every other
   `instrument/detector/*` dataset (attr `placeholder`). This is sound
-  because, as of mlgidbase 0.1.5 / pygidfit 0.1.3 / mlgidmatch 0.1.3:
+  because, as of mlgidbase 0.1.8 / pygidfit 0.1.4 / mlgidmatch 0.1.3:
   detection consumes only image + q axes
   (`mlgiddetect_functions._run_detection_single_frame`), fitting
   additionally only `params.wavelength` + `params.ai`
@@ -189,7 +157,7 @@ these. Verbatim call sites are in the code; this is the contract.
 - `mlgidbase.peak_operations._track_peaks` builds a DENSE
   all-against-all IoU matrix over the scan's total fitted-peak count
   N (`calculate_iou_matrix(box_all, box_all)`), and as of mlgidbase
-  0.1.5 that call keeps eight (N, N) float64 arrays alive at once —
+  0.1.8 that call keeps eight (N, N) float64 arrays alive at once —
   measured 64 bytes per peak pair. When `64 * N**2` exceeds
   `TRACKING_DENSE_MEM_FRACTION` of `MemAvailable`, `pipeline.execute`
   routes track_peaks to `phase_tracking.track_peaks_blocked` — a
@@ -429,3 +397,115 @@ adaptations below.
   (`pip install --no-deps --force-reinstall "git+https://github.com/mlgid-project/mlgidBASE@1b6514f" pygid==0.2.10 mlgiddetect==0.2.3 onnxruntime-gpu==1.26.0`)
   and revert the GUI commits of this bump (the dropped torch-gate
   workaround matters on mlgiddetect <= 0.2.3).
+
+### 2026-09-10 — mlgidbase 0.1.8 from PyPI (pygid 0.2.17, pygidfit 0.1.4)
+
+The bump that finally lands the critical-angle fix. `mlgidbase 0.1.8`
+(PyPI, 2026-09-10) drops the `pygidfit==0.1.3` pin that had blocked it
+since 0.1.5, so the whole set moves: `mlgidbase` 0.1.5 -> 0.1.8,
+`pygid` 0.2.13 -> 0.2.17, `pygidfit` 0.1.3 -> 0.1.4. `mlgiddetect`
+(0.2.8), `mlgidmatch` (0.1.3) and `pygidsim` (0.1.4) are unchanged.
+Full suite green before and after the GUI adaptations below, both with
+the backends installed and with them blocked at import (the CI
+profile).
+
+- **mlgidbase source diff is three files.** `main.py`,
+  `peak_operations.py`, `pygid_functions.py`, `nexus_operations.py`,
+  `pygidfit_functions.py`, `mlgidmatch_functions.py` and `widgets.py`
+  are byte-identical to 0.1.5, so every contract in Step 3 that names
+  a `run_*` signature or `_track_peaks` still holds verbatim (checked
+  by diffing the installed 0.1.8 tree against `git archive v0.1.5`).
+  What changed: `__init__.py` (version), `mlgiddetect_functions.py`,
+  `visualization.py`.
+- **`load_config` rewritten** (`mlgiddetect_functions.py`), and one
+  change reaches the GUI: `model_type` is now applied with a real
+  assignment on EVERY branch, where 0.1.5's str-config branch dropped
+  it (`config.MODEL_TYPE == model_type`, a comparison). An explicit
+  combo choice therefore beats a config file's own `MODEL:  TYPE:`
+  instead of losing to it. `detection_model.resolve_model_key`, which
+  decides which weights the pre-flight downloads, is updated to match
+  and now also understands the new `dict` config form (mlgidbase
+  flattens `{SECTION: {KEY: value}}` onto `SECTION_KEY`). Regression:
+  `test_resolve_model_key_lets_the_combo_override_a_config_file`,
+  `test_resolve_model_key_reads_a_dict_config`.
+- **`set_valid_config` / `set_postprocessing_config` are gone**, and
+  that is a no-op against mlgiddetect 0.2.8: every value they forced
+  (`PREPROCESSING_CUDA=False`, `FLIPHORIZONTAL=False`,
+  `QUAZIPOLAR=False`, `POLAR_SHAPE=[512, 1024]`,
+  `POLAR_CONVERSION=True`, and dino's `POSTPROCESSING_SCORE=0.4` /
+  `NMSIOU=0.4`) is already the `Config()` default. The three keys with
+  no `Config` default (`LINEAR_CONTRAST`, `NO_CONTRASTCORRECTION`,
+  `LINEAR_PERC_977`) appear nowhere in mlgiddetect 0.2.8 or mlgidbase,
+  so dropping them changes nothing either. Detection numerics are
+  unchanged by this bump.
+- **mlgiddetect imports are lazy now** (`Inference` and
+  `ImageContainer` moved inside `load_inference` / `run_mlgiddetect`,
+  the upstream `mlgiddetect_segfault` branch). Importing mlgidbase no
+  longer drags onnxruntime in. The GUI's own guards
+  (`is_mlgidbase_available`, `safe_console`, the model pre-flight) are
+  unaffected and stay.
+- **`visualization.py`**: new `get_clims`, so
+  `plot_analysis_results` defaults to 5/95 percentile colour limits
+  instead of min/max, and detected boxes are drawn as one `Wedge`
+  rather than two `Arc`s. This only touches the official figure export
+  (`figure_export_window`), which passes its own style through
+  `set_plot_defaults`; exported figures will look different (better
+  contrast) but the call contract is unchanged.
+- **pygidfit 0.1.3 -> 0.1.4, the actual fix.**
+  `process_scans.calc_smpl_hor` loses its stray `/ 10` (the docstring
+  said metres while every caller passes Angstrom), so the
+  sample-horizon `q_z` mask the fitting step applies is now the right
+  size instead of 10x too thin. Two further changes: ring/cluster
+  association in `clustering_and_errors` now measures box-edge
+  distance rather than centre distance, and
+  `ProcessDataFromFile.run()` skips entries whose `img_type` is not
+  `img_gid_q` when `entry is None`, which the GUI never hits:
+  `MainWindow._run_pipeline` expands "all entries" into one command
+  per concrete entry before mlgidbase is called.
+  **Consequence for users:** with a non-zero Critical angle, fitting
+  results change (the mask now really masks). The GUI's manual 2D fit
+  imports the same `img_preprocessing`, so preview and pipeline stay
+  byte-identical to each other. The wrong "Critical angle:" tooltip in
+  `pipeline_panel.py` is fixed in the same commit.
+- **pygid 0.2.13 -> 0.2.17** (diffed installed 0.2.13 against the
+  0.2.17 sdist; `conversion.py`, `coordmaps.py`, `dataloader.py`,
+  `datasaver.py`, `expparams.py`, `nexus_reader.py`, `__init__.py`):
+  - `ExpMetadata` now validates on `__setattr__`: only `str`,
+    `Number`, `bool`, and lists/tuples of those. The GUI's
+    `_build_exp_metadata` stores the panel's key/value strings, so it
+    passes; `None` would not, which is worth remembering if that panel
+    ever grows a "clear this field" path. `SampleMetadata` sanitizes
+    keys (spaces/hyphens to `_`, brackets stripped, collisions raise),
+    so a YAML key with spaces now lands under a different name than it
+    used to.
+  - `Conversion.dataset` default changed from `'measurement/eiger4m'`
+    to `None`. The GUI always passes `dataset=scan.entry`, so no
+    effect.
+  - Profile helpers (`horiz_profile_gid` / `vert_profile_gid` and the
+    polar profiles) changed their `dang` / `q_*_range` defaults from
+    fixed values to `None` (full range). The GUI calls none of them.
+  - `coordmaps`: `_find_ranges_phi_` now computes phi in the LAB frame
+    (`_q_smpl_to_q_lab_(self.q, ai=-self.ai)`), and `q_min` is 0
+    whenever the beam centre falls inside the image rather than when
+    the array is long. Polar conversion ranges can therefore differ
+    from 0.2.13 for the same input; the GUI reads whatever axes the
+    file carries, so nothing on our side assumes the old values.
+  - `expparams`: `_calc_rot_` rebuilt on `scipy.spatial.transform`
+    (new `calc_rots` / `apply_rotation` / `calc_center_after_rots`);
+    the transpose branch is the fixed one. `_calc_center_` and
+    `_calc_poni_` are unchanged apart from a moved log line, so
+    `conversion_config`'s poni -> centre autofill still mirrors
+    upstream exactly.
+  - `dataloader`: `_find_3d_dataset` / `_validate_dataset` improve
+    pygid's own raw-dataset search. mlgidLAB does its own walk
+    (`list_raw_entries`), so this is upside only.
+  - `nexus_reader`: new `set_techniques_info`; the GUI does not call
+    it.
+- **Still true at 0.1.8 / still GUI-side** (re-checked at this bump):
+  everything in the 0.1.5 entry's "still true" list, including the
+  ring-tracking clamp, `_backfill_fitted_peaks_polar_to_cartesian`,
+  `_dedupe_matched_groups`, `normalize_for_pygid`, and the networkx
+  packaging gap (0.1.8 still does not declare it).
+- Rollback: `pip install --no-deps --force-reinstall mlgidbase==0.1.5
+  pygid==0.2.13 pygidfit==0.1.3` and revert the GUI commit of this
+  bump (the `resolve_model_key` change is wrong against <= 0.1.6).

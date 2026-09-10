@@ -887,8 +887,8 @@ def execute(file_path: Path, command: PipelineCommand) -> Any:
         # AttributeError.
         raise RuntimeError(
             "The installed mlgidbase has no track_peaks — peak tracking "
-            "needs mlgidbase >= 0.1.5 (the [pipeline] pin). See "
-            "mlgidLAB/docs/backend_compatibility.md."
+            "needs mlgidbase >= 0.1.5 (the [pipeline] extra pins "
+            "0.1.8). See mlgidLAB/docs/backend_compatibility.md."
         )
     method = getattr(analysis, command.op_name)
     # Only detection and fitting ever carry a plan (``swap_plan``
