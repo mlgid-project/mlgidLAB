@@ -31,10 +31,10 @@ conda create -n mlgidlab python=3.12 -y
 conda activate mlgidlab
 
 # GUI only
-pip install "git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a18"
+pip install "git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a19"
 
 # or, full pipeline (detection / fitting / matching + raw conversion)
-pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a18"
+pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a19"
 ```
 
 ### From a local clone (for development)
@@ -57,8 +57,8 @@ pip install -e ".[pipeline]"      # or -e . for view-only, -e ".[dev]" for tests
   first launch may take a moment while Qt initializes.
 
 The `[pipeline]` extra pins the verified-good backend versions
-(`mlgidbase==0.1.3`, `pygid==0.2.10`, `pygidfit==0.1.3`,
-`mlgidmatch==0.1.3`, `pygidsim==0.1.4`); bumping them is a deliberate,
+(`mlgidbase==0.1.8`, `pygid==0.2.17`, `pygidfit==0.1.4`,
+`mlgidmatch==0.1.3`, `pygidsim==0.1.4`, `mlgiddetect==0.2.8`); bumping them is a deliberate,
 test-rechecked step (see [backend_compatibility.md](backend_compatibility.md)).
 
 ## Launch

@@ -4,6 +4,57 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## 0.1.0a19 — nineteenth alpha (2026-09-10)
+
+A backend-only release: the pipeline stack moves to **mlgidbase 0.1.8**,
+and with it to **pygid 0.2.17** and **pygidfit 0.1.4**. No GUI features
+were added or removed.
+
+### Fixed
+
+- **The critical-angle mask really masks now.** Fitting takes a
+  *Critical angle* and uses it, together with the incidence angle and
+  the wavelength, to cut the image at the sample horizon before fitting.
+  pygidfit 0.1.3 computed that cut ten times too small (a stray division
+  by ten, from a docstring that claimed the wavelength was in metres
+  while every caller passes Angstrom), so the mask covered almost
+  nothing. pygidfit 0.1.4 fixes it, and mlgidbase 0.1.8 is the first
+  release that allows the new pygidfit, so the pin could finally move.
+
+  **This changes fitting results** for any run with a non-zero critical
+  angle: peaks below the horizon that used to slip through are now
+  excluded. The manual 2D fit preview calls the same pygidfit code, so
+  preview and pipeline still agree exactly.
+
+- **The "Critical angle:" tooltip** described a clustering parameter it
+  never was. It now says what the value does.
+
+- **The detection Model box beats a config file again.** mlgidbase's
+  `load_config` used to drop the model type whenever a detection config
+  file was also given (an `==` where an `=` was meant); 0.1.8 fixes
+  that, so an explicit choice in the **Model** combo now wins. The
+  model pre-flight, which downloads the weights before the run, follows
+  the same rule and so fetches the file that will actually be loaded.
+
+### Changed
+
+- **Pipeline pins:** `mlgidbase` 0.1.5 to 0.1.8, `pygid` 0.2.13 to
+  0.2.17, `pygidfit` 0.1.3 to 0.1.4. `mlgiddetect` (0.2.8), `mlgidmatch`
+  (0.1.3) and `pygidsim` (0.1.4) are unchanged. mlgidbase 0.1.8 takes
+  pygid on a floor rather than an exact pin, so mlgidLAB keeps pinning
+  pygid exactly to stop that floor drifting between installs.
+
+- **Detected peaks in exported official figures** are drawn as a single
+  wedge rather than two arcs, which is mlgidbase 0.1.8's own change. The
+  new percentile-based colour limits it also introduced never apply
+  here: the export window always sends its own **Intensity** range.
+
+- Detection numerics are **not** affected by the mlgidbase bump: the
+  configuration defaults 0.1.8 stopped forcing are already mlgidDETECT
+  0.2.8's own defaults, and the rest of the config it dropped is read
+  nowhere in the installed stack. Verified key by key, and recorded in
+  `docs/backend_compatibility.md`.
+
 ## 0.1.0a18 — eighteenth alpha (2026-09-03)
 
 ### Added

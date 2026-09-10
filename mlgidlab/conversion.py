@@ -367,7 +367,7 @@ def import_converted_stack(
     those datasets, but detection consumes only image + q axes,
     fitting additionally only wavelength + ai (pygidfit's missing-
     wedge / critical-angle math), and matching only fitted peaks + q
-    maxima — verified against mlgidbase 0.1.5 / pygidfit 0.1.3, and
+    maxima — verified against mlgidbase 0.1.8 / pygidfit 0.1.4, and
     recorded in docs/backend_compatibility.md so future backend bumps
     re-check it. The placeholders carry a ``placeholder`` attr so the
     file stays honest. Without a wavelength (or with pixel axes) no

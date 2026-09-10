@@ -140,13 +140,28 @@ def test_resolve_model_key_maps_faster_rcnn_to_its_cache_name():
 
 
 def test_resolve_model_key_reads_a_yaml_config(tmp_path):
-    """A config file's MODEL_TYPE wins over the combo, mirroring
-    mlgidbase: on the str-config branch its ``model_type`` argument is
-    dropped (the assignment there is a ``==`` comparison), so the file
-    is what actually runs and what we must pre-fetch."""
+    """With the combo left on "(default)" the config file's MODEL_TYPE
+    is what actually runs, so it is what we must pre-fetch."""
     config = tmp_path / "detect.yaml"
     config.write_text("MODEL:\n  TYPE: faster_rcnn\n", encoding="utf-8")
-    assert detection_model.resolve_model_key("dino", str(config)) == "frcnn"
+    assert detection_model.resolve_model_key(None, str(config)) == "frcnn"
+
+
+def test_resolve_model_key_lets_the_combo_override_a_config_file(tmp_path):
+    """mlgidbase 0.1.8 applies ``model_type`` on every branch of
+    ``load_config``, including the str-config one that used to drop it,
+    so an explicit combo choice beats the file."""
+    config = tmp_path / "detect.yaml"
+    config.write_text("MODEL:\n  TYPE: faster_rcnn\n", encoding="utf-8")
+    assert detection_model.resolve_model_key("dino", str(config)) == "dino"
+
+
+def test_resolve_model_key_reads_a_dict_config():
+    """0.1.8 also accepts a dict, flattened onto ``SECTION_KEY``."""
+    assert detection_model.resolve_model_key(
+        None, {"MODEL": {"TYPE": "faster_rcnn"}}
+    ) == "frcnn"
+    assert detection_model.resolve_model_key(None, {"MODEL": {}}) == "dino"
 
 
 def test_resolve_model_key_reads_yaml_without_pyyaml(tmp_path, monkeypatch):
@@ -164,7 +179,7 @@ def test_resolve_model_key_reads_yaml_without_pyyaml(tmp_path, monkeypatch):
         "OTHER:\n  TYPE: not_this_one\n",
         encoding="utf-8",
     )
-    assert detection_model.resolve_model_key("dino", str(config)) == "frcnn"
+    assert detection_model.resolve_model_key(None, str(config)) == "frcnn"
     # Still safe on a missing file / unknown type.
     assert detection_model.resolve_model_key(
         None, str(tmp_path / "gone.yaml")

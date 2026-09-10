@@ -54,7 +54,7 @@ AXIS_LABELS = {
 }
 
 # Peak memory of one upstream track_peaks run, measured against
-# mlgidbase 0.1.5: ``calculate_iou_matrix(box_all, box_all)`` keeps
+# mlgidbase 0.1.8: ``calculate_iou_matrix(box_all, box_all)`` keeps
 # eight (N, N) float64 arrays alive at once (the four corner grids
 # are still function locals while intersection, union, the broadcast
 # sum and the result quotient are built), so the run needs at least
@@ -191,7 +191,7 @@ def track_peaks_blocked(
 ) -> TrackingPayload:
     """mlgidBASE ``track_peaks`` semantics in bounded memory.
 
-    Replicates upstream (mlgidbase 0.1.5
+    Replicates upstream (mlgidbase 0.1.8
     ``peak_operations._track_peaks``) exactly: same member order
     (frames 0..n-1 numerically, rows verbatim, frames without a
     ``fitted_peaks`` dataset skipped), same boxes (angle +-
@@ -386,7 +386,7 @@ class UpstreamContractError(RuntimeError):
     ``mlgidbase.peak_operations._plot_tracked_peaks`` because upstream's
     return value carries no member coordinates or ids. If this error
     fires, the installed mlgidbase no longer matches the contract
-    verified at 0.1.5 — see mlgidLAB/docs/backend_compatibility.md.
+    verified at 0.1.8 — see mlgidLAB/docs/backend_compatibility.md.
     """
 
 
@@ -428,7 +428,7 @@ def capture_tracking():
                 "_plot_tracked_peaks was called with an unexpected "
                 f"signature ({len(args)} positional args, "
                 f"{sorted(kwargs)} kwargs); the capture contract is "
-                "pinned to mlgidbase 0.1.5."
+                "pinned to mlgidbase 0.1.8."
             )
         rec["q_xy"] = np.asarray(args[1], dtype=float)
         rec["q_z"] = np.asarray(args[2], dtype=float)

@@ -454,7 +454,9 @@ class PipelinePanel(QWidget):
         self.fit_crit_angle.setValue(0.0)
         self.fit_crit_angle.setSuffix(" °")
         self.fit_crit_angle.setToolTip(
-            "Maximum allowed misorientation angle between peaks within a cluster."
+            "Critical angle of the sample, in degrees. Together with the "
+            "incidence angle and the wavelength it places the sample-horizon "
+            "q_z cut, below which the image is masked out before fitting."
         )
         form.addRow("Critical angle:", self.fit_crit_angle)
 
