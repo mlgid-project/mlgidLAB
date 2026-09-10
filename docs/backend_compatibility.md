@@ -447,10 +447,11 @@ profile).
 - **`visualization.py`**: new `get_clims`, so
   `plot_analysis_results` defaults to 5/95 percentile colour limits
   instead of min/max, and detected boxes are drawn as one `Wedge`
-  rather than two `Arc`s. This only touches the official figure export
-  (`figure_export_window`), which passes its own style through
-  `set_plot_defaults`; exported figures will look different (better
-  contrast) but the call contract is unchanged.
+  rather than two `Arc`s. The only consumer is the official figure
+  export (`figure_export_window`). Its `_gather_call_kwargs` always
+  sends an explicit `clims` from the Intensity spin boxes, so the new
+  default never fires; the `Wedge` does change how detected peaks look
+  in an exported figure. Call contract unchanged.
 - **pygidfit 0.1.3 -> 0.1.4, the actual fix.**
   `process_scans.calc_smpl_hor` loses its stray `/ 10` (the docstring
   said metres while every caller passes Angstrom), so the

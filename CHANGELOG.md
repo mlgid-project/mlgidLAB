@@ -44,10 +44,10 @@ were added or removed.
   pygid on a floor rather than an exact pin, so mlgidLAB keeps pinning
   pygid exactly to stop that floor drifting between installs.
 
-- **Exported official figures look different.** mlgidbase 0.1.8 defaults
-  its colour limits to the 5th/95th percentile of the positive pixels
-  instead of min/max, and draws detected peaks as a single wedge rather
-  than two arcs. The export path itself is unchanged.
+- **Detected peaks in exported official figures** are drawn as a single
+  wedge rather than two arcs, which is mlgidbase 0.1.8's own change. The
+  new percentile-based colour limits it also introduced never apply
+  here: the export window always sends its own **Intensity** range.
 
 - Detection numerics are **not** affected by the mlgidbase bump: the
   configuration defaults 0.1.8 stopped forcing are already mlgidDETECT
