@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>mlgidLAB v0.1.0a17 — manual test plan</title>
+<title>mlgidLAB v0.1.0a20 — manual test plan</title>
 <style>
   :root { --fg:#1b1b1b; --muted:#666; --line:#ddd; --accent:#1763b6; --warn:#b35a00; --pass:#1a7f37; --fail:#c0392b; }
   * { box-sizing: border-box; }
@@ -59,7 +59,7 @@
   <span class="count">Progress autosaves in this browser.</span>
 </div>
 
-<h1>mlgidLAB v0.1.0a17 — manual test plan</h1>
+<h1>mlgidLAB v0.1.0a20 — manual test plan</h1>
 <p class="sub">Mark each step <b>pass</b> or <b>fail</b> as you go (leave it
 blank if you didn't test it), and set an overall result per section. At
 the end, click <b>Copy results</b> and email the summary to me — it lists
@@ -71,7 +71,7 @@ every failed step by name. About 30-45 min for a full pass.</p>
   terminal output is the most useful thing to send me).
   <pre>conda create -n mlgidlab python=3.12 -y
 conda activate mlgidlab
-pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a17"
+pip install "mlgidlab[pipeline] @ git+https://github.com/mlgid-project/mlgidLAB@v0.1.0a20"
 mlgidlab</pre>
   <b>The test files are hosted once</b> on the
   <a href="https://github.com/mlgid-project/mlgidLAB/releases/tag/v0.1.0a9">v0.1.0a9
@@ -81,7 +81,7 @@ mlgidlab</pre>
   <code>example/</code> folder sits alongside it — you don't need to hunt
   anything down. You're welcome to try your own files too, but nothing
   else is required. Full install detail:
-  <a href="https://github.com/mlgid-project/mlgidLAB/blob/v0.1.0a17/docs/getting_started.md">docs/getting_started.md</a>.
+  <a href="https://github.com/mlgid-project/mlgidLAB/blob/v0.1.0a20/docs/getting_started.md">docs/getting_started.md</a>.
 </div>
 
 <h2>Reference files (in <code>example/</code>)</h2>
@@ -200,6 +200,7 @@ Not tested. The per-step marks are what tell us exactly which parts broke.</p>
     <li><label><input type="checkbox" id="c6_3"> Set the CIF source to prepr_cifs.pickle (or the cifs/ folder); Run Matching populates matched (expect 2 matched structures for BA2PbI4_noPeaks.h5)</label></li>
     <li><label><input type="checkbox" id="c6_4"> A non-default run scope (all entries / a frame) works with per-entry log lines</label></li>
     <li><label><input type="checkbox" id="c6_5"> Window stays responsive during a run</label></li>
+    <li><label><input type="checkbox" id="c6_6"> Detection &rarr; Model: on faster_rcnn the Score threshold, NMS IoU and (under Advanced) Class-aware NMS, both per-class NMS IoU, Ensemble and ONNX ensemble rows vanish with no stray gap; dino and (default) bring them back with the values you typed</label></li>
   </ul>
   <textarea id="n6" placeholder="Notes for area 6"></textarea>
 </div>
@@ -440,7 +441,7 @@ email together with the logs, and send to
 
   document.getElementById("copyBtn").addEventListener("click", function () {
     var L = [];
-    L.push("mlgidLAB v0.1.0a17 — manual test results");
+    L.push("mlgidLAB v0.1.0a20 — manual test results");
     L.push("Name: " + (val("t_name") || "(none)"));
     L.push("OS: " + (val("t_os") || "(none)") +
            "   Python: " + (val("t_py") || "(none)"));

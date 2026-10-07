@@ -482,6 +482,30 @@ def _cached_copy_is_sound(destination: Path, url: str) -> bool:
     return False
 
 
+def _has_explicit_onnx_path(config_detect: Any) -> bool:
+    """Does this config point mlgidDETECT at an ``.onnx`` file of its own?
+
+    Only the dict form is inspected, because that is the form the
+    Pipeline dock sends (``mlgidlab.detection_config``). ``"base"`` is
+    mlgidDETECT's own default for ``MODEL_ONNX_BASE`` and means "the
+    weights you download for MODEL_TYPE", so it is not an explicit
+    path; neither is an empty string, which the panel maps back to
+    ``"base"`` anyway.
+
+    ``resolve_model_key`` deliberately ignores ``MODEL_ONNX_BASE`` (see
+    its docstring: the field is read by ``inference.load_sessions``,
+    which mlgidbase never calls), so the decision belongs here, at the
+    pre-flight, and not in the key resolution.
+    """
+    if not isinstance(config_detect, dict):
+        return False
+    section = config_detect.get("MODEL")
+    if not isinstance(section, dict):
+        return False
+    base = section.get("ONNX_BASE")
+    return isinstance(base, str) and base.strip() not in ("", "base")
+
+
 def ensure_detection_model(
     model_type: str | None = None,
     config_detect: Any = None,
@@ -495,10 +519,24 @@ def ensure_detection_model(
     failed. Couldn't load the model."
 
     Returns the model path, or ``None`` when the pre-flight does not
-    apply (backend absent, or an unrecognised model type left to
-    mlgidDETECT). Raises ``RuntimeError`` only when a download was
-    genuinely required and genuinely failed.
+    apply (backend absent, an explicit ``.onnx`` path configured, or an
+    unrecognised model type left to mlgidDETECT). Raises
+    ``RuntimeError`` only when a download was genuinely required and
+    genuinely failed.
     """
+    if _has_explicit_onnx_path(config_detect):
+        # Nothing to fetch and nothing to verify: this whole pre-flight
+        # exists to get the weights mlgidDETECT would download for
+        # ``MODEL_TYPE`` on disk and intact. A user-supplied .onnx is
+        # neither downloaded nor named by ``MODEL_URLS``, so the
+        # pre-flight would at best check an unrelated file and at worst
+        # download one that is never loaded.
+        logger.info(
+            "detection config sets MODEL_ONNX_BASE to an explicit .onnx "
+            "path, skipping the model pre-flight"
+        )
+        return None
+
     urls = _model_urls()
     directory = cache_dir()
     if urls is None or directory is None:

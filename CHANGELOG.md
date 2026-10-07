@@ -4,6 +4,82 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## 0.1.0a20 — twentieth alpha (2026-10-07)
+
+Two independent pieces of work. Detection becomes configurable from the
+Pipeline dock instead of from a YAML file, and the pattern-simulation
+backend moves up one release to fix a q_xy mask that let reflections
+outside the measured range into every simulated pattern.
+
+### Added
+
+- **Detection parameters live in the Pipeline dock now.** Fitting and
+  Matching have always exposed their parameters as spin boxes and
+  combos; Detection only had a picker for an mlgidDETECT YAML config
+  file, so trying a different score threshold meant leaving the GUI and
+  editing a file. The **Detection** section now carries the parameters
+  themselves, and the config-file picker is gone.
+
+  Inline, because these are the three that get touched: **Score
+  threshold** (the confidence a box needs to be kept, so it decides
+  which peaks are detected and written at all, unlike the Display
+  dock's minimum-score slider, which only hides boxes already in the
+  file), **NMS IoU** (the overlap at which two boxes of one peak are
+  merged) and **Force CPU** (the documented way out of GPU trouble).
+
+  Everything else mlgidDETECT reads sits under a collapsed
+  **Advanced**: class-aware NMS with its separate ring and segment
+  overlaps, the dino ensemble switch and both ONNX model paths,
+  re-download, log scaling, histogram equalization, clipping with its
+  upper and lower percentiles, horizontal flip, and debug logging. A
+  **Reset to defaults** button puts the whole section back.
+
+  Every field starts at mlgidDETECT's own default, so an untouched
+  panel runs exactly as it did before, and a test compares the two sets
+  key by key so they cannot drift apart. The **Model** box is unchanged
+  and still decides which weights are loaded. Pointing **ONNX base** at
+  a model file of your own also switches off the weight download
+  pre-flight, which has nothing to fetch or check for a file you
+  supply.
+
+  **The form shows only what the chosen model reads.** mlgidDETECT's
+  legacy `faster_rcnn` model applies its own fixed post-processing and
+  never fuses an ensemble, so the score threshold, the NMS overlaps,
+  class-aware NMS, the ensemble switch and the second ONNX path would
+  do nothing under it. Those seven rows are hidden while **Model** is
+  set to `faster_rcnn` and come back for `dino` and `(default)`, which
+  runs dino. Values you entered are kept while a row is hidden.
+
+### Changed
+
+- **Pipeline pin:** `pygidsim` 0.1.4 to 0.1.7. The q-range mask that
+  pygidsim applies to a simulated 2D pattern compared q_z against the
+  q_xy limit, so the q_xy ceiling was never enforced and reflections
+  beyond the measured q_xy range survived into every pattern. Since
+  that pattern is what mlgidMATCH matches against, the **Expected
+  pattern** overlay now shows fewer reflections and the ones it shows
+  are inside the measured range, and matching chooses between fewer,
+  correct candidates. **Re-parse any CIF pickle** built with the old
+  version: nothing in a pickle says which pygidsim made it.
+
+- **CIF parsing no longer builds a form-factor database it may never
+  use.** pygidsim's experiment parameters build it on first access
+  instead of on construction, which is work saved every time
+  parameters are derived for an entry.
+
+- **An empty simulated pattern says so.** pygidsim used to raise a
+  named error when a CIF produced no reflections; it now returns empty
+  arrays, and mlgidMATCH turned that one step later into numpy's
+  `zero-size array to reduction operation maximum which has no
+  identity`. Parsing such a CIF now reports what was being simulated
+  and the usual cause: no reflection of that structure falls inside the
+  entry's q range.
+
+- `pygidfit` **stays at 0.1.4.** 0.1.5 exists and changes how fits are
+  seeded and solved, but `mlgidbase 0.1.8` requires exactly 0.1.4, so
+  it cannot be installed alongside the rest of the stack. Recorded in
+  `docs/backend_compatibility.md` for an upstream report.
+
 ## 0.1.0a19 — nineteenth alpha (2026-09-10)
 
 A backend-only release: the pipeline stack moves to **mlgidbase 0.1.8**,

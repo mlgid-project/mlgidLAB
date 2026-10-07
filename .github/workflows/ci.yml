@@ -93,8 +93,18 @@ jobs:
         # The shard is every third test file (sorted, round-robin), so
         # the three shards partition the suite exactly; conftest.py is
         # picked up as usual.
+        #
+        # ``LC_ALL=C`` on the listing, because ``ls`` sorts by locale and
+        # the partition is positional: under C, ``_`` (0x5F) orders
+        # before the lowercase letters, while en_US.UTF-8 collation
+        # ignores it at the primary level. The two disagree on enough
+        # neighbours (``test_flow_layout.py`` vs
+        # ``test_flow_layout_collapse.py``, ``test_viewer_controls.py``
+        # vs ``test_viewer_released_frame_source.py``) to put a file in
+        # a different shard, so without this a failing shard cannot be
+        # reproduced locally without matching the runner's locale.
         run: |
-          mapfile -t FILES < <(ls tests/test_*.py | awk "NR % 3 == ${{ matrix.shard }}")
+          mapfile -t FILES < <(LC_ALL=C ls tests/test_*.py | awk "NR % 3 == ${{ matrix.shard }}")
           pytest -v -rA "${FILES[@]}"
 
   # Windows-only regression net for the paths that genuinely differ per

@@ -1497,8 +1497,10 @@ class BuildMixin:
 
         The panels sit in resizable scroll areas, so a column that is
         too narrow does not scroll: it compresses and elides. That is
-        what the pinned 350 looked like — the Pipeline "Config (yaml)"
-        field squeezed down to a stub.
+        what the pinned 350 looked like — the Pipeline form's path
+        fields (the Matching section's CIF row today; the Detection
+        section's "Config (yaml)" field when this was measured)
+        squeezed down to a stub.
         """
         docks = (
             self._display_dock, self._pipeline_dock, self._sim_dock,

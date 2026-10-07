@@ -22,7 +22,7 @@ tests un-skip and run, not just the pure-h5py ones):
 | `pygid` | 0.2.17 | declared in `[pipeline]` |
 | `pygidfit` | 0.1.4 | declared in `[pipeline]` (GUI imports it directly) |
 | `mlgidmatch` | 0.1.3 | declared in `[pipeline]` (GUI imports it directly) |
-| `pygidsim` | 0.1.4 | declared in `[pipeline]` (GUI imports it directly) |
+| `pygidsim` | 0.1.7 | declared in `[pipeline]` (GUI imports it directly) |
 | `mlgiddetect` | 0.2.8 | transitive via `mlgidbase` (GUI never imports it) |
 | `networkx` | any | declared in `[pipeline]` (mlgidbase needs it, doesn't declare it) |
 
@@ -35,8 +35,9 @@ therefore pins every directly-imported backend to an exact version
 `pygidfit==0.1.4` and `mlgidmatch==0.1.3` with `==` too, but takes
 `pygid` on a floor (`pygid>=0.2.17`) rather than an exact pin, which is
 why the GUI's own exact `pygid==0.2.17` matters: without it pip would
-follow that floor forward on its own. `pygidsim==0.1.4` arrives via
-`mlgidmatch` and `pygid`. The GUI still declares `pygidfit`/`mlgidmatch`/`pygidsim`
+follow that floor forward on its own. `pygidsim==0.1.7` is
+exact here for the same reason: `mlgidmatch` and `pygid` both take it
+on a floor. The GUI still declares `pygidfit`/`mlgidmatch`/`pygidsim`
 explicitly — rather than leaning on `mlgidbase`'s transitive closure —
 because it imports those three *directly*, so a future `mlgidbase`
 dropping one must surface as a clear resolver error, not a runtime
@@ -120,6 +121,43 @@ these. Verbatim call sites are in the code; this is the contract.
 - `analysis.set_plot_defaults(**style)` and
   `analysis.plot_analysis_results(save_fig=True, path_to_save_fig=...,
   plot_result=False, return_result=False, **kwargs)` (figure export).
+- `mlgiddetect_functions.load_config`'s **dict form**, used by the
+  Pipeline dock's detection parameters (`mlgidlab.detection_config`):
+  a `{SECTION: {KEY: value}}` dict passed as `config_detect` is applied
+  onto a fresh `mlgiddetect` `Config` with
+  `setattr(config, f"{SECTION}_{KEY}", value)`, so the panel's widgets
+  reach mlgidDETECT without a config file on disk. Precedence matters:
+  the dict is applied first and an explicit `model_type` kwarg is
+  assigned *after* it, so the **Model** combo still wins over anything
+  the dict says about `MODEL_TYPE` (which is why the panel never puts
+  `TYPE` in the dict). Introduced in mlgidbase 0.1.8; a bump that
+  narrowed `config` back to `str | Config` would break every detection
+  run from the GUI, not just a configured one. Regression:
+  `tests/test_detection_params.py` (including a drift guard that
+  compares every exposed default against `Config.init_default`).
+- **The `POSTPROCESSING_*` settings apply to the `dino` model only.**
+  `mlgiddetect.postprocessing.standard_postprocessing` branches on
+  `MODEL_TYPE`: the `dino` branch calls `filter_boxes(config, ...)`,
+  which reads `POSTPROCESSING_SCORE`, `POSTPROCESSING_NMSIOU`,
+  `POSTPROCESSING_CLASSAWARE_NMS`, `POSTPROCESSING_NMSIOU_RING` and
+  `POSTPROCESSING_NMSIOU_SEG`, while the `faster_rcnn` branch reads none
+  of them and hardcodes its own chain (`SmallQFilter(50) +
+  MergeBoxesPostprocessing(min_score=0.01) +
+  StandardPostprocessing(nms_level=0.01, score_level=0.01)`). So with
+  `faster_rcnn` selected in the Pipeline dock's **Model** box, the panel's
+  Score threshold, NMS IoU, Class-aware NMS and the two per-class IoU
+  fields would have no effect. The same holds for the dino ensemble:
+  `mlgiddetect.inference` only fuses models when `MODEL_TYPE == 'dino'`
+  and `MODEL_ENSEMBLE_ENABLED`, so under `faster_rcnn` the Ensemble and
+  ONNX ensemble fields are ignored too. The combo defaults to
+  "(default)", which resolves to `dino`, so this only bites a deliberate
+  `faster_rcnn` run. The panel therefore **hides** those seven rows
+  while `faster_rcnn` is selected (`PipelinePanel._on_det_model_changed`)
+  and shows them again for `dino` and `(default)`. The hidden widgets
+  keep their values and still travel in `config_detect`, which is
+  harmless because the backend never reads them under `faster_rcnn`.
+  Regression: `tests/test_detection_params.py`. Re-check this branching
+  on any mlgiddetect bump, and keep the hidden set in step with it.
 
 **`pygid`** (`conversion.py`)
 - `pygid.ExpParams(poni_path=..., ai=..., mask_path=...)`
@@ -510,3 +548,109 @@ profile).
 - Rollback: `pip install --no-deps --force-reinstall mlgidbase==0.1.5
   pygid==0.2.13 pygidfit==0.1.3` and revert the GUI commit of this
   bump (the `resolve_model_key` change is wrong against <= 0.1.6).
+
+### 2026-10-06 — pygidsim 0.1.7 (pygidfit 0.1.5 held back)
+
+A full PyPI sweep of the six backends found exactly two releases ahead
+of the pins: `pygidsim` 0.1.7 and `pygidfit` 0.1.5. `mlgidbase` (0.1.8),
+`mlgiddetect` (0.2.8), `pygid` (0.2.17) and `mlgidmatch` (0.1.3) are
+still the newest published versions, so only `pygidsim` moves:
+0.1.4 -> 0.1.7. It resolves cleanly against the rest of the pinned set
+(`pip install --dry-run`), because `mlgidmatch` and `pygid` both take
+`pygidsim` on a floor rather than an exact pin. Full suite green before
+and after, both with the backends installed and with them blocked at
+import (the CI profile).
+
+- **The reason for the bump: a real q_xy mask bug in
+  `GIWAXS.giwaxs_2d`.** The simulated 2D pattern is mirrored into
+  negative q_xy, then re-masked against the entry's q range. 0.1.4
+  wrote that mask as
+  `(q_2d_fin[0] >= q_xy_range[0]) & (q_2d_fin[1] <= q_xy_range[1])`:
+  row 0 is q_xy, row 1 is q_z, so the second term compared **q_z**
+  against the **q_xy** ceiling and the q_xy upper limit was never
+  enforced at all. Reflections beyond q_xy_max survived into every
+  simulated pattern (they passed whenever their q_z happened to sit
+  under q_xy_max, which for a near-square q range is almost always).
+  0.1.7 compares `q_2d_fin[0]`. Since `CifPattern` is built from
+  `giwaxs_2d` output, this changes what mlgidLAB draws as the
+  **Expected pattern** overlay and which candidates matching scores:
+  fewer reflections, and the ones that remain are the ones inside the
+  measured q range. Re-parse any cached `.pickle` built with 0.1.4;
+  the GUI cannot tell which pygidsim a pickle came from.
+- **Empty patterns no longer raise, they return empty arrays.**
+  `giwaxs_2d` ended with `raise ValueError("There are no peaks in the
+  pattern.")` when clustering left nothing; 0.1.7 returns
+  `GIWAXS._return_empty(dim=2)` instead, matching what the 1D path
+  already did. That turns a named error into an opaque one one frame
+  later: `mlgidmatch.preprocess.cif_preprocess._create_all_possible_patterns`
+  computes `intensity / intensity.max()` on the empty array and numpy
+  raises `ValueError: zero-size array to reduction operation maximum
+  which has no identity`. `pipeline._build_cif_pattern_from_raw` now
+  catches that and re-raises a `RuntimeError` naming the CIF input and
+  the likely cause (no reflections inside the entry's q range), so
+  "Parse CIFs" on a CIF with nothing in range reads as a data problem
+  rather than a GUI bug. Regression:
+  `tests/test_cif_empty_pattern.py`.
+- **`ExpParameters` is lazier, and compatible.** The `create_FF`
+  constructor argument is gone, and `wavelength`, `q_max` and
+  `database` became properties, with the form-factor `Database` built
+  on first access to `.database` instead of inside `__init__`. The GUI
+  never passed `create_FF` (zero hits in the tree) and reads only
+  `.wavelength`, `.q_xy_range`, `.q_z_range` and `.ai` from an
+  `ExpParameters`, so the construction call in
+  `pipeline._exp_params_from_nexus` (`q_xy_max`, `q_z_max`, `ai`, `en`)
+  is unchanged and the energy guard still sees the same `en` contract.
+  The practical gain is that deriving parameters per entry no longer
+  builds a form-factor database the GUI may never consult; the pattern
+  simulation that does consult it pays for it on first touch.
+- **`Crystal` moved to `pygidsim/crystal.py`**, re-exported from
+  `giwaxs_sim` and now also from the package root beside
+  `ExpParameters`, `GIWAXS` and `GIWAXSFromCif`. Internal imports went
+  relative and `setup.py` was replaced by `pyproject.toml`. Every
+  import path mlgidLAB and mlgidmatch use still resolves
+  (`from pygidsim.experiment import ExpParameters` on our side), so
+  this is packaging hygiene rather than an API change.
+- **pygidfit 0.1.5 is blocked, and stays blocked.** `mlgidbase 0.1.8`
+  pins `pygidfit==0.1.4` exactly; asking pip for 0.1.5 alongside it is
+  a `ResolutionImpossible`. What is waiting there, for when mlgidbase
+  moves: `Model.fit` from lmfit is replaced by a direct
+  `scipy.optimize.least_squares` with a numba analytic Jacobian
+  (switchable via the `PYGIDFIT_ANALYTIC_JAC` environment variable and
+  auto-disabled above 6 Gaussian components), the neighbour-box ROI
+  masking is vectorised, and three initial-guess changes move fit
+  results: the amplitude seed becomes `np.nanpercentile(sub, 99)`
+  instead of `np.nanmax(sub)`, both sigmas are divided by 2.355 (the
+  FWHM-to-sigma factor), and the 1D ring `radius_width` upper bound
+  becomes the box width `x1_box - x0_box` rather than the x-axis
+  bound. The first two change every fitted amplitude and width seed,
+  so that bump is a numerics change to re-verify against stored
+  results, not a drop-in. Reported upstream so the mlgidbase pin can
+  follow.
+- **`tifffile`: pygid's upper bound is stale, and it does not matter.**
+  Installing into an environment that already carries a recent
+  `tifffile` makes pip print
+  `pygid 0.2.17 requires tifffile<2024.0,>=2023.7.18, but you have
+  tifffile 2026.9.15 which is incompatible`. It is a post-install
+  consistency warning, not a failed install, and it can be ignored:
+  **pygid never imports tifffile.** A recursive grep for `tifffile`,
+  `TiffFile`, `imread` and `imwrite` across the installed `pygid`
+  package returns zero hits, so the bound guards a dependency that is
+  declared and unused. The only real consumer in the stack is
+  mlgidDETECT (`dataloader/fromdisk.py`:
+  `tifffile.imread(config.INPUT_IMGPATH)`), which is unpinned, and the
+  GUI never takes that path anyway - mlgidbase hands mlgidDETECT the
+  image array directly through `from_pygid`. Of the other declarers,
+  `scikit-image` wants `>=2022.8.12` and `imageio` is unpinned.
+
+  Do not downgrade to satisfy it. A **clean** environment never sees
+  the warning at all: pip resolves `tifffile` to 2023.12.9, which
+  satisfies pygid's ceiling and every other floor, so it only appears
+  in an environment where something upgraded `tifffile` earlier.
+  Reported upstream: pygid should drop the dependency or raise the
+  `<2024.0` cap, which as written forces a years-old `tifffile` on
+  every consumer that also uses scikit-image, imageio or silx, for a
+  library pygid does not import.
+- Rollback: `pip install --no-deps --force-reinstall pygidsim==0.1.4`
+  and revert the pin here and in `pyproject.toml`. The GUI-side
+  error-message wrap is harmless against 0.1.4 (the `ValueError` it
+  catches simply never arrives).

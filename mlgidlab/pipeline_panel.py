@@ -6,6 +6,13 @@ method (see ``mlgidbase/main.py``: ``run_detection``, ``run_fitting``,
 host wires a ``get_active_entry`` callback so the entry-scope dropdowns can
 resolve "Active entry" at click time.
 
+Detection is the exception to "kwarg surface": its parameters do not
+arrive as kwargs but as one ``config_detect`` dict, which mlgidBASE
+flattens onto an ``mlgiddetect`` ``Config``. The keys, the defaults and
+the nesting live in ``mlgidlab.detection_config`` (Qt-free, so they are
+testable without a widget); this module only owns the widgets and the
+decision of which ones sit inline and which under "Advanced".
+
 Defaults intentionally scope every run to the *active* entry rather than to
 all entries (mlgidBASE's own default). The viewer shows one entry at a time
 and per-entry runs sidestep failures on incompatible sibling entries — the
@@ -21,6 +28,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -37,6 +45,7 @@ from PySide6.QtWidgets import (
 )
 
 from mlgidlab import file_dialogs
+from mlgidlab.detection_config import build_config_detect, flatten_defaults
 from mlgidlab.frame_range import parse_frame_range
 from mlgidlab.pipeline import PipelineCommand, is_mlgidbase_available
 
@@ -67,6 +76,7 @@ from mlgidlab.widgets import CollapsibleSection as _CollapsibleSection
 from mlgidlab.widgets import make_form as _make_form
 from mlgidlab.widgets import PRIMARY as _PRIMARY, set_variant as _set_variant
 from mlgidlab.widgets import skin_progress
+from mlgidlab.widgets import spin_double
 
 
 class PipelinePanel(QWidget):
@@ -107,6 +117,17 @@ class PipelinePanel(QWidget):
         # when present and the input hasn't changed since the parse.
         self._cached_cif_input: str | None = None
         self._cached_cif_obj: object | None = None
+        # Detection parameters: one registry keyed by the flat
+        # ``SECTION_KEY`` name mlgidDETECT uses, so building the
+        # ``config_detect`` dict and resetting the form are both a walk
+        # over the same table rather than two lists of widget names to
+        # keep in step. Empty on a backend-less install, where the
+        # section is never built.
+        self._det_defaults: dict[str, object] = flatten_defaults()
+        self._det_param_widgets: dict[str, QWidget] = {}
+        # (form, field) pairs for the rows only the dino model reads;
+        # see ``_add_dino_row`` and ``_on_det_model_changed``.
+        self._det_dino_rows: list[tuple[QFormLayout, QWidget]] = []
         self._build_ui()
 
     # -- Public API used by MainWindow --
@@ -392,41 +413,316 @@ class PipelinePanel(QWidget):
         )
         form.addRow("Frames:", det_frames_row)
 
-        # YAML config picker — passed straight through to mlgidBASE's
-        # ``config_detect`` argument when non-empty.
-        self.det_config_path = QLineEdit()
-        self.det_config_path.setPlaceholderText("(default config)")
-        self.det_config_path.setToolTip(
-            "Optional YAML config file passed to mlgidDETECT as "
-            "config_detect. Leave blank to use the built-in defaults."
-        )
-        det_browse = QPushButton("Browse…")
-        det_browse.clicked.connect(self._browse_detect_config)
-        det_clear = QPushButton("Clear")
-        det_clear.clicked.connect(lambda: self.det_config_path.setText(""))
-        det_cfg_row = QWidget()
-        det_cfg_h = QHBoxLayout(det_cfg_row)
-        det_cfg_h.setContentsMargins(0, 0, 0, 0)
-        det_cfg_h.setSpacing(4)
-        det_cfg_h.addWidget(self.det_config_path, 1)
-        det_cfg_h.addWidget(det_browse)
-        det_cfg_h.addWidget(det_clear)
-        form.addRow("Config (yaml):", det_cfg_row)
-
-        # Model type — empty string means "use mlgidbase default".
+        # Model type — empty string means "use mlgidbase default". This
+        # one stays a separate ``model_type`` kwarg rather than joining
+        # the config dict below: ``load_config`` assigns it *after* the
+        # dict, so keeping ``MODEL.TYPE`` out of the dict leaves one
+        # source of truth for which weights a run loads (and leaves
+        # ``detection_model.resolve_model_key``'s precedence alone).
         self.det_model_type = QComboBox()
         self.det_model_type.addItems(["(default)", "faster_rcnn", "dino"])
         self.det_model_type.setToolTip(
             "Detection model architecture. Leave on (default) unless your "
-            "config selects a different backbone."
+            "config selects a different backbone.\n\n"
+            "(default) runs the dino model. faster_rcnn is the legacy "
+            "model: it applies its own fixed post-processing and has no "
+            "ensemble, so the score, NMS and ensemble settings are "
+            "hidden while it is selected."
         )
         form.addRow("Model:", self.det_model_type)
 
+        # The three parameters that get touched in practice sit inline;
+        # everything else mlgidDETECT reads is one click away under
+        # "Advanced". Every widget is seeded from ``DETECT_DEFAULTS``,
+        # i.e. from mlgidDETECT's own defaults, so an untouched form
+        # reproduces exactly what a run did before this section grew
+        # fields.
+        self.det_score = self._det_spin("POSTPROCESSING_SCORE", 0.0, 1.0, 0.05)
+        self.det_score.setToolTip(
+            "Confidence a box needs to be kept as a detected peak. "
+            "Lower it to pull faint peaks out of a weak pattern, raise "
+            "it when the image is full of spurious boxes.\n\n"
+            "This decides which boxes are detected and WRITTEN to the "
+            "file. The Display dock's minimum-score slider is a view "
+            "filter: it only hides boxes that were already written."
+        )
+        self._add_dino_row(form, "Score threshold:", self.det_score)
+
+        self.det_nms_iou = self._det_spin(
+            "POSTPROCESSING_NMSIOU", 0.0, 1.0, 0.05
+        )
+        self.det_nms_iou.setToolTip(
+            "Overlap (intersection over union) above which two boxes of "
+            "the same peak are treated as one and the weaker is "
+            "dropped. Raise it when a single reflection comes out as a "
+            "stack of near-identical boxes; lower it when two genuinely "
+            "neighbouring peaks keep being merged into one."
+        )
+        self._add_dino_row(form, "NMS IoU:", self.det_nms_iou)
+
+        self.det_force_cpu = self._det_check("MODEL_FORCE_CPU")
+        self.det_force_cpu.setToolTip(
+            "Run inference on the CPU even when a usable GPU is "
+            "present. Slower, but it is the documented way out of GPU "
+            "trouble (a driver that falls over under load, an "
+            "onnxruntime CUDA provider that will not initialize). See "
+            "``detection_on_gpu`` in mlgidlab/pipeline.py."
+        )
+        form.addRow("Force CPU:", self.det_force_cpu)
+
         section.body_layout.addLayout(form)
+        section.body_layout.addWidget(self._build_detection_advanced())
+        # Every row exists now, so the model combo can start driving
+        # which of them are shown.
+        self.det_model_type.currentTextChanged.connect(
+            self._on_det_model_changed
+        )
+        self._on_det_model_changed(self.det_model_type.currentText())
         self.btn_detect = _set_variant(QPushButton("Run detection"), _PRIMARY)
         self.btn_detect.clicked.connect(self._on_run_detection)
         section.body_layout.addWidget(self.btn_detect)
         return section
+
+    def _build_detection_advanced(self) -> QWidget:
+        """The rest of mlgidDETECT's configuration, collapsed by default.
+
+        Everything here is real (mlgidDETECT reads every one of these
+        attributes), but none of it is part of a normal run, so it would
+        cost the inline rows their legibility. Collapsed, it stays
+        discoverable without being in the way.
+        """
+        advanced = _CollapsibleSection("Advanced", expanded=False)
+        form = _make_form()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(4)
+
+        self.det_classaware_nms = self._det_check(
+            "POSTPROCESSING_CLASSAWARE_NMS"
+        )
+        self.det_classaware_nms.setToolTip(
+            "Run the overlap suppression per class instead of across "
+            "all boxes, so a ring and a segment at the same place can "
+            "both survive. Applies to the 2-class ring/segment dino "
+            "model; leave it off for the legacy single-class model, "
+            "where every box is the same class anyway."
+        )
+        self._add_dino_row(form, "Class-aware NMS:", self.det_classaware_nms)
+
+        self.det_nms_iou_ring = self._det_spin(
+            "POSTPROCESSING_NMSIOU_RING", 0.0, 1.0, 0.05
+        )
+        self.det_nms_iou_ring.setToolTip(
+            "Overlap threshold used for ring boxes once class-aware NMS "
+            "is on. Rings are long and thin and overlap each other far "
+            "more readily than peaks do, which is why their default "
+            "(0.10) is stricter than the general one."
+        )
+        self._add_dino_row(form, "NMS IoU (rings):", self.det_nms_iou_ring)
+
+        self.det_nms_iou_seg = self._det_spin(
+            "POSTPROCESSING_NMSIOU_SEG", 0.0, 1.0, 0.05
+        )
+        self.det_nms_iou_seg.setToolTip(
+            "Overlap threshold used for segment (peak) boxes once "
+            "class-aware NMS is on."
+        )
+        self._add_dino_row(form, "NMS IoU (segments):", self.det_nms_iou_seg)
+
+        self.det_ensemble = self._det_check("MODEL_ENSEMBLE_ENABLED")
+        self.det_ensemble.setToolTip(
+            "Fuse the predictions of two dino models (ONNX base + ONNX "
+            "ensemble) instead of running one. Costs a second inference "
+            "pass per frame and needs both model files below."
+        )
+        self._add_dino_row(form, "Ensemble:", self.det_ensemble)
+
+        self.det_onnx_base = self._det_line("MODEL_ONNX_BASE", "base")
+        self.det_onnx_base.setToolTip(
+            "Path to an .onnx file to run instead of the weights "
+            "mlgidDETECT downloads for the chosen Model. Leave empty "
+            "for those downloaded weights. A path here also switches "
+            "off the GUI's download pre-flight, which has nothing to "
+            "fetch or verify for a file you supply yourself."
+        )
+        form.addRow("ONNX base:", self.det_onnx_base)
+
+        self.det_onnx_ensemble = self._det_line("MODEL_ONNX_ENSEMBLE")
+        self.det_onnx_ensemble.setToolTip(
+            "Path to the second .onnx file, used only while Ensemble is "
+            "ticked. Empty means none."
+        )
+        self._add_dino_row(form, "ONNX ensemble:", self.det_onnx_ensemble)
+
+        self.det_redownload = self._det_check("MODEL_REDOWNLOAD")
+        self.det_redownload.setToolTip(
+            "Fetch the model weights again even though a cached copy "
+            "exists. The way out of a cached file that loads but "
+            "behaves oddly; a cached file that is plainly truncated is "
+            "already replaced automatically."
+        )
+        form.addRow("Re-download weights:", self.det_redownload)
+
+        self.det_log = self._det_check("PREPROCESSING_LOG")
+        self.det_log.setToolTip(
+            "Take the logarithm of the intensities before the model "
+            "sees them. GIWAXS intensities span decades, so this is "
+            "how the weights were trained; switching it off is for "
+            "experiments, not for runs you want to keep."
+        )
+        form.addRow("Log scaling:", self.det_log)
+
+        self.det_hist_eq = self._det_check(
+            "PREPROCESSING_HISTOGRAMEQUALIZATION"
+        )
+        self.det_hist_eq.setToolTip(
+            "Flatten the intensity histogram so faint and bright "
+            "regions carry comparable contrast. Part of the training "
+            "preprocessing as well."
+        )
+        form.addRow("Histogram equalize:", self.det_hist_eq)
+
+        self.det_clipping = self._det_check("PREPROCESSING_PERFORMCLIPPING")
+        self.det_clipping.setToolTip(
+            "Clip the intensity range to the percentiles below before "
+            "scaling, so a few hot pixels or a detector gap cannot set "
+            "the contrast for the whole image."
+        )
+        form.addRow("Clipping:", self.det_clipping)
+
+        self.det_clip_upper = self._det_spin(
+            "PREPROCESSING_HIGHERCLIPPINGPERCENTILE", 0.0, 100.0, 0.5
+        )
+        self.det_clip_upper.setToolTip(
+            "Upper clipping percentile: everything above it is pulled "
+            "down to it. Lower this when a very bright reflection or a "
+            "hot pixel flattens the rest of the pattern."
+        )
+        form.addRow("Clip upper pct:", self.det_clip_upper)
+
+        self.det_clip_lower = self._det_spin(
+            "PREPROCESSING_LOWERCLIPPINGPERCENTILE", 0.0, 100.0, 0.5
+        )
+        self.det_clip_lower.setToolTip(
+            "Lower clipping percentile: everything below it is raised "
+            "to it. Raise it to push detector background and masked "
+            "zeros out of the contrast range."
+        )
+        form.addRow("Clip lower pct:", self.det_clip_lower)
+
+        self.det_flip_horizontal = self._det_check(
+            "PREPROCESSING_FLIPHORIZONTAL"
+        )
+        self.det_flip_horizontal.setToolTip(
+            "Mirror the image in q_xy before detection. For data whose "
+            "missing wedge sits on the other side than the model "
+            "expects; converted files already have it on the expected "
+            "side, so this stays off."
+        )
+        form.addRow("Flip horizontal:", self.det_flip_horizontal)
+
+        self.det_debug = self._det_check("GENERAL_DEBUG")
+        self.det_debug.setToolTip(
+            "Put mlgidDETECT's own logger at DEBUG level for the run. "
+            "Verbose, and it reaches the Logs dock."
+        )
+        form.addRow("Debug:", self.det_debug)
+
+        advanced.body_layout.addLayout(form)
+        self.btn_det_reset = QPushButton("Reset to defaults")
+        self.btn_det_reset.setToolTip(
+            "Put every detection parameter, inline and advanced, back "
+            "to mlgidDETECT's own default value."
+        )
+        self.btn_det_reset.clicked.connect(self._reset_detection_params)
+        advanced.body_layout.addWidget(self.btn_det_reset)
+        return advanced
+
+    # -- Detection parameter widgets --
+    #
+    # The three factories register each widget under its flat
+    # ``SECTION_KEY`` name and seed it from ``DETECT_DEFAULTS``, so the
+    # default, the reset value and the key sent to mlgidDETECT cannot
+    # drift apart per widget: there is one table, read three ways.
+
+    def _det_spin(
+        self, key: str, lo: float, hi: float, step: float
+    ) -> QDoubleSpinBox:
+        """A registered detection spin box, two decimals."""
+        spin = spin_double(lo, hi, float(self._det_defaults[key]), decimals=2)
+        spin.setSingleStep(step)
+        self._det_param_widgets[key] = spin
+        return spin
+
+    def _det_check(self, key: str) -> QCheckBox:
+        """A registered detection check box."""
+        box = QCheckBox()
+        box.setChecked(bool(self._det_defaults[key]))
+        self._det_param_widgets[key] = box
+        return box
+
+    def _det_line(self, key: str, placeholder: str = "") -> QLineEdit:
+        """A registered detection text field.
+
+        Empty means "mlgidDETECT's default", which is what the
+        placeholder shows; nothing is typed in for the user, so the
+        pristine state is visibly pristine.
+        """
+        edit = QLineEdit()
+        if placeholder:
+            edit.setPlaceholderText(placeholder)
+        self._det_param_widgets[key] = edit
+        return edit
+
+    def _add_dino_row(
+        self, form: QFormLayout, label: str, field: QWidget
+    ) -> None:
+        """Add a row that only the dino model reads.
+
+        mlgidDETECT's ``faster_rcnn`` branch ignores the score and NMS
+        settings (it hardcodes its own post-processing) and never fuses
+        an ensemble, so those rows are hidden while it is selected
+        rather than left in the form doing nothing.
+        """
+        form.addRow(label, field)
+        self._det_dino_rows.append((form, field))
+
+    def _on_det_model_changed(self, model: str) -> None:
+        """Show only the rows the selected model actually reads.
+
+        ``(default)`` resolves to dino, so only an explicit
+        ``faster_rcnn`` hides anything. The hidden widgets keep their
+        values and still travel in ``config_detect``: the backend never
+        reads them under ``faster_rcnn``, and keeping them means an
+        edit survives flipping the combo back and forth.
+        """
+        dino = model != "faster_rcnn"
+        for form, field in self._det_dino_rows:
+            form.setRowVisible(field, dino)
+
+    def _detection_params(self) -> dict[str, object]:
+        """The detection form as a flat ``{"SECTION_KEY": value}`` map."""
+        flat: dict[str, object] = {}
+        for key, widget in self._det_param_widgets.items():
+            if isinstance(widget, QCheckBox):
+                flat[key] = bool(widget.isChecked())
+            elif isinstance(widget, QDoubleSpinBox):
+                flat[key] = float(widget.value())
+            else:
+                # Text field: an empty one means the default, which for
+                # ONNX ensemble is None and gets dropped on nesting.
+                flat[key] = widget.text().strip() or self._det_defaults[key]
+        return flat
+
+    def _reset_detection_params(self) -> None:
+        """Put every detection widget back to mlgidDETECT's default."""
+        for key, value in self._det_defaults.items():
+            widget = self._det_param_widgets.get(key)
+            if isinstance(widget, QCheckBox):
+                widget.setChecked(bool(value))
+            elif isinstance(widget, QDoubleSpinBox):
+                widget.setValue(float(value))
+            elif widget is not None:
+                widget.clear()
 
     def _build_fitting_section(self) -> QWidget:
         section = _CollapsibleSection("Fitting", expanded=False)
@@ -745,9 +1041,14 @@ class PipelinePanel(QWidget):
             self.det_frame_scope, self.det_frame_range, kwargs
         ):
             return
-        cfg = self.det_config_path.text().strip()
-        if cfg:
-            kwargs["config_detect"] = cfg
+        # Always sent, never conditional: an untouched form carries
+        # mlgidDETECT's own defaults, so there is no state in which
+        # omitting the dict would mean something different from sending
+        # it. ``pipeline.execute`` builds a fresh mlgidBASE per command,
+        # so an edit takes effect on the very next click.
+        kwargs["config_detect"] = build_config_detect(
+            self._detection_params()
+        )
         model = self.det_model_type.currentText()
         if model and not model.startswith("("):
             kwargs["model_type"] = model
@@ -1094,15 +1395,6 @@ class PipelinePanel(QWidget):
             )
         kwargs["frame_num"] = valid
         return True
-
-    def _browse_detect_config(self) -> None:
-        path = file_dialogs.open_file(
-            self,
-            "Select detection config (YAML)",
-            "YAML (*.yaml *.yml);;All files (*)",
-        )
-        if path:
-            self.det_config_path.setText(path)
 
     def _browse_cif(self) -> None:
         """Pick one-or-more raw .cif files.

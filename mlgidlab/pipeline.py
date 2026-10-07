@@ -1363,12 +1363,71 @@ def _build_cif_pattern_from_raw(
     # so we always populate both — the cache is built once per Parse click
     # anyway and the 1D pass is cheap relative to the 3D pattern simulation
     # that ``create_elementary`` already does.
-    return CifPattern(
-        params=params,
-        folder_path=folder_path,
-        cifs=cifs,
-        create_all=True,
-    )
+    # An empty simulation used to be a named error: pygidsim <= 0.1.4
+    # ended ``giwaxs_2d`` with ``ValueError("There are no peaks in the
+    # pattern.")``. Since 0.1.7 it returns empty arrays instead, so the
+    # failure surfaces one frame later inside mlgidmatch's
+    # ``_create_all_possible_patterns``, which divides by
+    # ``intensity.max()`` and lets numpy raise "zero-size array to
+    # reduction operation maximum which has no identity", a message that
+    # says nothing about CIFs and reads like a GUI bug. Re-raise it as a
+    # RuntimeError that names the input and the usual cause, same shape
+    # as the re-raises in ``execute``.
+    try:
+        return CifPattern(
+            params=params,
+            folder_path=folder_path,
+            cifs=cifs,
+            create_all=True,
+        )
+    except ValueError as exc:
+        if not _is_empty_pattern_error(exc):
+            # Some other ValueError: a malformed CIF out of
+            # xrayutilities' parser, a bad lattice, an unknown element.
+            # Those already name their own cause, and relabelling them
+            # "the pattern came out empty" would be a lie, so they go
+            # up untouched.
+            raise
+        raise RuntimeError(
+            f"Could not simulate a diffraction pattern for "
+            f"{_describe_cif_input(folder_path, cifs)}: the simulated "
+            f"pattern came out empty. Usually that means none of these "
+            f"structures has a reflection inside this entry's q range. "
+            f"Check the CIF (lattice parameters, occupancies) and the "
+            f"entry's q_xy / q_z extents. ({exc})"
+        ) from exc
+
+
+# Both wordings for "the simulated pattern has no peaks": pygidsim's own,
+# raised by ``giwaxs_2d`` up to 0.1.4, and numpy's, which is what 0.1.7's
+# empty-array return turns into one frame later inside mlgidmatch
+# (``intensity / intensity.max()``). Matched on text because neither
+# arrives as a distinguishable exception type.
+_EMPTY_PATTERN_MARKERS = (
+    "zero-size array to reduction operation",
+    "there are no peaks in the pattern",
+)
+
+
+def _is_empty_pattern_error(exc: ValueError) -> bool:
+    """Is this ValueError the empty-simulated-pattern case?"""
+    text = str(exc).lower()
+    return any(marker in text for marker in _EMPTY_PATTERN_MARKERS)
+
+
+def _describe_cif_input(folder_path: str, cifs: list[str]) -> str:
+    """A short, log-safe name for a CIF input in an error message.
+
+    A folder of CIFs can hold dozens of names; listing them all turns a
+    one-line error into a wall. Up to three are named, the rest counted.
+    """
+    import os
+
+    if len(cifs) <= 3:
+        listed = ", ".join(cifs)
+    else:
+        listed = ", ".join(cifs[:3]) + f", +{len(cifs) - 3} more"
+    return f"{listed} (in {os.path.basename(folder_path) or folder_path})"
 
 
 class _EnergyOutOfRangeError(ValueError):
