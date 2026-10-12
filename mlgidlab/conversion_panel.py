@@ -9,6 +9,7 @@ hand off to the worker. Wiring of the emit path lives in Step 5.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Callable
 
@@ -463,14 +464,15 @@ class ConversionPanel(QWidget):
         inner.setSpacing(4)
 
         # Sections are independent — any combination can be open at once.
-        # Selection starts open because that's what the user configures
-        # first; the rest stay collapsed to keep the initial UI compact.
+        # Selection and Output start open: what to convert and where it
+        # goes are what the user sets first. The rest stay collapsed to
+        # keep the initial UI compact.
         self._sections: list[_CollapsibleSection] = [
             self._build_selection_section(),
+            self._build_output_section(),
             self._build_exp_params_section(),
             self._build_metadata_section(),
             self._build_conversion_config_section(),
-            self._build_output_section(),
         ]
         for s in self._sections:
             inner.addWidget(s)
@@ -1270,13 +1272,23 @@ class ConversionPanel(QWidget):
     # ---------------- Section: Output ----------------
 
     def _build_output_section(self) -> _CollapsibleSection:
-        section = _CollapsibleSection("Output", expanded=False)
+        section = _CollapsibleSection("Output", expanded=True)
 
         form = _make_form()
         form.setContentsMargins(0, 0, 0, 0)
 
         self.output_dir = QLineEdit()
-        self.output_dir.setPlaceholderText("Output directory (required)")
+        # The placeholder shows the live default (_refresh_output_dir_default).
+        self._default_output_dir_shown: Path | None = None
+        self.output_dir.setPlaceholderText(
+            "Default: the folder of the first checked raw file"
+        )
+        self.output_dir.setToolTip(
+            "Where the converted files are written. Leave it empty to "
+            "write next to the raw data, in the folder of the first "
+            "checked raw file. With raw files from several folders, "
+            "every output goes to that first file's folder."
+        )
         out_browse = QPushButton("Browse…")
         out_browse.clicked.connect(self._browse_output_dir)
         form.addRow("Directory:", _row(self.output_dir, out_browse))
@@ -1376,8 +1388,8 @@ class ConversionPanel(QWidget):
         ONE output path (always true in separate-datasets mode; true in
         separate-files mode for a single raw file).
         """
-        out_text = self.output_dir.text().strip()
-        if not out_text:
+        out_dir = self._effective_output_dir()
+        if out_dir is None:
             return None
         from mlgidlab import conversion  # lazy: defer the engine module until a run is configured
 
@@ -1398,7 +1410,7 @@ class ConversionPanel(QWidget):
             scans = [RawScan(file_path=Path("_"), entry="_")]
         try:
             outputs = conversion._plan_output_paths(
-                scans, cfg, Path(out_text).expanduser()
+                scans, cfg, out_dir.expanduser()
             )
         except Exception:
             logger.debug("suppressed output-path plan in append refresh", exc_info=True)
@@ -1430,6 +1442,30 @@ class ConversionPanel(QWidget):
             self.append_entry_combo.setCurrentText(previous)
         elif names:
             self.append_entry_combo.setCurrentIndex(len(names) - 1)
+
+    def _default_output_dir(self) -> Path | None:
+        """The folder of the first checked raw file, or None."""
+        entries = self._checked_entries()
+        return entries[0].file_path.parent if entries else None
+
+    def _effective_output_dir(self) -> Path | None:
+        """The typed directory, else the default next to the raw data."""
+        out_text = self.output_dir.text().strip()
+        return Path(out_text) if out_text else self._default_output_dir()
+
+    def _refresh_output_dir_default(self) -> None:
+        """Show the default directory in the empty field, and re-list the
+        append targets when it moves with the selection."""
+        default = self._default_output_dir()
+        if default == self._default_output_dir_shown:
+            return
+        self._default_output_dir_shown = default
+        self.output_dir.setPlaceholderText(
+            f"Default: {default}" if default is not None
+            else "Default: the folder of the first checked raw file"
+        )
+        if not self.output_dir.text().strip():
+            self._refresh_append_entries()
 
     def _browse_output_dir(self) -> None:
         path = file_dialogs.existing_directory(
@@ -1466,13 +1502,12 @@ class ConversionPanel(QWidget):
     def _is_runnable(self) -> bool:
         """Whether the Convert button should be enabled.
 
-        Requires: at least one entry checked, a non-empty PONI path, and
-        a non-empty output directory. ``set_running`` overrides this when
-        a run is in flight.
+        Requires: at least one entry checked and a non-empty PONI path.
+        The output directory is optional (``_collect_run_inputs`` falls
+        back to the raw data's folder). ``set_running`` overrides this
+        when a run is in flight.
         """
         if not self.poni_path.text().strip():
-            return False
-        if not self.output_dir.text().strip():
             return False
         return self._has_checked_entries()
 
@@ -1486,6 +1521,8 @@ class ConversionPanel(QWidget):
 
     def _refresh_runnable(self) -> None:
         self.btn_convert.setEnabled(self._is_runnable())
+        # Every selection change passes through here.
+        self._refresh_output_dir_default()
 
     def _on_convert_clicked(self) -> None:
         """Collect every section's state into a config + scan list and
@@ -1513,6 +1550,19 @@ class ConversionPanel(QWidget):
         if not scans:
             raise ValueError("No entries selected — tick at least one in the Selection tree.")
         cfg = self._collect_config()
+        if cfg.output_dir is None:
+            folder = scans[0].file_path.parent
+            if not os.access(folder, os.W_OK | os.X_OK):
+                raise ValueError(
+                    f"no output directory is set and the raw data's folder "
+                    f"{folder} is not writable. Choose an output directory "
+                    f"in the Output section."
+                )
+            cfg.output_dir = folder
+            self.append_log(
+                f"No output directory set: writing next to the raw data, "
+                f"in {folder}"
+            )
         if isinstance(cfg.ai, list):
             axis = self._selection_frame_axis()
             if len(cfg.ai) != axis:
