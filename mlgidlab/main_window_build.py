@@ -738,10 +738,11 @@ class BuildMixin:
         )
         sim_orient_row.addWidget(self._sim_matched_combo, 1)
         self._sim_hkl_edit = QLineEdit()
-        self._sim_hkl_edit.setPlaceholderText("h k l   e.g. 0 0 1")
+        self._sim_hkl_edit.setPlaceholderText("h k l   e.g. 0 0 1 or 001")
         self._sim_hkl_edit.setToolTip(
             "Miller indices of the orientation to render: three "
-            "integers separated by spaces or commas. Validated "
+            "integers separated by spaces or commas, or three single "
+            "digits written together (001, -110, 1-10). Validated "
             "against the structure's precomputed orientations; "
             "equivalent spellings (2 2 0, 0 0 -1) resolve to the "
             "simulated one (1 1 0, 0 0 1)."
