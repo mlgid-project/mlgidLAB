@@ -1046,7 +1046,16 @@ class BuildMixin:
         self.conversion_panel.logMessage.connect(self._log_view.appendPlainText)
         self.conversion_panel.logCleared.connect(self._log_view.clear)
 
-        self._display_dock.raise_()
+        # Remember which right-hand tab the user has in front, so a
+        # session switch that re-tabifies the column can put it back
+        # (``_apply_session_mode``). A tabbed dock emits
+        # ``visibilityChanged(True)`` when its tab becomes current.
+        self._right_front_dock = None
+        for dock in (self._display_dock, self._pipeline_dock, self._sim_dock,
+                     self._conversion_dock, self._logs_dock):
+            dock.visibilityChanged.connect(
+                lambda visible, d=dock: self._note_right_front_dock(d, visible))
+        self._pipeline_dock.raise_()
 
         # Bottom: profile viewer + peaks table, tabified together.
         # Default to ~30% of window height so the central image
@@ -1462,6 +1471,18 @@ class BuildMixin:
     _RIGHT_DOCK_WINDOW_SHARE = 3
     _RIGHT_DOCK_MAX_PX = 500
     _RIGHT_DOCK_MIN_PX = 380
+
+    def _note_right_front_dock(self, dock, visible: bool) -> None:
+        if not visible or dock.isFloating():
+            return
+        # Folding the docks for the Structure tab brings each next tab
+        # forward for a moment on the way out; that is not a choice.
+        tabs = getattr(self, "tabs", None)
+        structure = getattr(self, "structure_panel", None)
+        if tabs is not None and structure is not None \
+                and tabs.currentWidget() is structure:
+            return
+        self._right_front_dock = dock
 
     def _apply_default_dock_widths(self) -> None:
         """Open the two side columns at their default widths.

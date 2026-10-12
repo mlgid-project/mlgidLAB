@@ -907,6 +907,9 @@ class FilesMixin:
                 stack.setCurrentWidget(self.tabs)
 
         is_raw = session is not None and session.kind == "raw"
+        # Read before the docks are shown, hidden and re-tabified below:
+        # each of those can bring another tab forward for a moment.
+        front = getattr(self, "_right_front_dock", None)
         self._pipeline_dock.setVisible(not is_raw)
         self._conversion_dock.setVisible(is_raw)
         # Re-tabify the right-dock chain per mode so the tab bar
@@ -921,12 +924,16 @@ class FilesMixin:
             self.tabifyDockWidget(self._display_dock, self._conversion_dock)
             self.tabifyDockWidget(self._conversion_dock, self._logs_dock)
             self._conversion_dock.raise_()
+            self._right_front_dock = self._conversion_dock
         else:
             self.tabifyDockWidget(self._display_dock, self._pipeline_dock)
             self.tabifyDockWidget(self._pipeline_dock, self._logs_dock)
-            # Keep Display in front by default for NeXus sessions; users
-            # who prefer Pipeline up-front can click its tab.
-            self._display_dock.raise_()
+            # Keep whichever tab the user had in front. Pipeline when
+            # there is none yet, or when it was Conversion (raw to NeXus).
+            if front is None or front is self._conversion_dock:
+                front = self._pipeline_dock
+            front.raise_()
+            self._right_front_dock = front
         # Hide NeXus-mode-only widgets in raw mode. Peaks is hidden
         # alongside Profiles since both depend on peak tables that
         # only exist after conversion.
