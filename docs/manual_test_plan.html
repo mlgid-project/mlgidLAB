@@ -143,6 +143,7 @@ Not tested. The per-step marks are what tell us exactly which parts broke.</p>
     <li><label><input type="checkbox" id="c2_3"> File &rarr; Open recent lists the file</label></li>
     <li><label><input type="checkbox" id="c2_4"> Opening eiger4m_0000.h5 (raw) switches the right dock to Conversion</label></li>
     <li><label><input type="checkbox" id="c2_5"> Two files open; clicking between them in the tree switches the active session</label></li>
+    <li><label><input type="checkbox" id="c2_6"> On launch the right dock column shows Pipeline in front; bring Logs forward, then open or switch files: Logs stays in front (a raw file still brings Conversion forward, and going back to a converted file shows Pipeline)</label></li>
   </ul>
   <textarea id="n2" placeholder="Notes for area 2"></textarea>
 </div>
@@ -156,6 +157,7 @@ Not tested. The per-step marks are what tell us exactly which parts broke.</p>
     <li><label><input type="checkbox" id="c3_3"> Colormap change, histogram levels, Log/linear contrast work</label></li>
     <li><label><input type="checkbox" id="c3_5"> Contrast sticks: drag the histogram slider, then add a peak / run the pipeline / scrub frames &mdash; the contrast stays put (does not snap back to default). Opening a file, switching entries, or toggling Log/linear re-auto-contrasts; Cartesian/Polar keeps it.</label></li>
     <li><label><input type="checkbox" id="c3_4"> Status bar shows file / entry / frame / live cursor readout</label></li>
+    <li><label><input type="checkbox" id="c3_6"> organic_labeled.h5 has one frame per entry: the Scan tracking tab and the strip's Track stage are gone and View &rarr; Scan tracking is greyed out; open MAPbI3_MAPbBr3_0001_scan0006.h5 (multi-frame) and both come back</label></li>
   </ul>
   <textarea id="n3" placeholder="Notes for area 3"></textarea>
 </div>
@@ -172,6 +174,7 @@ Not tested. The per-step marks are what tell us exactly which parts broke.</p>
     <li><label><input type="checkbox" id="c4_5"> Open Manual overrides and enable both "Flip horizontally (fliplr)" and "Flip vertically (flipud)" so the converted polar image comes out in the correct orientation</label></li>
     <li><label><input type="checkbox" id="c4_3"> Convert runs; progress streams in Logs; converted file opens automatically</label></li>
     <li><label><input type="checkbox" id="c4_4"> Both output modes work; "Overwrite off" appends entries</label></li>
+    <li><label><input type="checkbox" id="c4_6"> Output sits right under Selection and starts open; with Directory left empty, Convert is enabled, the empty field names the raw file's folder, and the converted file lands there (Logs says where)</label></li>
   </ul>
   <textarea id="n4" placeholder="Notes for area 4"></textarea>
 </div>
@@ -201,6 +204,8 @@ Not tested. The per-step marks are what tell us exactly which parts broke.</p>
     <li><label><input type="checkbox" id="c6_4"> A non-default run scope (all entries / a frame) works with per-entry log lines</label></li>
     <li><label><input type="checkbox" id="c6_5"> Window stays responsive during a run</label></li>
     <li><label><input type="checkbox" id="c6_6"> Detection &rarr; Model: on faster_rcnn the Score threshold, NMS IoU and (under Advanced) Class-aware NMS, both per-class NMS IoU, Ensemble and ONNX ensemble rows vanish with no stray gap; dino and (default) bring them back with the values you typed</label></li>
+    <li><label><input type="checkbox" id="c6_7"> Close the Pipeline dock, then press the small play button next to Detect on the workflow strip: the dock comes back in front and detection runs; with Settings &rarr; Settings&hellip; &rarr; Workflow strip unticked it runs without opening the dock</label></li>
+    <li><label><input type="checkbox" id="c6_8"> Expected pattern, user-specified orientation: typing 001 or -110 is accepted like 0 0 1 or -1 1 0; 0001 and 000 are refused with a message</label></li>
   </ul>
   <textarea id="n6" placeholder="Notes for area 6"></textarea>
 </div>
@@ -288,6 +293,7 @@ Not tested. The per-step marks are what tell us exactly which parts broke.</p>
     <li><label><input type="checkbox" id="c13_1"> Cancel a Conversion or batch fit mid-run: app stays usable</label></li>
     <li><label><input type="checkbox" id="c13_2"> Large multi-frame file (MAPbI3…): scrubbing stays responsive, memory stays bounded</label></li>
     <li><label><input type="checkbox" id="c13_3"> Anything that crashes/freezes/shows a traceback is captured (see below)</label></li>
+    <li><label><input type="checkbox" id="c13_4"> After an in-app update (Help &rarr; Update now&hellip; or the banner's Update now), update_install.log in the log folder (see below) holds a started and a finished block for that run, and crash.log is there too</label></li>
   </ul>
   <textarea id="n13" placeholder="Notes for area 13"></textarea>
 </div>
@@ -312,8 +318,9 @@ Not tested. The per-step marks are what tell us exactly which parts broke.</p>
 </div>
 
 <h2>Collecting and sending logs</h2>
-<p>There is no log file on disk — logs live in the app and the terminal.
-Three ways to capture them, easiest first:</p>
+<p>Logs live in the app and the terminal; only crashes and in-app
+updates are also written to disk (the last item below).
+Ways to capture them, easiest first:</p>
 <ol>
   <li><b>Copy diagnostics (quickest):</b> <code>Help &rarr; Copy diagnostics</code>
       copies versions + active session + the last 50 log lines to your
@@ -324,6 +331,11 @@ Three ways to capture them, easiest first:</p>
   <li><b>Terminal output (crashes/freezes):</b> copy everything the
       terminal you launched <code>mlgidlab</code> from printed, especially
       any <code>Traceback (most recent call last)</code> block.</li>
+  <li><b>Crash and update logs:</b> attach <code>crash.log</code> and, after
+      an in-app update, <code>update_install.log</code> from the log folder:
+      <code>~/.local/state/mlgidlab</code> on Linux,
+      <code>%LOCALAPPDATA%\mlgidlab\Logs</code> on Windows,
+      <code>~/Library/Logs/mlgidlab</code> on macOS.</li>
 </ol>
 <p>Then click <b>Copy results to clipboard</b> above, paste it into an
 email together with the logs, and send to

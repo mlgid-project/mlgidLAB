@@ -4,6 +4,46 @@ All notable changes to mlgidLAB are recorded here. Versions follow
 [PEP 440](https://peps.python.org/pep-0440/); `aN` suffixes are alpha
 pre-releases.
 
+## Unreleased
+
+### Added
+
+- **Crash and update logs that survive a reboot.** The crash log moved
+  out of the system temp folder, which a reboot empties, into a
+  per-user log folder: `~/.local/state/mlgidlab` on Linux,
+  `%LOCALAPPDATA%\mlgidlab\Logs` on Windows and `~/Library/Logs/mlgidlab`
+  on macOS. It is called `crash.log` and starts a fresh file past 1 MiB.
+  Installing an update from inside the app now writes
+  `update_install.log` in the same folder: the mlgidLAB and Python
+  versions, the platform and the pip command before pip starts, and
+  pip's full output and return code after it. The "Update failed" dialog
+  names that file.
+- **The workflow strip's play button opens its dock.** Pressing the
+  small play button next to a stage now also brings the dock that owns
+  the stage forward, so the run's settings and progress are in view.
+  Settings has a new **Workflow strip** group to turn this off.
+
+### Changed
+
+- **Pipeline is in front at startup.** The right-hand dock column opens
+  on Pipeline instead of Display, and whichever tab you bring forward
+  stays in front when you open, switch or close files.
+- **No Scan tracking for single-frame data.** Tracking follows peaks
+  across frames, so for a converted file whose entry has a single frame
+  the Scan tracking dock and the strip's Track stage are hidden, and
+  View menu's Scan tracking entry is greyed out. They come back when a
+  multi-frame entry is shown, unless you had closed the dock yourself.
+- **Miller indices without spaces.** The Expected pattern orientation
+  field accepts three single digits written together, such as `001`,
+  `-110` or `1-10`, as well as the spaced forms.
+- **Conversion: Output moved up, and the directory is optional.** The
+  Output section now sits right under Selection and starts open. Leave
+  the directory empty to write next to the raw data, in the folder of
+  the first checked raw file; the empty field shows which folder that
+  is, and the Logs dock says where the files went. If that folder is not
+  writable, Convert asks you to choose a directory. With raw files from
+  several folders, all outputs go to the first file's folder.
+
 ## 0.1.0a20 — twentieth alpha (2026-10-07)
 
 Two independent pieces of work. Detection becomes configurable from the
