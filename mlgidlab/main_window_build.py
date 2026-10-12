@@ -55,6 +55,7 @@ from mlgidlab.main_window_constants import (
     DEFAULT_PLAYBACK_FRAME_MS,
 )
 from mlgidlab.parameter_panel import ParameterPanel
+from mlgidlab.peak_link import read_bool
 from mlgidlab.peaks_table_panel import PeaksTablePanel
 from mlgidlab.pipeline import is_mlgidbase_available
 from mlgidlab.pipeline_panel import PipelinePanel
@@ -86,6 +87,9 @@ logger = logging.getLogger(__name__)
 
 #: QSettings key for whether the workflow strip is open or folded.
 RAIL_EXPANDED_KEY = "view/workflow_rail_expanded"
+#: QSettings key for whether a stage's run glyph also brings its dock
+#: forward. Default on.
+RAIL_RUN_OPENS_DOCK_KEY = "view/rail_run_opens_dock"
 
 
 def _dirty_dot(diameter: int = 8) -> QPixmap:
@@ -1757,6 +1761,9 @@ class BuildMixin:
     def _on_rail_stage_run(self, key: str) -> None:
         button = self._rail_run_button(key)
         if button is not None and button.isEnabled():
+            # Read per click, so the Settings dialog applies at once.
+            if read_bool(RAIL_RUN_OPENS_DOCK_KEY, True):
+                self._on_rail_stage_activated(key)
             button.click()
 
     def _refresh_workflow_rail(self) -> None:

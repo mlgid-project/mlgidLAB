@@ -46,6 +46,7 @@ from mlgidlab.main_window_constants import (
     PLAYBACK_TOTAL_S_MAX,
     PLAYBACK_TOTAL_S_MIN,
 )
+from mlgidlab.main_window_build import RAIL_RUN_OPENS_DOCK_KEY
 from mlgidlab.peak_link import link_enabled, read_bool
 
 
@@ -285,6 +286,21 @@ class _SettingsDialog(QDialog):
         lists_layout.addWidget(self._lists_empty_hint)
         outer.addWidget(lists_box)
 
+        # --- Workflow strip ---------------------------------------------------
+        rail_box = QGroupBox("Workflow strip")
+        rail_layout = QVBoxLayout(rail_box)
+        self._chk_rail_run_opens_dock = QCheckBox(
+            "Open a stage's dock when its play button is pressed"
+        )
+        self._chk_rail_run_opens_dock.setToolTip(
+            "The play button next to a stage on the strip above the image "
+            "runs that stage. With this on it also brings the dock that "
+            "owns the stage forward, so the run's settings and progress "
+            "are in view. Clicking a stage's name always does."
+        )
+        rail_layout.addWidget(self._chk_rail_run_opens_dock)
+        outer.addWidget(rail_box)
+
         # --- Buttons + outer wiring -------------------------------------------
         outer.addStretch(1)
         btns = QDialogButtonBox(
@@ -334,6 +350,9 @@ class _SettingsDialog(QDialog):
         self._chk_peak_link.setChecked(link_enabled())
         self._chk_peak_link_reverse.setChecked(
             read_bool(PEAK_LINK_REVERSE_KEY, False)
+        )
+        self._chk_rail_run_opens_dock.setChecked(
+            read_bool(RAIL_RUN_OPENS_DOCK_KEY, True)
         )
         self._load_list_rows()
         self._refresh_enabled()
@@ -633,4 +652,8 @@ class _SettingsDialog(QDialog):
         settings.setValue(
             PEAK_LINK_REVERSE_KEY,
             bool(self._chk_peak_link_reverse.isChecked()),
+        )
+        settings.setValue(
+            RAIL_RUN_OPENS_DOCK_KEY,
+            bool(self._chk_rail_run_opens_dock.isChecked()),
         )
