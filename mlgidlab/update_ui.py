@@ -8,7 +8,7 @@ import subprocess
 from PySide6.QtCore import QObject, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QToolButton
-from mlgidlab import update_check
+from mlgidlab import diagnostics, update_check
 from mlgidlab import icons, theme_tokens
 
 import logging
@@ -58,6 +58,9 @@ class _UpdateInstallWorker(QObject):
         # it aside first and put it back if the install fails. No-op
         # elsewhere.
         renames: list = []
+        # Written before pip starts, so a crash mid-install leaves a
+        # started block with no finished one (diagnostics never raises).
+        diagnostics.log_update_started(self._command)
         try:
             renames = update_check.free_locked_launchers()
             proc = subprocess.run(
@@ -71,11 +74,14 @@ class _UpdateInstallWorker(QObject):
             if proc.returncode != 0:
                 update_check.restore_launchers(renames)
             output = (proc.stdout or "") + (proc.stderr or "")
+            diagnostics.log_update_finished(proc.returncode, output)
             self.finished.emit(proc.returncode, output)
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("update install worker failed", exc_info=True)
             update_check.restore_launchers(renames)
-            self.finished.emit(1, f"Failed to launch pip: {exc}")
+            output = f"Failed to launch pip: {exc}"
+            diagnostics.log_update_finished(1, output)
+            self.finished.emit(1, output)
 
 
 class _UpdateBanner(QFrame):

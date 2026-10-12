@@ -7,6 +7,8 @@ suite is headless and hermetic:
 * ``XDG_CONFIG_HOME`` redirected to a temp dir — QSettings (recent
   files, theme, playback) cannot read or clobber the real user config,
   so construction starts from a clean slate every run.
+* ``MLGIDLAB_LOG_DIR`` redirected into the same temp dir, so the update
+  log is never written to the real per-user log directory.
 * ``HDF5_USE_FILE_LOCKING=FALSE`` — mirrors ``mlgidlab.__init__.main``;
   matters once the file-open increments land, set here for parity.
 
@@ -29,6 +31,9 @@ os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 # so without an explicit rmtree these would pile up in /tmp run after run.
 _CONFIG_ROOT = tempfile.mkdtemp(prefix="mlgidlab-test-config-")
 os.environ["XDG_CONFIG_HOME"] = _CONFIG_ROOT
+# Same for the crash / update logs (mlgidlab.diagnostics): never the real
+# per-user log directory.
+os.environ["MLGIDLAB_LOG_DIR"] = os.path.join(_CONFIG_ROOT, "logs")
 
 import gc  # noqa: E402
 import sys  # noqa: E402

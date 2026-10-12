@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QTextBrowser,
     QVBoxLayout,
 )
-from mlgidlab import update_check
+from mlgidlab import diagnostics, update_check
 from mlgidlab.controls_help import ControlsDialog
 from mlgidlab.widgets import make_progress_dialog
 from mlgidlab.update_ui import (
@@ -448,7 +448,10 @@ class UpdateMixin:
             "The update could not be installed. You can try again, or "
             "update manually from a terminal:"
         )
-        box.setInformativeText(command)
+        log_path = diagnostics.update_log_path()
+        box.setInformativeText(
+            f"{command}\n\nFull log: {log_path}" if log_path else command
+        )
         box.setDetailedText(tail)
         box.exec()
 
@@ -467,6 +470,7 @@ class UpdateMixin:
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+        diagnostics.log_restart_requested()
         # Relaunch the module entry point with the same interpreter, then quit
         # this instance. startDetached returns before we exit so the new
         # process survives our shutdown.

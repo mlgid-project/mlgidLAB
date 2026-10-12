@@ -32,17 +32,26 @@ def _enable_crash_log() -> None:
     more often than from a terminal, and in both cases stderr goes
     nowhere. The file is kept open for the life of the process on
     purpose: the handler runs in a broken process and cannot open one.
+
+    It lives in the per-user log directory (``diagnostics.log_dir``) so a
+    reboot does not wipe it, with the system temp dir as the fallback.
     """
     try:
+        import datetime
         import faulthandler
-        import tempfile
-        from pathlib import Path
 
-        path = Path(tempfile.gettempdir()) / "mlgidlab_crash.log"
+        from mlgidlab import diagnostics
+
+        opened = diagnostics.open_crash_log()
+        if opened is None:
+            return
         # Deliberately not closed, and deliberately not a context
         # manager: the file has to still be open when the process dies.
-        stream = open(path, "a", buffering=1)
-        stream.write(f"--- mlgidLAB started, pid {os.getpid()} ---\n")
+        stream, _path = opened
+        started = datetime.datetime.now().isoformat(timespec="seconds")
+        stream.write(
+            f"--- mlgidLAB {__version__} started {started}, "
+            f"pid {os.getpid()} ---\n")
         faulthandler.enable(file=stream, all_threads=True)
     except Exception:
         # A missing crash log must never be what stops the app starting.
