@@ -380,6 +380,9 @@ class MainWindow(
         # Docks folded away because the Structure tab is in front, to be
         # restored on the way back to Image or Data.
         self._structure_folded_docks: set[str] = set()
+        # Scan tracking was hidden because the data has a single frame
+        # (``_sync_scan_tracking_visibility``), not closed by the user.
+        self._tracking_hidden_by_rule = False
         # Set when a structural edit landed while the File browser was
         # folded away: rebuilding a tree nobody can see is a teardown for
         # nothing, so it is paid once, on the way out.

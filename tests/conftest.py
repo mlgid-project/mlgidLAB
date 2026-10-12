@@ -373,11 +373,20 @@ def synthetic_nexus(tmp_path):
     Imports are local so the conftest environment lockdown is fully
     applied before h5py touches HDF5.
     """
+    return _write_synthetic_nexus(tmp_path / "synthetic.h5", n_frames=3)
+
+
+@pytest.fixture
+def synthetic_nexus_single(tmp_path):
+    """``synthetic_nexus`` with a single frame: nothing to track across."""
+    return _write_synthetic_nexus(tmp_path / "synthetic_single.h5", n_frames=1)
+
+
+def _write_synthetic_nexus(path, n_frames):
     import h5py
     import numpy as np
 
-    path = tmp_path / "synthetic.h5"
-    n_frames, n_qz, n_qxy = 3, 16, 24
+    n_qz, n_qxy = 16, 24
     rng = np.random.default_rng(0)
     with h5py.File(path, "w", track_order=True) as f:
         data = f.create_group("entry_0000/data")

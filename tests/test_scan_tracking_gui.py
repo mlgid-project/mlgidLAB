@@ -2370,3 +2370,126 @@ def test_export_dialog_modes(qtbot):
     assert data_dlg.selected_structures() is None  # no structure section
     assert not hasattr(data_dlg, "line_width")     # no style section
     assert data_dlg.selected_views() == []         # current tab disabled
+
+
+# -- single-frame data has nothing to track --------------------------------
+
+
+def _tracking_shown(window) -> bool:
+    return (not window._scan_tracking_dock.isHidden()
+            and window.workflow_rail.is_stage_visible("track"))
+
+
+def test_tracking_is_hidden_for_a_single_frame(
+        main_window, synthetic_nexus_single):
+    _open(main_window, synthetic_nexus_single)
+    assert main_window.viewer.n_frames == 1
+    dock = main_window._scan_tracking_dock
+    assert dock.isHidden()
+    assert not main_window.workflow_rail.is_stage_visible("track")
+    assert main_window._tracking_hidden_by_rule
+    # The View menu cannot bring it back.
+    action = dock.toggleViewAction()
+    assert not action.isEnabled()
+    action.trigger()
+    assert dock.isHidden()
+
+
+def test_tracking_is_shown_for_many_frames(main_window, synthetic_nexus):
+    _open(main_window, synthetic_nexus)
+    assert main_window.viewer.n_frames == 3
+    assert _tracking_shown(main_window)
+    assert main_window._scan_tracking_dock.toggleViewAction().isEnabled()
+
+
+def test_switching_sessions_hides_and_restores_tracking(
+        main_window, synthetic_nexus, synthetic_nexus_single):
+    many = _open(main_window, synthetic_nexus)
+    _open(main_window, synthetic_nexus_single)
+    assert not _tracking_shown(main_window)
+    main_window._set_active_session(many)
+    assert _tracking_shown(main_window)
+    assert main_window._scan_tracking_dock.toggleViewAction().isEnabled()
+
+
+@pytest.fixture
+def mixed_entries(tmp_path):
+    """entry_0000 with one frame, entry_0001 with three."""
+    import h5py
+
+    path = tmp_path / "mixed.h5"
+    with h5py.File(path, "w", track_order=True) as f:
+        for name, n_frames in (("entry_0000", 1), ("entry_0001", 3)):
+            data = f.create_group(f"{name}/data")
+            data.attrs["signal"] = "img_gid_q"
+            data.create_dataset(
+                "img_gid_q", data=np.ones((n_frames, 16, 24), np.float32))
+            data.create_dataset(
+                "q_xy", data=np.linspace(-1.0, 3.0, 24, dtype=np.float32))
+            data.create_dataset(
+                "q_z", data=np.linspace(0.0, 4.0, 16, dtype=np.float32))
+    return path
+
+
+def test_a_dock_the_user_closed_stays_closed(main_window, mixed_entries):
+    # Shown, so the View-menu action tracks the dock's visibility.
+    main_window.show()
+    _open(main_window, mixed_entries)
+    dock = main_window._scan_tracking_dock
+    assert dock.isHidden()                      # entry_0000: one frame
+    main_window._load_entry_into_viewer("entry_0001")
+    assert _tracking_shown(main_window)         # the rule hid it: back
+    dock.toggleViewAction().trigger()           # the user closes it
+    assert dock.isHidden()
+    main_window._load_entry_into_viewer("entry_0000")
+    assert not main_window._tracking_hidden_by_rule
+    main_window._load_entry_into_viewer("entry_0001")
+    assert dock.isHidden()                      # still the user's choice
+    assert main_window.workflow_rail.is_stage_visible("track")
+    assert dock.toggleViewAction().isEnabled()
+
+
+def test_the_structure_tab_does_not_bring_tracking_back(
+        main_window, synthetic_nexus_single):
+    _open(main_window, synthetic_nexus_single)
+    main_window._confirm_discard_changes = lambda session=None: True
+    main_window.show()
+    try:
+        main_window.tabs.setCurrentWidget(main_window.structure_panel)
+        main_window.tabs.setCurrentWidget(main_window.viewer)
+        assert not main_window._scan_tracking_dock.isVisible()
+        assert not main_window._profile_dock.isHidden()
+        assert not main_window._scan_tracking_dock.toggleViewAction().isEnabled()
+    finally:
+        if main_window._h5_edit_handle is not None:
+            main_window._h5_edit_handle.release()
+
+
+def test_the_structure_tab_round_trip_keeps_tracking_for_many_frames(
+        main_window, synthetic_nexus):
+    _open(main_window, synthetic_nexus)
+    main_window._confirm_discard_changes = lambda session=None: True
+    main_window.show()
+    try:
+        main_window.tabs.setCurrentWidget(main_window.structure_panel)
+        assert main_window._scan_tracking_dock.isHidden()
+        main_window.tabs.setCurrentWidget(main_window.viewer)
+        assert _tracking_shown(main_window)
+    finally:
+        if main_window._h5_edit_handle is not None:
+            main_window._h5_edit_handle.release()
+
+
+def test_a_raw_session_after_a_single_frame_re_enables_the_action(
+        main_window, synthetic_nexus_single, synthetic_raw):
+    from mlgidlab.session import RawSession
+
+    _open(main_window, synthetic_nexus_single)
+    raw = RawSession.open([synthetic_raw])
+    main_window._sessions.append(raw)
+    main_window._set_active_session(raw)
+    dock = main_window._scan_tracking_dock
+    assert dock.isHidden()                      # raw mode hides it
+    assert dock.toggleViewAction().isEnabled()
+    assert main_window.workflow_rail.is_stage_visible("track")
+    assert not main_window._tracking_hidden_by_rule

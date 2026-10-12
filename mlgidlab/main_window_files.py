@@ -941,7 +941,13 @@ class FilesMixin:
         if hasattr(self, "_peaks_dock"):
             self._peaks_dock.setVisible(not is_raw)
         if hasattr(self, "_scan_tracking_dock"):
-            self._scan_tracking_dock.setVisible(not is_raw)
+            if is_raw:
+                self._tracking_hidden_by_rule = False
+                self._scan_tracking_dock.setVisible(False)
+                self._sync_scan_tracking_visibility()
+            else:
+                # Hidden instead when the data has a single frame.
+                self._sync_scan_tracking_visibility(from_scratch=True)
         if hasattr(self, "parameter_panel"):
             self.parameter_panel.setVisible(not is_raw)
         # Cartesian / Polar radios — meaningless before conversion.

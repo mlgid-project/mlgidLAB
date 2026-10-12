@@ -661,6 +661,7 @@ class FramesMixin:
         self.frame_label.setText(self._frame_label_text(cur))
         self._set_frame_slider_visible(n > 1)
         self._refresh_frame_nav_enabled()
+        self._sync_scan_tracking_visibility()
 
     def _set_frame_slider_visible(self, visible: bool) -> None:
         """Show or hide the toolbar's frame-navigation cluster.

@@ -1768,6 +1768,7 @@ class BuildMixin:
         rail = getattr(self, "workflow_rail", None)
         if rail is None:
             return
+        self._sync_scan_tracking_visibility()
         session = self.session
         rail.setVisible(session is not None)
         if session is None:

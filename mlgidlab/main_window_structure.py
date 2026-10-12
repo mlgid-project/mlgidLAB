@@ -1593,6 +1593,9 @@ class StructureMixin:
         if front is not None and not front.isHidden():
             front.raise_()
             self._right_front_dock = front
+        # The loop above shows Scan tracking too, which the single-frame
+        # rule may need to take away again.
+        self._sync_scan_tracking_visibility()
         self._settle_dock_chrome()
 
     def _browser_is_hidden(self) -> bool:

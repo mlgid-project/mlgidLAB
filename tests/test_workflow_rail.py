@@ -206,3 +206,40 @@ def test_the_rail_catches_up_when_a_run_s_results_land(main_window,
     main_window._on_pipeline_finished(None, None)
 
     assert main_window.workflow_rail.chips["detect"].state.text() == "5 this frame"
+
+
+# -- stages that do not apply ----------------------------------------------
+
+
+def _shown_arrows(rail) -> list[str]:
+    """Keys of the stages whose trailing arrow is showing."""
+    return [key for (key, _l, _g), block in zip(STAGES, rail._blocks)
+            if not block.isHidden() and block.arrow is not None
+            and not block.arrow.isHidden()]
+
+
+def test_hiding_the_last_stage_leaves_no_dangling_arrow(rail):
+    assert _shown_arrows(rail) == ["convert", "detect", "fit", "match"]
+    rail.set_stage_visible("track", False)
+    assert rail._blocks[-1].isHidden()
+    assert not rail.is_stage_visible("track")
+    assert _shown_arrows(rail) == ["convert", "detect", "fit"]
+    rail.set_stage_visible("track", True)
+    assert not rail._blocks[-1].isHidden()
+    assert _shown_arrows(rail) == ["convert", "detect", "fit", "match"]
+
+
+def test_hiding_a_middle_stage_keeps_the_arrow_before_it(rail):
+    rail.set_stage_visible("fit", False)
+    assert rail._blocks[2].isHidden()
+    # Detect still points on, to Match.
+    assert _shown_arrows(rail) == ["convert", "detect", "match"]
+
+
+def test_expanding_the_strip_keeps_a_hidden_stage_hidden(rail):
+    rail.set_stage_visible("track", False)
+    rail.set_expanded(False)
+    assert all(block.isHidden() for block in rail._blocks)
+    rail.set_expanded(True)
+    assert rail._blocks[-1].isHidden()
+    assert not any(block.isHidden() for block in rail._blocks[:-1])

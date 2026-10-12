@@ -289,6 +289,47 @@ class TrackingMixin:
         if self._phase_views_window is not None:
             self._phase_views_window.clear()
 
+    def _sync_scan_tracking_visibility(self, *, from_scratch: bool = False) -> None:
+        """Take Scan tracking away for single-frame NeXus data.
+
+        Tracking follows peaks across frames, so one frame has nothing to
+        track: the dock and the workflow strip's Track stage go, and the
+        dock's View-menu action is disabled so it cannot be brought back.
+        When the rule stops holding, only a dock the rule hid comes back;
+        one the user closed by hand stays closed.
+
+        ``from_scratch`` is the session-mode path, which decides dock
+        visibility afresh: the dock is shown unless the rule hides it.
+        Raw sessions hide the dock in ``_apply_session_mode``.
+        """
+        dock = getattr(self, "_scan_tracking_dock", None)
+        if dock is None:
+            return
+        session = self.session
+        single = (session is not None and session.kind == "nexus"
+                  and self.viewer.n_frames <= 1)
+        rail = getattr(self, "workflow_rail", None)
+        if rail is not None:
+            rail.set_stage_visible("track", not single)
+        dock.toggleViewAction().setEnabled(not single)
+        name = "_scan_tracking_dock"
+        # Docks folded away for the Structure tab come back from this set
+        # when the tab is left.
+        folded = self._structure_folded_docks
+        if single:
+            if from_scratch or not dock.isHidden() or name in folded:
+                self._tracking_hidden_by_rule = True
+            folded.discard(name)
+            dock.hide()
+            return
+        if from_scratch or self._tracking_hidden_by_rule:
+            self._tracking_hidden_by_rule = False
+            structure = getattr(self, "structure_panel", None)
+            if structure is not None and self.tabs.currentWidget() is structure:
+                folded.add(name)
+            else:
+                dock.show()
+
     def _on_show_phase_views(self) -> None:
         """Open (lazily building) and raise the phase-tracking views."""
         if self._phase_views_window is None:
