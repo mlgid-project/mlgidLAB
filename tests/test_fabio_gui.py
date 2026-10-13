@@ -450,3 +450,55 @@ def test_hdf5_raw_files_dropped_one_by_one_accumulate(
         assert len(main_window._sessions) == 1
         assert _selection_files(main_window) == [f.name for f in files[:i]]
         assert main_window.entry_combo.count() == i
+
+
+def test_closing_the_raw_session_empties_the_selection(main_window, tmp_path):
+    """Closed raw files must leave the Conversion panel's Selection list
+    (and the Convert button) instead of lingering until the next load."""
+    tiffs = _write_tiffs(tmp_path, n=2)
+    main_window._open_paths([tiffs[0]])
+    main_window._open_paths([tiffs[1]])
+    panel = main_window.conversion_panel
+    panel.selection_tree.topLevelItem(0).setCheckState(0, Qt.CheckState.Checked)
+    assert _selection_files(main_window) == [t.name for t in tiffs]
+
+    main_window._close_session(main_window.session)
+
+    assert main_window.session is None
+    assert _selection_files(main_window) == []
+    assert not panel.select_all_box.isEnabled()
+    assert not panel.btn_convert.isEnabled()
+    assert main_window._raw_entries == {}
+    assert main_window._raw_entry_label_by_path == {}
+
+
+def test_closing_a_raw_session_behind_a_nexus_file_empties_the_selection(
+    main_window, synthetic_nexus, tmp_path
+):
+    from mlgidlab.session import NexusSession
+
+    (tiff,) = _write_tiffs(tmp_path, n=1)
+    main_window._open_paths([tiff])
+    raw = main_window.session
+    nexus = NexusSession.open(synthetic_nexus)
+    main_window._sessions.append(nexus)
+    main_window._set_active_session(nexus)
+    assert _selection_files(main_window) == [tiff.name]
+
+    main_window._close_session(raw)
+
+    assert main_window.session is nexus
+    assert _selection_files(main_window) == []
+
+
+def test_a_file_dropped_after_closing_starts_a_fresh_selection(
+    main_window, tmp_path
+):
+    first, second = _write_tiffs(tmp_path, n=2)
+    main_window._open_paths([first])
+    main_window._close_session(main_window.session)
+
+    main_window._open_paths([second])
+
+    assert _selection_files(main_window) == [second.name]
+    assert main_window.session.raw_paths == [second.resolve()]

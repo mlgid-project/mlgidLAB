@@ -738,6 +738,16 @@ class FilesMixin:
             session.close()
         # Closed session may have been raw — rebuild the tree's raw set.
         self._refresh_tree_raw_paths()
+        # The Conversion panel lists the files of the raw session that was
+        # last shown. Once that session is closed its rows must go too;
+        # another raw session coming to the front repopulates them below.
+        if isinstance(session, RawSession) and (
+            was_active
+            or not any(isinstance(s, RawSession) for s in self._sessions)
+        ):
+            self.conversion_panel.set_raw_inputs([])
+            self._raw_entries = {}
+            self._raw_entry_label_by_path = {}
         if was_active:
             new_active = self._sessions[-1] if self._sessions else None
             if new_active is not None:

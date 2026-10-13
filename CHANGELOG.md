@@ -46,6 +46,11 @@ pre-releases.
 
 ### Fixed
 
+- **Closed raw files leave the Selection list.** Closing a raw file
+  (Ctrl+W, or Delete on its row in the file browser) closes the raw batch
+  it belongs to, and the Conversion panel used to keep listing those
+  files, with Convert still enabled, until the next raw load. The list is
+  now emptied together with the batch.
 - **Python 3.11 installs no longer pick PySide6 6.12.0.** That release
   drops a reference to `None` on every Qt method call that returns
   nothing, and Python 3.11 then aborts the whole process with
