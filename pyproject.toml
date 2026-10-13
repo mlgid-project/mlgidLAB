@@ -29,7 +29,12 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-    "PySide6>=6.6",
+    # 6.12.0 drops one reference to None per void method call on Python
+    # 3.11 (3.12+ makes None immortal, which hides it), so the process
+    # aborts with "none_dealloc" after enough calls. Excluded on 3.11
+    # only; later releases are allowed again.
+    "PySide6>=6.6,!=6.12.0; python_version < '3.12'",
+    "PySide6>=6.6; python_version >= '3.12'",
     # silx[full] pulls in matplotlib, dateutil, qtawesome, PyOpenGL — all
     # required by DataViewerFrame's auto-rendering.
     "silx[full]>=2.1",

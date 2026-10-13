@@ -46,6 +46,16 @@ pre-releases.
 
 ### Fixed
 
+- **Python 3.11 installs no longer pick PySide6 6.12.0.** That release
+  drops a reference to `None` on every Qt method call that returns
+  nothing, and Python 3.11 then aborts the whole process with
+  `Fatal Python error: none_dealloc` after enough calls. Python 3.12 and
+  later are unaffected. The dependency now excludes exactly that version
+  on 3.11, so a fresh install resolves to 6.11.2 there; later releases
+  are allowed again. If you installed on Python 3.11 in the last few
+  days and the app closed by itself, `pip install "PySide6!=6.12.0"`
+  fixes it.
+
 - **Raw files dropped one at a time all appear in Selection.** Each drop
   used to start its own raw batch, so the Conversion panel's Selection
   list showed only the newest file. A raw file dropped or opened while a

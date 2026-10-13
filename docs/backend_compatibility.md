@@ -58,6 +58,14 @@ for the session) plus an idempotent `closeEvent`, not by pinning the
 GUI stack down — verified green with PySide6 6.11.1 + pyqtgraph 0.14.0
 on both Python 3.12 and 3.14.
 
+**One exclusion: PySide6 6.12.0 on Python 3.11.** That release loses one
+reference to `None` per void method call (`w.update()`, `w.setText(...)`)
+on 3.11, where `None` is not immortal, so the interpreter dies with
+`Fatal Python error: none_dealloc` once the count runs out; the suite
+aborted partway through on every 3.11 shard (exit code 134), on `main`
+as well. 3.12 and later are unaffected. `pyproject.toml` therefore
+excludes exactly that version on 3.11 and leaves later releases allowed.
+
 ## Step 1 — Is mlgidbase installable from your index?
 
 ```bash
