@@ -144,6 +144,7 @@ Not tested. The per-step marks are what tell us exactly which parts broke.</p>
     <li><label><input type="checkbox" id="c2_4"> Opening eiger4m_0000.h5 (raw) switches the right dock to Conversion</label></li>
     <li><label><input type="checkbox" id="c2_5"> Two files open; clicking between them in the tree switches the active session</label></li>
     <li><label><input type="checkbox" id="c2_6"> On launch the right dock column shows Pipeline in front; bring Logs forward, then open or switch files: Logs stays in front (a raw file still brings Conversion forward, and going back to a converted file shows Pipeline)</label></li>
+    <li><label><input type="checkbox" id="c2_7"> Drag raw files into the window one at a time (HDF5 or TIFF): each new file adds a row to the Conversion panel's Selection list below the earlier ones, ticks you already set stay, and the viewer shows the file just dropped; dropping a file twice adds nothing</label></li>
   </ul>
   <textarea id="n2" placeholder="Notes for area 2"></textarea>
 </div>

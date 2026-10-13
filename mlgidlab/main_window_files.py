@@ -336,6 +336,13 @@ class FilesMixin:
             if all(file_model.is_fabio_image(p) for p in raw_paths):
                 if self._offer_import_for_float_images(raw_paths):
                     return
+            # Raw files dropped one at a time join the existing raw batch:
+            # a session per drop left the Conversion panel showing only
+            # the newest file.
+            target = self._raw_session_to_extend()
+            if target is not None:
+                self._extend_raw_session(target, raw_paths, entry_cache)
+                return
             try:
                 session = RawSession.open(raw_paths)
             except Exception as exc:
@@ -350,6 +357,54 @@ class FilesMixin:
                 self._set_active_session(session)
                 self._add_recent_files(session.raw_paths, "raw")
                 self._refresh_tree_raw_paths()
+
+    def _raw_session_to_extend(self) -> RawSession | None:
+        """The raw session newly opened raw files should join, if any.
+
+        The active one when it is raw, else the most recent raw session
+        (a NeXus file may be in front while a raw batch waits behind it).
+        """
+        active = self._active_session
+        if isinstance(active, RawSession):
+            return active
+        for s in reversed(self._sessions):
+            if isinstance(s, RawSession):
+                return s
+        return None
+
+    def _extend_raw_session(
+        self,
+        target: RawSession,
+        raw_paths: list[Path],
+        entry_cache: dict[str, list],
+    ) -> None:
+        """Append ``raw_paths`` to ``target`` and show them.
+
+        Files already in the batch are skipped. An active target keeps its
+        Conversion rows and check state and gains only the new rows; a
+        target behind a NeXus session is activated, which rebuilds the
+        views from its full file list.
+        """
+        try:
+            added = target.add_paths(raw_paths)
+        except Exception as exc:
+            QMessageBox.critical(self, "Open failed", str(exc))
+            return
+        if not added:
+            self.conversion_panel.append_log(
+                "Already open: " + ", ".join(p.name for p in raw_paths)
+            )
+            return
+        cache = getattr(target, "_raw_entries_cache", None) or {}
+        cache.update(entry_cache)
+        target._raw_entries_cache = cache  # type: ignore[attr-defined]
+        self._queue_tree_inserts([str(p) for p in added])
+        self._add_recent_files(added, "raw")
+        self._refresh_tree_raw_paths()
+        if target is self._active_session:
+            self._append_raw_entries(added)
+        else:
+            self._set_active_session(target)
 
     def _show_open_progress(self, name: str) -> None:
         """Show the bottom-left open indicator and force it to paint NOW.

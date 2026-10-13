@@ -37,3 +37,36 @@ def test_raw_session_open_happy(synthetic_raw):
     assert session.kind == "raw"
     assert session.raw_paths == [synthetic_raw.resolve()]
     assert session.temp_path == synthetic_raw.resolve()
+
+
+def test_add_paths_appends_and_skips_known_files(tmp_path):
+    from mlgidlab.session import RawSession
+
+    a, b = tmp_path / "a.h5", tmp_path / "b.h5"
+    a.write_bytes(b"")
+    b.write_bytes(b"")
+    session = RawSession.open([a])
+    assert session.raw_path_strs == frozenset({str(a.resolve())})
+
+    added = session.add_paths([a, b])
+
+    assert added == [b.resolve()]
+    assert session.raw_paths == [a.resolve(), b.resolve()]
+    # The cached string set follows the list.
+    assert session.raw_path_strs == frozenset(
+        {str(a.resolve()), str(b.resolve())}
+    )
+    assert session.add_paths([b]) == []
+
+
+def test_add_paths_rejects_a_missing_file(tmp_path):
+    import pytest
+
+    from mlgidlab.session import RawSession
+
+    a = tmp_path / "a.h5"
+    a.write_bytes(b"")
+    session = RawSession.open([a])
+    with pytest.raises(FileNotFoundError):
+        session.add_paths([tmp_path / "missing.h5"])
+    assert session.raw_paths == [a.resolve()]

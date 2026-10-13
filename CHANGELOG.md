@@ -44,6 +44,15 @@ pre-releases.
   writable, Convert asks you to choose a directory. With raw files from
   several folders, all outputs go to the first file's folder.
 
+### Fixed
+
+- **Raw files dropped one at a time all appear in Selection.** Each drop
+  used to start its own raw batch, so the Conversion panel's Selection
+  list showed only the newest file. A raw file dropped or opened while a
+  raw batch exists now joins that batch: the Selection list gains a row
+  below the ones already there, with your ticks kept, and the viewer
+  shows the new file. A file already in the batch is skipped.
+
 ## 0.1.0a20 — twentieth alpha (2026-10-07)
 
 Two independent pieces of work. Detection becomes configurable from the

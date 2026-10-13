@@ -333,6 +333,28 @@ class RawSession(BaseSession):
             raise ValueError("RawSession.open requires at least one path")
         return cls(raw_paths=resolved)
 
+    def add_paths(self, raw_paths: list[Path | str]) -> list[Path]:
+        """Append files to the batch and return the ones actually added.
+
+        Files already in the batch are skipped, so dropping the same file
+        twice does not duplicate its row. Paths are resolved the way
+        ``open`` resolves them, which keeps ``raw_path_strs`` canonical.
+        """
+        known = set(self.raw_path_strs)
+        added: list[Path] = []
+        for p in raw_paths:
+            path = Path(p).resolve()
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            if str(path) in known:
+                continue
+            known.add(str(path))
+            added.append(path)
+        if added:
+            self._raw_paths.extend(added)
+            self._raw_path_strs = None
+        return added
+
     def close(self) -> None:
         """Raw inputs are not owned by the GUI; nothing to delete.
 

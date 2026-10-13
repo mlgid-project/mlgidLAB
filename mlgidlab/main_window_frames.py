@@ -113,19 +113,54 @@ class FramesMixin:
         # handler can resolve a click without re-walking the HDF5 file.
         self._raw_entries: dict[str, file_model.RawEntry] = {}
         self._raw_entry_label_by_path = {}
-        labels: list[str] = []
-        panel_inputs: list[tuple[Path, list[file_model.RawEntry]]] = []
         # Per-file entry lists are cached on the session: CopyWorker fills
         # the cache when the file is opened, and a GUI-thread fallback walk
         # fills it once for sessions that arrived without one. Activation
         # is on the GUI thread, so this must not re-walk a big beamtime
         # file's metadata every time the user switches back to the session.
+        labels, panel_inputs = self._collect_raw_inputs(self.session.raw_paths)
+        # Push the same data into the Conversion panel for its selection
+        # tree. Done before populating the combo so the panel paint
+        # happens once on activation.
+        self.conversion_panel.set_raw_inputs(panel_inputs)
+        self.entry_combo.blockSignals(True)
+        self.entry_combo.clear()
+        self.entry_combo.addItems(labels)
+        self.entry_combo.blockSignals(False)
+        self.pipeline_panel.set_available_entries([])
+        if labels:
+            # Auto-load the first candidate so the user sees something
+            # immediately. The change handler handles further picks.
+            self._load_raw_entry_into_viewer(labels[0])
+        else:
+            QMessageBox.information(
+                self,
+                "No raw datasets found",
+                "None of the selected raw files contain a 3D detector "
+                "dataset (shape (N, H, W) with H, W ≥ 32). Check the "
+                "files in the tree on the left to see their structure.",
+            )
+
+    def _collect_raw_inputs(
+        self, paths: list[Path]
+    ) -> tuple[list[str], list[tuple[Path, list[file_model.RawEntry]]]]:
+        """Entry labels and Conversion-panel rows for ``paths``.
+
+        Registers each entry in ``self._raw_entries`` (label → RawEntry)
+        and, for standalone images, in ``self._raw_entry_label_by_path``;
+        existing registrations are left alone, so this serves both the
+        full populate and the append path. HDF5 entry lists come from the
+        session's cache, with a one-off walk for files that have none.
+        """
+        assert isinstance(self.session, RawSession)
+        labels: list[str] = []
+        panel_inputs: list[tuple[Path, list[file_model.RawEntry]]] = []
         cache: dict[str, list] = getattr(self.session, "_raw_entries_cache", None) or {}
         # Standalone image files (TIFF/CBF/EDF) are read via fabio, not the
         # h5 detector walk; they become one 1-frame entry per file below.
         # Keep the HDF5 raw-walk path exactly as before for the rest.
-        fabio_paths = [p for p in self.session.raw_paths if file_model.is_fabio_image(p)]
-        h5_paths = [p for p in self.session.raw_paths if not file_model.is_fabio_image(p)]
+        fabio_paths = [p for p in paths if file_model.is_fabio_image(p)]
+        h5_paths = [p for p in paths if not file_model.is_fabio_image(p)]
         for raw_path in h5_paths:
             entries = cache.get(str(raw_path))
             if entries is None:
@@ -162,27 +197,25 @@ class FramesMixin:
                     self._raw_entry_label_by_path[str(entry.file_path)] = (
                         entry.label
                     )
-        # Push the same data into the Conversion panel for its selection
-        # tree. Done before populating the combo so the panel paint
-        # happens once on activation.
-        self.conversion_panel.set_raw_inputs(panel_inputs)
+        return labels, panel_inputs
+
+    def _append_raw_entries(self, paths: list[Path]) -> None:
+        """Add newly dropped raw files to the active raw session's views.
+
+        The Conversion panel keeps its rows and their check state, the
+        entry combo gains the new labels, and the viewer jumps to the
+        first new entry, as it does when a first file is opened.
+        """
+        assert isinstance(self.session, RawSession)
+        labels, panel_inputs = self._collect_raw_inputs(paths)
+        self.conversion_panel.add_raw_inputs(panel_inputs)
+        if not labels:
+            return
         self.entry_combo.blockSignals(True)
-        self.entry_combo.clear()
         self.entry_combo.addItems(labels)
         self.entry_combo.blockSignals(False)
-        self.pipeline_panel.set_available_entries([])
-        if labels:
-            # Auto-load the first candidate so the user sees something
-            # immediately. The change handler handles further picks.
-            self._load_raw_entry_into_viewer(labels[0])
-        else:
-            QMessageBox.information(
-                self,
-                "No raw datasets found",
-                "None of the selected raw files contain a 3D detector "
-                "dataset (shape (N, H, W) with H, W ≥ 32). Check the "
-                "files in the tree on the left to see their structure.",
-            )
+        # Signals are live again, so this selects and loads the entry.
+        self.entry_combo.setCurrentText(labels[0])
 
     def _on_raw_flips_changed(
         self, flip_lr: bool, flip_ud: bool, transp: bool = False,

@@ -438,6 +438,31 @@ class ConversionPanel(QWidget):
         self._refresh_selection_tree()
         self._refresh_runnable()
 
+    def add_raw_inputs(
+        self, inputs: list[tuple[Path, list[RawEntry]]]
+    ) -> None:
+        """Append files to the selection tree, keeping what is already there.
+
+        Used when raw files are dropped one at a time onto an open raw
+        batch: existing rows and their check state stay untouched and the
+        new files arrive unchecked below them.
+        """
+        if not inputs:
+            return
+        self._raw_inputs.extend(inputs)
+        tree = self.selection_tree
+        tree.blockSignals(True)
+        try:
+            for file_path, entries in inputs:
+                file_item = self._make_file_item(file_path, entries)
+                tree.addTopLevelItem(file_item)
+                file_item.setExpanded(True)
+        finally:
+            tree.blockSignals(False)
+        self.select_all_box.setEnabled(True)
+        self._sync_select_all_state()
+        self._refresh_runnable()
+
     # ---------------- UI construction ----------------
 
     def _build_ui(self) -> None:
@@ -671,34 +696,41 @@ class ConversionPanel(QWidget):
         self.select_all_box.setEnabled(bool(self._raw_inputs))
         self.selection_tree.clear()
         for file_path, entries in self._raw_inputs:
-            file_item = QTreeWidgetItem([file_path.name, "", ""])
-            file_item.setFlags(
-                file_item.flags()
-                | Qt.ItemFlag.ItemIsUserCheckable
-                | Qt.ItemFlag.ItemIsAutoTristate
-            )
-            file_item.setCheckState(0, Qt.CheckState.Unchecked)
-            file_item.setToolTip(0, str(file_path))
-            for re in entries:
-                shape = "×".join(str(s) for s in re.shape)
-                # Fabio images have no internal dataset path — label the child
-                # by frame count instead of the empty string.
-                if getattr(re, "frame_map", None) is not None:
-                    n = len(re.frame_map)
-                    child_text = f"image ({n} frame{'s' if n != 1 else ''})"
-                else:
-                    child_text = re.dataset_path
-                child = QTreeWidgetItem([
-                    child_text, shape, re.dtype,
-                ])
-                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                child.setCheckState(0, Qt.CheckState.Unchecked)
-                # Stash the RawEntry on the item so collection back into a
-                # ConversionConfig is a single ``data()`` lookup.
-                child.setData(0, Qt.ItemDataRole.UserRole, re)
-                file_item.addChild(child)
+            file_item = self._make_file_item(file_path, entries)
             self.selection_tree.addTopLevelItem(file_item)
             file_item.setExpanded(True)
+
+    def _make_file_item(
+        self, file_path: Path, entries: list[RawEntry]
+    ) -> QTreeWidgetItem:
+        """One unchecked file row with a checkable child per raw entry."""
+        file_item = QTreeWidgetItem([file_path.name, "", ""])
+        file_item.setFlags(
+            file_item.flags()
+            | Qt.ItemFlag.ItemIsUserCheckable
+            | Qt.ItemFlag.ItemIsAutoTristate
+        )
+        file_item.setCheckState(0, Qt.CheckState.Unchecked)
+        file_item.setToolTip(0, str(file_path))
+        for re in entries:
+            shape = "×".join(str(s) for s in re.shape)
+            # Fabio images have no internal dataset path: label the child
+            # by frame count instead of the empty string.
+            if getattr(re, "frame_map", None) is not None:
+                n = len(re.frame_map)
+                child_text = f"image ({n} frame{'s' if n != 1 else ''})"
+            else:
+                child_text = re.dataset_path
+            child = QTreeWidgetItem([
+                child_text, shape, re.dtype,
+            ])
+            child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            child.setCheckState(0, Qt.CheckState.Unchecked)
+            # Stash the RawEntry on the item so collection back into a
+            # ConversionConfig is a single ``data()`` lookup.
+            child.setData(0, Qt.ItemDataRole.UserRole, re)
+            file_item.addChild(child)
+        return file_item
 
     # ---------------- Section: Experimental parameters ----------------
 
