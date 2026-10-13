@@ -70,3 +70,28 @@ def test_add_paths_rejects_a_missing_file(tmp_path):
     with pytest.raises(FileNotFoundError):
         session.add_paths([tmp_path / "missing.h5"])
     assert session.raw_paths == [a.resolve()]
+
+
+def test_remove_paths_drops_files_and_moves_the_first(tmp_path):
+    files = []
+    for name in ("a.h5", "b.h5", "c.h5"):
+        f = tmp_path / name
+        f.write_bytes(b"x")
+        files.append(f)
+    session = RawSession.open(files)
+
+    removed = session.remove_paths([files[0], tmp_path / "unknown.h5"])
+
+    assert removed == [files[0].resolve()]
+    assert session.raw_paths == [files[1].resolve(), files[2].resolve()]
+    assert session.temp_path == files[1].resolve()
+    assert str(files[0].resolve()) not in session.raw_path_strs
+
+
+def test_remove_paths_refuses_to_empty_the_session(tmp_path):
+    f = tmp_path / "a.h5"
+    f.write_bytes(b"x")
+    session = RawSession.open([f])
+    with pytest.raises(ValueError):
+        session.remove_paths([f])
+    assert session.raw_paths == [f.resolve()]

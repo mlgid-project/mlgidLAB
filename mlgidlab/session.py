@@ -355,6 +355,25 @@ class RawSession(BaseSession):
             self._raw_path_strs = None
         return added
 
+    def remove_paths(self, raw_paths: list[Path | str]) -> list[Path]:
+        """Drop files from the batch and return the ones actually removed.
+
+        Unknown paths are ignored. A batch cannot be emptied this way (the
+        session would have no files to stand for); callers close the
+        session instead. ``temp_path`` follows the new first file.
+        """
+        drop = {str(Path(p).resolve()) for p in raw_paths}
+        removed = [p for p in self._raw_paths if str(p) in drop]
+        if not removed:
+            return []
+        kept = [p for p in self._raw_paths if str(p) not in drop]
+        if not kept:
+            raise ValueError("remove_paths would leave the session empty")
+        self._raw_paths = kept
+        self._raw_path_strs = None
+        self.temp_path = kept[0]
+        return removed
+
     def close(self) -> None:
         """Raw inputs are not owned by the GUI; nothing to delete.
 

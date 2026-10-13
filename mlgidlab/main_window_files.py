@@ -406,6 +406,89 @@ class FilesMixin:
         else:
             self._set_active_session(target)
 
+    def _shown_raw_file(self) -> str | None:
+        """Path of the raw file whose entry the viewer is showing, if any."""
+        entry = getattr(self, "_raw_entries", {}).get(
+            self.entry_combo.currentText()
+        )
+        if entry is None:
+            return None
+        try:
+            return str(Path(entry.file_path).resolve())
+        except OSError:
+            return str(entry.file_path)
+
+    def _remove_raw_files(self, session: RawSession, paths: list[str]) -> None:
+        """Close single files out of an open raw batch.
+
+        The files leave the file browser, the entry dropdown and the
+        Conversion Selection together; every other file keeps its row and
+        check state. Removing the last file closes the session. When the
+        file on screen goes, the viewer moves to the first remaining entry.
+        """
+        drop = set(paths) & set(session.raw_path_strs)
+        if not drop:
+            return
+        if drop == set(session.raw_path_strs):
+            self._close_session(session)
+            return
+        was_active = session is self._active_session
+        if was_active:
+            self.viewer.commit_pending_manual()
+            self._pause_playback()
+        session.remove_paths(sorted(drop))
+        cache = getattr(session, "_raw_entries_cache", None)
+        if cache:
+            for p in drop:
+                cache.pop(p, None)
+        # Files still waiting for their browser row never get one.
+        queued = len(self._tree_insert_queue)
+        self._tree_insert_queue[:] = [
+            p for p in self._tree_insert_queue if p not in drop
+        ]
+        self._tree_insert_total -= queued - len(self._tree_insert_queue)
+        self._update_tree_insert_progress()
+        model = self.tree.findHdf5TreeModel()
+        if isinstance(model, _MlgidHdf5TreeModel):
+            model.remove_file_rows(drop)
+        self._refresh_tree_raw_paths()
+        self.conversion_panel.remove_raw_inputs(drop)
+        entries = getattr(self, "_raw_entries", {})
+        gone = [
+            label for label, e in entries.items() if str(e.file_path) in drop
+        ]
+        for label in gone:
+            entries.pop(label, None)
+        for p in drop:
+            self._raw_entry_label_by_path.pop(p, None)
+        if was_active:
+            self._drop_raw_combo_items(gone)
+        self._update_title()
+        self._update_actions()
+
+    def _drop_raw_combo_items(self, labels: list[str]) -> None:
+        """Remove ``labels`` from the entry dropdown; reload if the shown
+        one was among them."""
+        shown_gone = self.entry_combo.currentText() in labels
+        self.entry_combo.blockSignals(True)
+        try:
+            for label in labels:
+                i = self.entry_combo.findText(label)
+                if i >= 0:
+                    self.entry_combo.removeItem(i)
+            if shown_gone and self.entry_combo.count():
+                self.entry_combo.setCurrentIndex(0)
+        finally:
+            self.entry_combo.blockSignals(False)
+        if shown_gone:
+            if self.entry_combo.count():
+                self._load_raw_entry_into_viewer(self.entry_combo.currentText())
+            else:
+                self.viewer.clear()
+                self.viewer.clear_history()
+        self._update_status_entry()
+        self._update_status_frame()
+
     def _show_open_progress(self, name: str) -> None:
         """Show the bottom-left open indicator and force it to paint NOW.
 
@@ -514,6 +597,13 @@ class FilesMixin:
         active = self._active_session
         if active is None:
             return
+        if isinstance(active, RawSession):
+            # A raw batch is several files: close the one on screen and
+            # leave the rest (and their Selection rows) alone.
+            shown = self._shown_raw_file()
+            if shown is not None:
+                self._remove_raw_files(active, [shown])
+                return
         if not self._confirm_discard_changes(active):
             return
         self._close_session(active)

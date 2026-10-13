@@ -463,6 +463,31 @@ class ConversionPanel(QWidget):
         self._sync_select_all_state()
         self._refresh_runnable()
 
+    def remove_raw_inputs(self, paths) -> None:
+        """Drop the rows of ``paths`` from the selection tree.
+
+        The remaining rows keep their check state. Used when single files
+        are closed out of an open raw batch.
+        """
+        gone = {str(p) for p in paths}
+        if not gone:
+            return
+        self._raw_inputs = [
+            (fp, entries) for fp, entries in self._raw_inputs
+            if str(fp) not in gone
+        ]
+        tree = self.selection_tree
+        tree.blockSignals(True)
+        try:
+            for i in reversed(range(tree.topLevelItemCount())):
+                if tree.topLevelItem(i).toolTip(0) in gone:
+                    tree.takeTopLevelItem(i)
+        finally:
+            tree.blockSignals(False)
+        self.select_all_box.setEnabled(bool(self._raw_inputs))
+        self._sync_select_all_state()
+        self._refresh_runnable()
+
     # ---------------- UI construction ----------------
 
     def _build_ui(self) -> None:
