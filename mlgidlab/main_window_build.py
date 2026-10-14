@@ -20,6 +20,7 @@ from PySide6.QtGui import (
     QPixmap,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QAbstractSpinBox,
     QCheckBox,
     QComboBox,
@@ -239,6 +240,11 @@ class BuildMixin:
         # Entries show in the file's native order (acquisition order for the
         # track_order pygid masters this targets).
         self.tree.setSortingEnabled(False)
+        # Shift/Ctrl-click and Ctrl+A pick several rows so Delete can close
+        # them together.
+        self.tree.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
         # Single-click silently updates Data tab; double-click jumps to it.
         self.tree.selectionModel().selectionChanged.connect(
             self._on_tree_selection_changed

@@ -52,8 +52,13 @@ pre-releases.
   until the next raw load. Closing now removes exactly that file from
   the file browser, the entry dropdown and the Selection list; the other
   raw files stay open with their ticks. Ctrl+W closes the file the viewer
-  is showing, Delete closes every selected row, and closing the last raw
-  file closes the raw batch and empties the list.
+  is showing, and closing the last raw file closes the raw batch and
+  empties the list.
+- **Select several files in the file browser and close them together.**
+  Shift-click, Ctrl-click and Ctrl+A now pick several rows, and Delete
+  closes every selected file, raw or converted. Converted files with
+  unsaved changes are asked about first, and Cancel closes nothing.
+  Picking several rows leaves the viewer where it is.
 - **Python 3.11 installs no longer pick PySide6 6.12.0.** That release
   drops a reference to `None` on every Qt method call that returns
   nothing, and Python 3.11 then aborts the whole process with

@@ -914,6 +914,13 @@ class FramesMixin:
         # one. See ``_restore_tree_state``.
         if getattr(self, "_restoring_tree_selection", False):
             return
+        # Several rows picked (Shift/Ctrl-click, Ctrl+A) is a batch for
+        # Delete, not a click: leave the viewer where it is.
+        picked = sum(
+            1 for i in self.tree.selectedIndexes() if i.column() == 0
+        )
+        if picked > 1:
+            return
         image_node = self._selected_image_node()
         if image_node is not None:
             self._activate_image_node(image_node)
@@ -1200,9 +1207,16 @@ class FramesMixin:
         if s is not None and s is not self._active_session:
             self._set_active_session(s)
 
-    def _selected_raw_files(self) -> dict[RawSession, list[str]]:
-        """Raw files among the selected browser rows, grouped by session."""
-        paths: list[str] = []
+    def _selected_file_targets(
+        self,
+    ) -> tuple[dict[RawSession, list[str]], list[BaseSession]]:
+        """What the selected browser rows stand for.
+
+        Returns the raw files to close, grouped by their raw session, and
+        the converted (NeXus) sessions whose file a selected row belongs
+        to. Several rows of one converted file count once.
+        """
+        raw_paths: list[str] = []
         try:
             for index in self.tree.selectedIndexes():
                 if index.column() != 0:
@@ -1211,11 +1225,12 @@ class FramesMixin:
                     index, Hdf5TreeModel.H5PY_ITEM_ROLE
                 )
                 if isinstance(item, _ImageFileNode):
-                    paths.append(item.image_path)
+                    raw_paths.append(item.image_path)
         except Exception:
             logger.debug(
-                "suppressed exception in _selected_raw_files", exc_info=True
+                "suppressed exception in _selected_file_targets", exc_info=True
             )
+        nexus: list[BaseSession] = []
         for node in self._safe_selected_h5_nodes():
             fname = self._node_filename(node)
             if fname is None:
@@ -1224,43 +1239,45 @@ class FramesMixin:
                 fname = fname.resolve()
             except OSError:
                 pass
-            paths.append(str(fname))
-        grouped: dict[RawSession, list[str]] = {}
-        for p in paths:
+            session = self._session_for_path(str(fname))
+            if isinstance(session, RawSession):
+                raw_paths.append(str(fname))
+            elif session is not None and session not in nexus:
+                nexus.append(session)
+        raw: dict[RawSession, list[str]] = {}
+        for p in raw_paths:
             session = self._session_for_path(p)
             if isinstance(session, RawSession):
-                grouped.setdefault(session, [])
-                if p not in grouped[session]:
-                    grouped[session].append(p)
-        return grouped
+                paths = raw.setdefault(session, [])
+                if p not in paths:
+                    paths.append(p)
+        return raw, nexus
 
     def _remove_selected_file_from_browser(self) -> None:
         """Close the file(s) the current tree selection belongs to.
 
         Wired to the file browser's Delete key (``deleteFileRequested``).
-        Raw rows close just their own files, however many are selected,
-        and leave the rest of the raw batch (and its Selection rows) in
-        place. Anything else resolves to its session and routes through
-        the same discard-confirm + ``_close_session`` path as File →
-        Close (Ctrl+W), so unsaved-change handling and tree teardown are
-        identical no matter which entry point removes the file. No-ops if
-        the selection can't be mapped to a live session (e.g. a stale or
+        Every selected file closes: a raw row closes just its own file and
+        leaves the rest of the raw batch (and its Selection rows) in place;
+        any row of a converted file closes that file. Unsaved work in the
+        converted files is asked about first, through the same
+        discard-confirm as File → Close (Ctrl+W), and Cancel on any of
+        them closes nothing. The active session is closed last so the
+        window does not switch through sessions about to go. No-ops if the
+        selection can't be mapped to a live session (e.g. a stale or
         orphan node), mirroring how a no-active-session Close no-ops.
         """
-        raw = self._selected_raw_files()
-        if raw:
-            for session, paths in raw.items():
-                self._remove_raw_files(session, paths)
+        raw, nexus = self._selected_file_targets()
+        if not raw and not nexus:
             return
-        nodes = self._safe_selected_h5_nodes()
-        if not nodes:
-            return
-        session = self._session_for_node(nodes[0])
-        if session is None:
-            return
-        if not self._confirm_discard_changes(session):
-            return
-        self._close_session(session)
+        for session in nexus:
+            if not self._confirm_discard_changes(session):
+                return
+        for session, paths in raw.items():
+            self._remove_raw_files(session, paths)
+        active = self._active_session
+        for session in sorted(nexus, key=lambda s: s is active):
+            self._close_session(session)
 
     @staticmethod
     def _node_filename(node) -> Path | None:

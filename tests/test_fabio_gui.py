@@ -676,3 +676,54 @@ def test_closing_one_hdf5_raw_file_keeps_the_others(
         e.file_path.resolve() == files[1].resolve()
         for e in main_window._raw_entries.values()
     )
+
+
+def test_shift_selecting_rows_and_pressing_delete_closes_them(
+    main_window, qtbot, tmp_path
+):
+    """The real route: extended selection in the browser, then the Delete
+    key on the tree."""
+    tiffs = _open_tiffs(main_window, qtbot, tmp_path, n=5)
+    view = main_window.tree
+    proxy = view.model()
+    from PySide6.QtCore import QItemSelection, QItemSelectionModel
+
+    sel = QItemSelection(proxy.index(1, 0), proxy.index(3, 0))
+    view.selectionModel().select(
+        sel,
+        QItemSelectionModel.SelectionFlag.ClearAndSelect
+        | QItemSelectionModel.SelectionFlag.Rows,
+    )
+    assert len(view.selectionModel().selectedRows()) == 3
+
+    qtbot.keyClick(view, Qt.Key.Key_Delete)
+
+    assert _selection_files(main_window) == [tiffs[0].name, tiffs[4].name]
+    assert _browser_rows(main_window) == [tiffs[0].name, tiffs[4].name]
+    assert main_window.session.raw_paths == [
+        tiffs[0].resolve(), tiffs[4].resolve()
+    ]
+
+
+def test_a_multi_row_selection_does_not_move_the_viewer(
+    main_window, qtbot, tmp_path
+):
+    """A single click follows the row; adding a second row to the
+    selection (Ctrl-click) leaves the viewer where it was."""
+    from PySide6.QtCore import QItemSelectionModel
+
+    tiffs = _open_tiffs(main_window, qtbot, tmp_path, n=3)
+    view = main_window.tree
+    proxy = view.model()
+    view.selectionModel().select(
+        proxy.index(0, 0), QItemSelectionModel.SelectionFlag.ClearAndSelect
+    )
+    assert main_window.entry_combo.currentText() == tiffs[0].name
+
+    view.selectionModel().select(
+        proxy.index(2, 0), QItemSelectionModel.SelectionFlag.Select
+    )
+
+    picked = [i for i in view.selectedIndexes() if i.column() == 0]
+    assert len(picked) == 2
+    assert main_window.entry_combo.currentText() == tiffs[0].name
